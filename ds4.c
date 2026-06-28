@@ -26481,7 +26481,8 @@ bool ds4_session_serving_ready(ds4_session *s) {
     if (!s) return false;
     if (!s->distributed) return true;
     char err[128];
-    return ds4_dist_session_route_ready(s->distributed, err, sizeof(err)) == 0;
+    /* ds4_dist_session_route_ready: 1 = route complete, 0 = incomplete, -1 = no session. */
+    return ds4_dist_session_route_ready(s->distributed, err, sizeof(err)) == 1;
 }
 
 int ds4_session_power(ds4_session *s) {
