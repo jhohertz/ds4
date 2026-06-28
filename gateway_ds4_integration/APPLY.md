@@ -41,6 +41,20 @@ Add the new fields to `ModelConfig` (in `config.py`): `gguf_path, ds4_bin, coord
 worker_layers, coord_listen_port, coordinator_gpu, worker_gpu, q8_f16_reserve_mb_coord,
 q8_f16_reserve_mb_worker, weight_cache_gb`.
 
+## 1b. Model-presence check — `_model_files_exist` (else status = download_required)
+
+`_model_files_exist` does `os.path.isdir(local_path)`; a ds4 model is a single `.gguf` FILE, so
+it gets marked `download_required` and won't load. Add a ds4 case at the top:
+
+```python
+if cfg.engine == "ds4":
+    gguf = cfg.gguf_path or cfg.local_path
+    return bool(gguf) and os.path.isfile(gguf)
+```
+
+ds4-server also needs a `/health` route (it had only `/v1/models`) so the gateway's existing
+`_wait_for_ready` probe (`GET /health`) flips the model to ready — added in `ds4_server.c`.
+
 ## 2. Readiness probe — wait for "route ready", not just an open port
 
 The DS4 server opens its port but only answers after the worker registers
