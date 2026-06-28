@@ -85,7 +85,16 @@ tokenizer, **superseded** by `glm52_ds4_q2k_tok.gguf`) and, if no GLM re-quant i
 #435 draft PRO router.
 
 ## Benchmark (after PRO is correct)
-Structured Flash vs GLM vs PRO: prefill + generation t/s, VRAM residency / GPUs used, and a
-quality probe (logit corr vs HF ref, or a small task set). Match quant where feasible and note
-machine/backend/quant per CONTRIBUTING. Flash baseline already measured: prefill 97 t/s, gen
-40.8 t/s (single H200, IQ2XXS); GLM-5.2 q2: prefill ~34–39 t/s, gen ~16 t/s (2× H200 resident).
+**Two distinct benchmarks — keep them separate:**
+1. **Intra-DS4** (the immediate goal): Flash vs GLM vs PRO on DS4 — prefill + generation t/s,
+   VRAM residency / GPUs used, quality probe (logit corr vs HF ref, or a small task set). Match
+   quant where feasible; note machine/backend/quant per CONTRIBUTING. Baselines so far: Flash
+   prefill 97 / gen 40.8 t/s (single H200, IQ2XXS); GLM-5.2 q2 prefill ~34–39 / gen ~16 t/s
+   (2× H200 resident).
+2. **DS4 vs market (DEFERRED — user said "lo vediamo dopo")**: DS4-GLM vs **vLLM**-GLM vs
+   **llama.cpp**-GLM (all-GPU, not Unsloth CPU-offload) on the same H200 box, same ~2-bit quant.
+   This is the only thing that proves DS4 is *competitive* rather than just a working engine
+   contribution. Unsloth's edge is cheap hardware (24 GB GPU + 256 GB RAM via MoE offload) — a
+   different regime; DS4's regime is full GPU residency, where the real rivals are vLLM /
+   llama.cpp-all-GPU. Possible DS4 levers to test: MTP speculative decode, distributed pipeline
+   split, absorbed-MLA. Do this AFTER PRO + intra-DS4 bench.
