@@ -26472,6 +26472,18 @@ int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen
     return ds4_dist_session_route_ready(s->distributed, err, errlen);
 }
 
+/* True when the session can actually serve a request. A single-process session
+ * is ready once it exists; a distributed coordinator is ready only after the
+ * full layer route is assembled (all workers registered). Used by /health so the
+ * gateway doesn't proxy a request before the route completes (else the first
+ * cold-load request fails with "distributed route incomplete"). */
+bool ds4_session_serving_ready(ds4_session *s) {
+    if (!s) return false;
+    if (!s->distributed) return true;
+    char err[128];
+    return ds4_dist_session_route_ready(s->distributed, err, sizeof(err)) == 0;
+}
+
 int ds4_session_power(ds4_session *s) {
     if (!s || !s->engine) return 100;
     return s->engine->power_percent;

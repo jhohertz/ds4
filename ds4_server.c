@@ -11271,9 +11271,16 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") &&
         (!strcmp(hr.path, "/health") || !strcmp(hr.path, "/healthz"))) {
-        /* Liveness/readiness probe (used by the Arma Gateway to detect when the
-         * distributed coordinator is serving). 200 once the HTTP loop is up. */
-        http_response(fd, s->enable_cors, 200, "application/json", "{\"status\":\"ok\"}\n");
+        /* Readiness probe (used by the Arma Gateway). For a distributed
+         * coordinator, report ready ONLY after the layer route is complete —
+         * otherwise the gateway proxies the first cold-load request before the
+         * workers register and it fails with "distributed route incomplete". */
+        if (ds4_session_serving_ready(s->session)) {
+            http_response(fd, s->enable_cors, 200, "application/json", "{\"status\":\"ok\"}\n");
+        } else {
+            http_response(fd, s->enable_cors, 503, "application/json",
+                          "{\"status\":\"loading\"}\n");
+        }
         http_request_free(&hr);
         goto done;
     }
