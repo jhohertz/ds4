@@ -4164,7 +4164,11 @@ static void *dist_coordinator_client_main(void *arg) {
     }
 
     if (hello.model_id != state->model_id) {
-        snprintf(err, sizeof(err), "model id mismatch: worker=%u coordinator=%u", hello.model_id, state->model_id);
+        snprintf(err, sizeof(err),
+                 "model id mismatch: worker=%u coordinator=%u "
+                 "(coordinator and worker must load the SAME model; check both pass the same -m path "
+                 "- a coordinator started without -m falls back to the default ds4flash.gguf)",
+                 hello.model_id, state->model_id);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
         close(fd);
@@ -5419,6 +5423,8 @@ int ds4_dist_session_create(
     d->listen_fd = listen_fd;
     d->state.engine = engine;
     d->state.model_id = (uint32_t)ds4_engine_model_id(engine);
+    fprintf(stderr, "DIST-DBG session_create model_id=%u layers=%u\n",
+            d->state.model_id, (uint32_t)ds4_engine_layer_count(engine));
     d->state.n_layers = (uint32_t)ds4_engine_layer_count(engine);
     d->state.local_start = opt->layers.start;
     d->state.local_end = dist_resolved_layer_end(opt, d->state.n_layers);
@@ -5704,6 +5710,8 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     memset(&state, 0, sizeof(state));
     state.engine = engine;
     state.model_id = (uint32_t)ds4_engine_model_id(engine);
+    fprintf(stderr, "DIST-DBG coordinator model_id=%u n_layers=%u\n",
+            state.model_id, (uint32_t)ds4_engine_layer_count(engine));
     state.n_layers = (uint32_t)ds4_engine_layer_count(engine);
     state.local_start = opt->layers.start;
     state.local_end = dist_resolved_layer_end(opt, state.n_layers);

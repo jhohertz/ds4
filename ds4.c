@@ -108,21 +108,21 @@ static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
  */
 
 enum {
-    DS4_MAX_LAYER            = 61,
+    DS4_MAX_LAYER            = 96,   /* GLM-5.2 has 78 layers (was 61 for DeepSeek Pro) */
     DS4_MAX_EMBD             = 7168,
-    DS4_MAX_VOCAB            = 129280,
+    DS4_MAX_VOCAB            = 160000,  /* GLM-5.2 vocab 154880 (was 129280) */
     DS4_MAX_HEAD             = 128,
     DS4_MAX_HEAD_KV          = 1,
-    DS4_MAX_HEAD_DIM         = 512,
+    DS4_MAX_HEAD_DIM         = 640,     /* GLM-5.2 absorbed head_dim 576 (was 512) */
     DS4_MAX_VALUE_DIM        = 512,
     DS4_MAX_ROT              = 64,
-    DS4_MAX_OUT_GROUP        = 16,
-    DS4_MAX_LORA_Q           = 1536,
+    DS4_MAX_OUT_GROUP        = 64,      /* GLM-5.2 n_out_group 64 (was 16) */
+    DS4_MAX_LORA_Q           = 2048,    /* GLM-5.2 q_lora 2048 (was 1536) */
     DS4_MAX_LORA_O           = 1024,
     DS4_MAX_EXPERT           = 384,
-    DS4_MAX_EXPERT_USED      = 6,
+    DS4_MAX_EXPERT_USED      = 8,       /* GLM-5.2 top-8 (was 6) */
     DS4_MAX_EXPERT_SHARED    = 1,
-    DS4_MAX_FF_EXP           = 3072,
+    DS4_MAX_FF_EXP           = 12288,   /* GLM-5.2 dense MLP in shexp slot (was 3072) */
     DS4_MAX_HASH_LAYER       = 3,
     DS4_MAX_SWA              = 128,
     DS4_MAX_INDEXER_HEAD     = 64,
@@ -135,6 +135,7 @@ enum {
 typedef enum {
     DS4_VARIANT_FLASH = 0,
     DS4_VARIANT_PRO   = 1,
+    DS4_VARIANT_GLM52 = 2,
 } ds4_variant;
 
 typedef struct {
@@ -240,6 +241,92 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .hc_eps = DS4_DEFAULT_HC_EPS,
     .expert_weight_scale = 2.5f,
     .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+};
+
+/* GLM-5.2 (GlmMoeDsaForCausalLM). DeepSeek-V4 family: MLA + DSA indexer + MoE +
+ * MTP, so it slots into the same engine path. Values from the published
+ * GlmMoeDsaConfig (zai-org/GLM-5). Fields marked VERIFY must be reconciled
+ * against a real GLM-5.2 GGUF in DS4 layout (P1) before this preset will match:
+ * the MLA latent dims (n_head_dim/n_value_dim), output groups, dense-layer count
+ * mapping, SWA, and whether GLM carries mHC (it does not -> n_hc=1). */
+static const ds4_shape DS4_SHAPE_GLM52 = {
+    .name = "GLM 5.2",
+    .variant = DS4_VARIANT_GLM52,
+    .n_layer = 78,
+    .n_embd = 6144,
+    .n_vocab = 154880,
+    .n_head = 64,
+    .n_head_kv = 1,
+    .n_head_dim = 576,          /* absorbed MLA latent = kv_lora(512) + qk_rope(64) */
+    .n_value_dim = 512,         /* value latent = c_kv = kv_lora_rank=512 */
+    .n_rot = 64,                /* qk_rope_head_dim=64 */
+    .n_out_group = 64,          /* = n_head -> group_heads=1, exact per-head W_v absorption */
+    .n_lora_q = 2048,           /* q_lora_rank=2048 */
+    .n_lora_o = 256,            /* = v_head_dim (per-head output low rank) */
+    .n_expert = 256,
+    .n_expert_used = 8,         /* num_experts_per_tok=8 (DS4 DeepSeek uses 6) */
+    .n_expert_shared = 1,
+    .n_ff_exp = 2048,           /* moe_intermediate_size=2048 */
+    .n_hash_layer = 3,          /* first_k_dense_replace=3; VERIFY semantics */
+    .n_swa = 128,               /* VERIFY (DSA may not use SWA) */
+    .n_indexer_head = 32,       /* index_n_heads=32 (DS4 DeepSeek uses 64) */
+    .n_indexer_head_dim = 128,  /* index_head_dim=128 */
+    .n_indexer_top_k = 2048,    /* index_topk=2048 */
+    .n_hc = 1,                  /* GLM has no mHC hyper-connections */
+    .n_hc_sinkhorn_iter = 0,
+    .rms_eps = 1.0e-5f,
+    .hc_eps = DS4_DEFAULT_HC_EPS,
+    .expert_weight_scale = 2.5f, /* routed_scaling_factor=2.5 */
+    .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+    .rope_freq_base = 8000000.0f, /* GLM-5.2 rope_theta=8e6 */
+    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+};
+
+/* tiny-random/glm-5 bring-up preset (for converter+loader validation only). */
+static const ds4_shape DS4_SHAPE_GLM5_TINY = {
+    .name = "GLM 5.2 tiny",
+    .variant = DS4_VARIANT_GLM52,
+    .n_layer = 2, .n_embd = 8, .n_vocab = 154880,
+    .n_head = 4, .n_head_kv = 1, .n_head_dim = 512, .n_value_dim = 512,
+    .n_rot = 64, .n_out_group = 8, .n_lora_q = 32, .n_lora_o = 8,
+    .n_expert = 256, .n_expert_used = 8, .n_expert_shared = 1, .n_ff_exp = 32,
+    .n_hash_layer = 1, .n_swa = 128,
+    .n_indexer_head = 4, .n_indexer_head_dim = 128, .n_indexer_top_k = 2048,
+    .n_hc = 1, .n_hc_sinkhorn_iter = 0,
+    .rms_eps = 1.0e-5f, .hc_eps = DS4_DEFAULT_HC_EPS,
+    .expert_weight_scale = 2.5f, .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+};
+
+/* Synthetic non-degenerate GlmMoeDsa (real-ratio dims) for Q8_0 load+forward
+ * mechanics validation. Matches gen_synth_glm.py. */
+static const ds4_shape DS4_SHAPE_GLM5_SYNTH = {
+    .name = "GLM 5.2 synth",
+    .variant = DS4_VARIANT_GLM52,
+    .n_layer = 4, .n_embd = 256, .n_vocab = 512,
+    .n_head = 8, .n_head_kv = 1, .n_head_dim = 576, .n_value_dim = 512,
+    .n_rot = 64, .n_out_group = 8, .n_lora_q = 64, .n_lora_o = 256,
+    .n_expert = 32, .n_expert_used = 8, .n_expert_shared = 1, .n_ff_exp = 256,
+    .n_hash_layer = 1, .n_swa = 128,
+    .n_indexer_head = 8, .n_indexer_head_dim = 128, .n_indexer_top_k = 2048,
+    .n_hc = 1, .n_hc_sinkhorn_iter = 0,
+    .rms_eps = 1.0e-5f, .hc_eps = DS4_DEFAULT_HC_EPS,
+    .expert_weight_scale = 2.5f, .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
     .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
     .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
     .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
@@ -637,6 +724,13 @@ static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
     case DS4_VARIANT_PRO:
         if (il < 2) return 128u;
         return (il & 1u) == 0 ? 4u : 128u;
+    case DS4_VARIANT_GLM52:
+        /* Bring-up: ratio 0 on every layer = dense MLA, no V4 compressor and no
+         * DSA indexer tensors required (GLM lacks DS4's compressor/indexer
+         * structure). Lets the model LOAD + run a forward. The real per-layer DSA
+         * pattern (IndexShare full/shared) is P2 once the GLM indexer assembly
+         * exists. Keep in sync with the converter's compress_ratios metadata. */
+        return 0u;
     default:
         ds4_die("unsupported DeepSeek4 model variant");
     }
@@ -3162,7 +3256,7 @@ static void tensor_expect_layout(
 
     const uint64_t want[3] = { d0, d1, d2 };
     for (uint32_t i = 0; i < ndim; i++) {
-        if (t->dim[i] == want[i]) continue;
+        if (want[i] == UINT64_MAX || t->dim[i] == want[i]) continue;  /* MAX = skip (variable dim) */
         fprintf(stderr,
                 "ds4: tensor %.*s has dim[%u]=%" PRIu64 ", expected %" PRIu64 "\n",
                 (int)t->name.len,
@@ -3440,7 +3534,7 @@ static void tensor_expect_routed_expert(
 
     const uint64_t want[3] = { d0, d1, d2 };
     for (uint32_t i = 0; i < ndim; i++) {
-        if (t->dim[i] == want[i]) continue;
+        if (want[i] == UINT64_MAX || t->dim[i] == want[i]) continue;  /* MAX = skip (variable dim) */
         fprintf(stderr,
                 "ds4: tensor %.*s has dim[%u]=%" PRIu64 ", expected %" PRIu64 "\n",
                 (int)t->name.len,
@@ -3630,9 +3724,12 @@ static void weights_validate_layout(
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
         }
-        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        /* GLM dense layers (il<n_hash_layer) carry a full dense MLP at intermediate_size
+         * in the shared-expert slot (≠ moe_inter); runtime reads the dim from the tensor. */
+        const uint64_t shexp_ff = (DS4_N_HC == 1) ? UINT64_MAX : DS4_N_FF_EXP;
+        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, shexp_ff, 0);
+        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, shexp_ff, 0);
+        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0,    2, shexp_ff, DS4_N_EMBD, 0);
         if (il < DS4_N_HASH_LAYER) {
             tensor_expect_layout(l->ffn_gate_tid2eid, DS4_TENSOR_I32, 2, DS4_N_EXPERT_USED, DS4_N_VOCAB, 0);
         }
@@ -3776,6 +3873,39 @@ static void ds4_select_shape_from_metadata(
                                    n_indexer_head_dim, n_indexer_top_k, n_hc,
                                    n_hc_sinkhorn_iter)) {
         g_ds4_shape = DS4_SHAPE_PRO;
+        return;
+    }
+    if (ds4_shape_matches_metadata(&DS4_SHAPE_GLM52,
+                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
+                                   n_lora_o, n_out_group, n_expert,
+                                   n_expert_used, n_ff_exp, n_expert_shared,
+                                   n_hash_layer, n_swa, n_indexer_head,
+                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
+                                   n_hc_sinkhorn_iter)) {
+        g_ds4_shape = DS4_SHAPE_GLM52;
+        return;
+    }
+    if (ds4_shape_matches_metadata(&DS4_SHAPE_GLM5_TINY,
+                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
+                                   n_lora_o, n_out_group, n_expert,
+                                   n_expert_used, n_ff_exp, n_expert_shared,
+                                   n_hash_layer, n_swa, n_indexer_head,
+                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
+                                   n_hc_sinkhorn_iter)) {
+        g_ds4_shape = DS4_SHAPE_GLM5_TINY;
+        return;
+    }
+    if (ds4_shape_matches_metadata(&DS4_SHAPE_GLM5_SYNTH,
+                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
+                                   n_lora_o, n_out_group, n_expert,
+                                   n_expert_used, n_ff_exp, n_expert_shared,
+                                   n_hash_layer, n_swa, n_indexer_head,
+                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
+                                   n_hc_sinkhorn_iter)) {
+        g_ds4_shape = DS4_SHAPE_GLM5_SYNTH;
         return;
     }
 
@@ -14871,7 +15001,9 @@ static bool metal_graph_encode_decode_layer(
     if (ext_factor != 0.0f && freq_scale > 0.0f) {
         attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
-    const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
+    /* GLM (n_hc==1): force the non-fused q/kv norm path so the GLM-specific kv-norm
+     * (c_kv only) and the head_rms_norm skip can be applied. */
+    const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm() && DS4_N_HC != 1;
 
     bool ok = true;
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
@@ -14881,13 +15013,20 @@ static bool metal_graph_encode_decode_layer(
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
     } while (0)
-    if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
-                                                 hc_dim, mix_hc, g->flat_hc, 1);
+    /* GLM-5.2 n_hc==1: identity hyper-connection — bypass the n_hc==4-only mHC
+     * machine. attn_cur is the single residual stream (cur_hc). */
+    const bool hc_bypass = DS4_N_HC == 1;
     const bool fuse_hc_norm =
         DS4_N_HC == 4 &&
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
+    if (hc_bypass) {
+        if (ok) ok = ds4_gpu_tensor_copy(g->attn_cur, 0, g->cur_hc, 0,
+                                         (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    } else {
+    if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+    if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
+                                                 hc_dim, mix_hc, g->flat_hc, 1);
     if (ok && fuse_hc_norm) {
         ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->attn_cur,
                                                          g->attn_norm,
@@ -14925,6 +15064,7 @@ static bool metal_graph_encode_decode_layer(
                                        model,
                                        layer->hc_attn_scale->abs_offset,
                                        layer->hc_attn_base->abs_offset);
+    }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_pre");
     if (ok) {
@@ -15010,7 +15150,7 @@ static bool metal_graph_encode_decode_layer(
     }
     const bool decode_q_norm_debug = metal_graph_debug_wants("Qnorm", il, pos);
     bool decode_q_norm_rope_fused = false;
-    if (ok && !decode_q_norm_debug) {
+    if (ok && !decode_q_norm_debug && DS4_N_HC != 1) {  /* GLM: non-fused so head_rms can be skipped */
         decode_q_norm_rope_fused =
             ds4_gpu_head_rms_norm_rope_tail_tensor(g->q,
                                                    1,
@@ -15029,7 +15169,8 @@ static bool metal_graph_encode_decode_layer(
                                                    DS4_RMS_EPS) != 0;
     }
     if (!decode_q_norm_rope_fused) {
-        if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+        /* GLM has no per-head q RMSNorm — skip it, keep rope. */
+        if (ok && DS4_N_HC != 1) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
         }
@@ -15051,7 +15192,11 @@ static bool metal_graph_encode_decode_layer(
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
         }
-        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->kv, g->kv_raw,
+        if (ok && DS4_N_HC == 1)  /* GLM: norm c_kv (kv_lora) only, pass k_rope tail */
+            ok = ds4_gpu_glm_kv_norm_tensor(g->kv, g->kv_raw, model->map, model->size,
+                                            layer->attn_kv_a_norm->abs_offset,
+                                            DS4_N_VALUE_DIM, DS4_N_HEAD_DIM, 1, DS4_RMS_EPS) != 0;
+        else if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->kv, g->kv_raw,
                                                       model->map, model->size,
                                                       layer->attn_kv_a_norm->abs_offset,
                                                       DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
@@ -15439,6 +15584,7 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
     }
     const bool fuse_attn_out_hc =
+        !hc_bypass &&
         !metal_graph_directional_steering_attn_enabled(g) &&
         !metal_graph_use_reference_attn_out_hc();
     if (ok && fuse_attn_out_hc) {
@@ -15487,7 +15633,11 @@ static bool metal_graph_encode_decode_layer(
     if (ok && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, g->attn_out, il, 1);
     }
-    if (ok && !fuse_attn_out_hc) {
+    if (ok && hc_bypass) {
+        /* identity hc-out: after_attn = attn_out + residual */
+        ok = ds4_gpu_add_tensor(g->after_attn_hc, g->attn_out, g->cur_hc,
+                                DS4_N_EMBD) != 0;
+    } else if (ok && !fuse_attn_out_hc) {
         ok = ds4_gpu_hc_expand_tensor(g->after_attn_hc, g->attn_out, g->cur_hc,
                                         g->hc_post, g->hc_comb, DS4_N_EMBD, DS4_N_HC) != 0;
     }
@@ -15495,6 +15645,10 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
+    if (hc_bypass) {
+        if (ok) ok = ds4_gpu_tensor_copy(g->ffn_cur, 0, g->after_attn_hc, 0,
+                                         (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    } else {
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
                                                  hc_dim, mix_hc, g->flat_hc, 1);
@@ -15536,6 +15690,7 @@ static bool metal_graph_encode_decode_layer(
                                        layer->hc_ffn_scale->abs_offset,
                                        layer->hc_ffn_base->abs_offset);
     }
+    }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_pre");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre_mixes", g->hc_mix, mix_hc, il, pos);
@@ -15576,7 +15731,8 @@ static bool metal_graph_encode_decode_layer(
                                                     0,
                                                     layer->ffn_exp_probs_b != NULL,
                                                     layer->ffn_gate_tid2eid != NULL,
-                                                    g->router_logits) != 0;
+                                                    g->router_logits,
+                                                    DS4_N_HC == 1) != 0;
         if (ok) ok = metal_graph_decode_set_hash_selected_override(model,
                                                                    layer,
                                                                    il,
@@ -15602,7 +15758,7 @@ static bool metal_graph_encode_decode_layer(
         getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
 #endif
     const bool fuse_shared_down_hc =
-        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
+        !hc_bypass && !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
     const bool q4_selected_shared_overlap =
         metal_graph_use_q4_selected_shared_overlap() &&
         metal_graph_decode_q4_selected_slots_expected(g,
@@ -15754,7 +15910,11 @@ static bool metal_graph_encode_decode_layer(
         if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
             ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
         }
-        if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        if (ok && hc_bypass) {
+            /* identity hc-out: after_ffn = routed + shared + post-attn residual */
+            ok = ds4_gpu_add_tensor(g->after_ffn_hc, g->routed_out, g->shared_out, DS4_N_EMBD) != 0;
+            if (ok) ok = ds4_gpu_add_tensor(g->after_ffn_hc, g->after_ffn_hc, g->after_attn_hc, DS4_N_EMBD) != 0;
+        } else if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
             ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc,
                                             g->ffn_out,
                                             g->after_attn_hc,
@@ -15922,7 +16082,11 @@ static bool metal_graph_encode_decode_layer(
         if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
             ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
         }
-        if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        if (ok && hc_bypass) {
+            /* identity hc-out: after_ffn = routed + shared + post-attn residual */
+            ok = ds4_gpu_add_tensor(g->after_ffn_hc, g->routed_out, g->shared_out, DS4_N_EMBD) != 0;
+            if (ok) ok = ds4_gpu_add_tensor(g->after_ffn_hc, g->after_ffn_hc, g->after_attn_hc, DS4_N_EMBD) != 0;
+        } else if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
             ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc,
                                             g->ffn_out,
                                             g->after_attn_hc,
@@ -16042,7 +16206,11 @@ static bool metal_graph_encode_decode_layer(
     if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
     }
-    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+    if (ok && hc_bypass) {
+        /* identity hc-out: after_ffn = routed + shared + post-attn residual */
+        ok = ds4_gpu_add_tensor(g->after_ffn_hc, g->routed_out, g->shared_out, DS4_N_EMBD) != 0;
+        if (ok) ok = ds4_gpu_add_tensor(g->after_ffn_hc, g->after_ffn_hc, g->after_attn_hc, DS4_N_EMBD) != 0;
+    } else if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc,
                                         g->ffn_out,
                                         g->after_attn_hc,
@@ -16074,7 +16242,13 @@ static bool metal_graph_encode_output_head(
         const ds4_weights     *weights,
         uint64_t               vocab_dim) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+    bool ok = true;
+    if (DS4_N_HC == 1) {
+        /* identity hc collapse: output_embd == cur_hc (single residual stream) */
+        ok = ds4_gpu_tensor_copy(g->output_embd, 0, g->cur_hc, 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    } else {
+    ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = ds4_gpu_matmul_f16_tensor(g->output_pre,
                                              model->map,
                                              model->size,
@@ -16102,6 +16276,7 @@ static bool metal_graph_encode_output_head(
                                                   g->output_weights,
                                                   DS4_N_EMBD,
                                                   DS4_N_HC) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("result_hc", g->output_embd, DS4_N_EMBD, DS4_N_LAYER, 0);
     }
@@ -16170,6 +16345,11 @@ static bool metal_graph_encode_output_head_batch(
                                    (uint64_t)n_tokens * vocab_dim * sizeof(float));
     ok = output_pre && output_weights && output_embd && output_norm && logits;
 
+    if (ok && DS4_N_HC == 1) {
+        /* identity hc collapse: output_embd == cur_hc (per row) */
+        ok = ds4_gpu_tensor_copy(output_embd, 0, g->batch_cur_hc, 0,
+                                 (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float)) != 0;
+    } else {
     if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
@@ -16196,6 +16376,7 @@ static bool metal_graph_encode_output_head_batch(
                                                   output_weights,
                                                   DS4_N_EMBD,
                                                   DS4_N_HC) != 0;
+    }
     if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(output_norm,
                                                        output_embd,
                                                        model->map,
@@ -16278,7 +16459,13 @@ static bool metal_graph_encode_output_head_mtp(
         const ds4_mtp_weights *mtp,
         uint64_t               vocab_dim) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+    bool ok = true;
+    if (DS4_N_HC == 1) {
+        /* identity hc collapse: output_embd == cur_hc */
+        ok = ds4_gpu_tensor_copy(g->output_embd, 0, g->cur_hc, 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    } else {
+    ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->output_pre, mtp_model, mtp->hc_head_fn,
                                                  hc_dim, DS4_N_HC, g->flat_hc, 1);
     if (ok) ok = ds4_gpu_output_hc_weights_tensor(g->output_weights,
@@ -16294,6 +16481,7 @@ static bool metal_graph_encode_output_head_mtp(
                                                   g->output_weights,
                                                   DS4_N_EMBD,
                                                   DS4_N_HC) != 0;
+    }
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
                                                   g->output_embd,
                                                   mtp_model->map,
@@ -17354,7 +17542,9 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     uint32_t *comp_counts = compressed ? xcalloc(n_tokens, sizeof(comp_counts[0])) : NULL;
     uint32_t *index_counts = ratio == 4 ? xcalloc(n_tokens, sizeof(index_counts[0])) : NULL;
-    const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
+    /* GLM (n_hc==1): force the non-fused q/kv norm path so the GLM-specific kv-norm
+     * (c_kv only) and the head_rms_norm skip can be applied. */
+    const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm() && DS4_N_HC != 1;
     ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(
             g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
     ds4_gpu_tensor *hc_split_view = ds4_gpu_tensor_view(
@@ -17367,6 +17557,15 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool fuse_hc_norm = DS4_N_HC == 4 &&
                               !metal_graph_use_reference_hc_decode() &&
                               metal_graph_enable_batch_hc_norm_fusion();
+    /* GLM-5.2 has n_hc==1 (no mHC). The hc split/sinkhorn/weighted-sum primitives
+     * are hardcoded for n_hc==4 and fail otherwise. With a single residual stream
+     * the hyper-connection is the identity: attn_cur == batch_cur_hc. Bypass the
+     * whole mHC machine. Gated on DS4_N_HC==1 → Flash (n_hc=4) path untouched. */
+    const bool hc_bypass = DS4_N_HC == 1;
+    if (hc_bypass) {
+        if (ok) ok = ds4_gpu_tensor_copy(attn_cur_view, 0, g->batch_cur_hc, 0,
+                                         (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float)) != 0;
+    } else {
     if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
@@ -17424,6 +17623,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_N_HC,
                                                             DS4_N_HC_SINKHORN_ITER,
                                                             DS4_HC_EPS) != 0;
+    }
     }
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_pre", g->batch_attn_cur,
@@ -17511,7 +17711,7 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_wants("Qraw", il, pos0) ||
         metal_graph_debug_wants("Qnorm", il, pos0);
     bool q_b_f16_out = false;
-    if (ok && !q_path_debug) {
+    if (ok && !q_path_debug && DS4_N_HC != 1) {  /* GLM: non-fused q_b (skip head_rms) */
         q_b_f16_out = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(g->batch_q,
                                                                      g->batch_q_half,
                                                                      model->map,
@@ -17559,7 +17759,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
         DS4_METAL_PROFILE_Q_STAGE("q_b");
-        if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
+        /* GLM has no per-head q RMSNorm — skip it (DeepSeek path keeps it). */
+        if (ok && DS4_N_HC != 1) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
                                                     n_tokens,
                                                     DS4_N_HEAD,
                                                     DS4_N_HEAD_DIM,
@@ -17605,7 +17806,17 @@ static bool metal_graph_encode_layer_attention_batch(
             metal_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
         }
-        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_kv,
+        if (ok && DS4_N_HC == 1)  /* GLM: norm c_kv (kv_lora) only, pass k_rope tail */
+            ok = ds4_gpu_glm_kv_norm_tensor(g->batch_kv,
+                                            g->batch_kv_raw,
+                                            model->map,
+                                            model->size,
+                                            layer->attn_kv_a_norm->abs_offset,
+                                            DS4_N_VALUE_DIM,
+                                            DS4_N_HEAD_DIM,
+                                            n_tokens,
+                                            DS4_RMS_EPS) != 0;
+        else if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_kv,
                                                            g->batch_kv_raw,
                                                            model->map,
                                                            model->size,
@@ -18697,6 +18908,7 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_wants("attn_out", il, pos0);
     bool attn_out_f16 = false;
     if (ok &&
+        !hc_bypass &&
         !attn_out_debug &&
         !metal_graph_directional_steering_attn_enabled(g)) {
         attn_out_f16 = ds4_gpu_attention_output_q8_batch_f16_tensor(g->batch_q_half,
@@ -18744,7 +18956,13 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok && !attn_out_f16 && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, g->batch_attn_out, il, n_tokens);
     }
-    if (ok && attn_out_f16) {
+    if (ok && hc_bypass) {
+        /* identity hc-out: after_attn = attn_out + residual (plain residual add) */
+        ok = ds4_gpu_add_tensor(after_attn_hc_view,
+                                g->batch_attn_out,
+                                g->batch_cur_hc,
+                                (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+    } else if (ok && attn_out_f16) {
         ok = ds4_gpu_hc_expand_split_half_tensor(after_attn_hc_view,
                                                  g->batch_q_half,
                                                  g->batch_cur_hc,
@@ -18817,6 +19035,13 @@ static bool metal_graph_encode_layer_ffn_batch(
     const bool fuse_hc_norm = DS4_N_HC == 4 &&
                               !metal_graph_use_reference_hc_decode() &&
                               metal_graph_enable_batch_hc_norm_fusion();
+    /* n_hc==1 (GLM): identity hyper-connection — ffn_cur == post-attention residual
+     * (batch_after_attn_hc). Bypass the n_hc==4-only mHC primitives. */
+    const bool hc_bypass = DS4_N_HC == 1;
+    if (hc_bypass) {
+        if (ok) ok = ds4_gpu_tensor_copy(ffn_cur_view, 0, g->batch_after_attn_hc, 0,
+                                         (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float)) != 0;
+    } else {
     if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_after_attn_hc,
                                                       (uint32_t)hc_dim,
@@ -18875,6 +19100,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                             DS4_N_HC_SINKHORN_ITER,
                                                             DS4_HC_EPS) != 0;
     }
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre", g->batch_ffn_cur,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
@@ -18921,7 +19147,8 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       DS4_N_EXPERT,
                                                       DS4_N_EXPERT_USED,
                                                       DS4_EXPERT_WEIGHT_SCALE,
-                                                      n_tokens) != 0;
+                                                      n_tokens,
+                                                      DS4_N_HC == 1) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->batch_router_logits,
                                       (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
@@ -19007,7 +19234,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     bool shared_down_f16 = false;
 
 #define DS4_METAL_TRY_SHARED_DOWN_F16() do { \
-        if (ok && !keep_ffn_out && !metal_graph_debug_wants("ffn_shexp", il, pos0)) { \
+        if (ok && !hc_bypass && !keep_ffn_out && !metal_graph_debug_wants("ffn_shexp", il, pos0)) { \
             shared_down_f16 = ds4_gpu_matmul_q8_0_f16_out_tensor(g->batch_q_half, \
                                                                  model->map, \
                                                                  model->size, \
@@ -19218,7 +19445,15 @@ static bool metal_graph_encode_layer_ffn_batch(
     if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_ffn(g, g->batch_ffn_out, il, n_tokens);
     }
-    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+    if (ok && hc_bypass) {
+        /* identity hc-out: next = routed + shared + post-attention residual */
+        const uint32_t n_elem = (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD);
+        ok = ds4_gpu_add_tensor(next_hc_view, g->batch_routed_out,
+                                g->batch_shared_out, n_elem) != 0;
+        if (ok) ok = ds4_gpu_add_tensor(next_hc_view, next_hc_view,
+                                        g->batch_after_attn_hc, n_elem) != 0;
+    }
+    else if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = ds4_gpu_hc_expand_split_tensor(next_hc_view,
                                               g->batch_ffn_out,
                                               g->batch_after_attn_hc,
@@ -21801,6 +22036,12 @@ struct ds4_vocab {
     int think_start_id;
     int think_end_id;
     int dsml_id;
+    /* GLM-5.2 (GlmMoeDsa) tokenizer: distinct special markers + a [gMASK]<sop>
+     * prompt prefix. is_glm gates the GLM chat template in encode_chat_prompt. */
+    bool is_glm;
+    int sop_id;
+    int system_id;
+    int observation_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
@@ -22220,9 +22461,16 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
     }
 }
 
-static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
+/* Non-fatal lookup: returns -1 if the token string is absent. */
+static int vocab_lookup_opt(const ds4_vocab *vocab, const char *text) {
     int token = -1;
-    if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) {
+    if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) return -1;
+    return token;
+}
+
+static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
+    int token = vocab_lookup_opt(vocab, text);
+    if (token < 0) {
         fprintf(stderr, "ds4: required tokenizer token is missing: %s\n", text);
         exit(1);
     }
@@ -22263,6 +22511,24 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
+    /* GLM-5.2 (GlmMoeDsa) ships a different special-token set than DeepSeek.
+     * Detect it by its sentinel and resolve the GLM markers; otherwise keep the
+     * (required) DeepSeek tokens so Flash/Pro behavior is byte-identical. */
+    vocab->is_glm = vocab_lookup_opt(vocab, "[gMASK]") >= 0 &&
+                    vocab_lookup_opt(vocab, "<|assistant|>") >= 0;
+    if (vocab->is_glm) {
+        vocab->bos_id         = vocab_lookup(vocab, "[gMASK]");
+        vocab->sop_id         = vocab_lookup(vocab, "<sop>");
+        vocab->eos_id         = vocab_lookup(vocab, "<|endoftext|>");
+        vocab->system_id      = vocab_lookup(vocab, "<|system|>");
+        vocab->user_id        = vocab_lookup(vocab, "<|user|>");
+        vocab->assistant_id   = vocab_lookup(vocab, "<|assistant|>");
+        vocab->observation_id = vocab_lookup_opt(vocab, "<|observation|>");
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id   = vocab_lookup(vocab, "</think>");
+        vocab->dsml_id        = -1;
+        return;
+    }
     vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
     vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
     vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
@@ -22288,6 +22554,25 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (vocab->is_glm) {
+        /* GLM-5.2 chat template:
+         * [gMASK]<sop>[<|system|>SYS]<|user|>PROMPT<|assistant|>[<think>|</think>] */
+        token_vec_push(out, vocab->bos_id);   /* [gMASK] */
+        token_vec_push(out, vocab->sop_id);   /* <sop>   */
+        if (system && system[0]) {
+            token_vec_push(out, vocab->system_id);
+            bpe_tokenize_text(vocab, system, out);
+        }
+        token_vec_push(out, vocab->user_id);
+        bpe_tokenize_text(vocab, prompt, out);
+        token_vec_push(out, vocab->assistant_id);
+        if (ds4_think_mode_enabled(think_mode)) {
+            token_vec_push(out, vocab->think_start_id);
+        } else {
+            token_vec_push(out, vocab->think_end_id);
+        }
+        return;
+    }
     token_vec_push(out, vocab->bos_id);
     if (think_mode == DS4_THINK_MAX) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
@@ -22544,6 +22829,19 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
+}
+
+/* End-of-turn test for the generation loop. DeepSeek stops on a single eos.
+ * GLM-5.2 ends an assistant turn with any of <|endoftext|>/<|user|>/<|observation|>
+ * (its generation_config eos_token_id set), so stop on those too. */
+static bool vocab_token_is_eot(const ds4_vocab *v, int token) {
+    if (token == v->eos_id) return true;
+    if (v->is_glm && (token == v->user_id || token == v->observation_id)) return true;
+    return false;
+}
+
+bool ds4_token_is_eot(ds4_engine *e, int token) {
+    return vocab_token_is_eot(&e->vocab, token);
 }
 
 int ds4_token_user(ds4_engine *e) {
@@ -22866,7 +23164,7 @@ static int generate_raw_swa_cpu(
         }
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (token == vocab->eos_id) break;
+        if (vocab_token_is_eot(vocab, token)) break;
 
         if (emit) emit(emit_ud, token);
         n_generated++;
@@ -23023,7 +23321,7 @@ static int generate_metal_graph_raw_swa(
         }
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (token == vocab->eos_id) break;
+        if (vocab_token_is_eot(vocab, token)) break;
 
         if (emit) emit(emit_ud, token);
         n_generated++;

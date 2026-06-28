@@ -35,6 +35,7 @@ typedef struct {
     float min_p;
     uint64_t seed;
     bool dump_tokens;
+    const char *raw_ids;  /* debug: comma-separated token ids, bypass tokenizer */
     const char *dump_logits_path;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
@@ -476,7 +477,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_token_is_eot(engine, token)) break;
 
         int toks[17];
         int ntok = 0;
@@ -512,7 +513,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == ds4_token_eos(engine)) {
+            if (ds4_token_is_eot(engine, toks[j])) {
                 stop = true;
                 break;
             }
@@ -766,7 +767,7 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
         }
         fputs("]}", fp);
 
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_token_is_eot(engine, token)) break;
         if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4: decode failed while dumping logprobs: %s\n", err);
             free(scores);
@@ -872,7 +873,20 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
 
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
-    build_prompt(engine, &cfg->gen, &prompt);
+    if (!cfg->gen.raw_ids) build_prompt(engine, &cfg->gen, &prompt);
+    if (cfg->gen.raw_ids) {
+        prompt.len = 0;
+        const char *s = cfg->gen.raw_ids;
+        while (*s) {
+            char *end = NULL;
+            long id = strtol(s, &end, 10);
+            if (end == s) break;
+            ds4_tokens_push(&prompt, (int)id);
+            s = end;
+            while (*s == ',' || *s == ' ') s++;
+        }
+        fprintf(stderr, "ds4: --raw-ids: %d tokens injected (tokenizer bypassed)\n", prompt.len);
+    }
 
     int rc = 0;
     if (cfg->gen.metal_graph_test) {
@@ -1147,7 +1161,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_token_is_eot(engine, token)) break;
 
         int toks[17];
         int ntok = 0;
@@ -1181,7 +1195,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == ds4_token_eos(engine)) {
+            if (ds4_token_is_eot(engine, toks[j])) {
                 stop = true;
                 break;
             }
@@ -1543,6 +1557,8 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
 #endif
+        } else if (!strcmp(arg, "--raw-ids")) {
+            c.gen.raw_ids = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {
@@ -1695,7 +1711,7 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_max_tokens);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
-    } else if (cfg.gen.prompt == NULL) {
+    } else if (cfg.gen.prompt == NULL && cfg.gen.raw_ids == NULL) {
         rc = run_repl(engine, &cfg);
     } else {
         rc = run_generation(engine, &cfg);

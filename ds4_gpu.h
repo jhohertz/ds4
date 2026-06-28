@@ -345,6 +345,18 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+/* GLM MLA kv-norm: normalize first kvl (c_kv) of an nhd-wide row, pass rope tail through. */
+int ds4_gpu_glm_kv_norm_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                kvl,
+        uint32_t                nhd,
+        uint32_t                rows,
+        float                   eps);
+
 int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,
         const ds4_gpu_tensor *q,
@@ -787,7 +799,8 @@ int ds4_gpu_router_select_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
-        const ds4_gpu_tensor *logits);
+        const ds4_gpu_tensor *logits,
+        int                     scoring_sigmoid);
 
 int ds4_gpu_router_select_batch_tensor(
         ds4_gpu_tensor       *selected,
@@ -807,7 +820,8 @@ int ds4_gpu_router_select_batch_tensor(
         uint32_t                n_expert,
         uint32_t                n_expert_used,
         float                   expert_weight_scale,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        int                     scoring_sigmoid);
 
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
 
