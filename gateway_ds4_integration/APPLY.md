@@ -134,3 +134,15 @@ won't co-schedule with `qwen3-235b`/`crimezero` TP=2 once the GPUs are taken).
   `make ds4-server CUDA_ARCH=native` from `vcnngr/ds4 @ glm-5.2-backend`.
 - Reasoning is already split into `reasoning`/`content` by the server (give enough `max_tokens`
   so the model closes `</think>` — think mode needs headroom).
+
+## Known engine bug: large-prefill grid.y overflow (workaround in the wrapper)
+
+At large prefill batch the CUDA kernel `quantize_q8_0_f32_kernel` is launched with
+`grid.y = n_tokens * n_groups` (ds4_cuda.cu:9405). When that exceeds CUDA's 65535 grid.y
+limit (e.g. a ~12k-token prompt with prefill_chunk 4096 and grouped attention output) the
+launch fails: `attention_output_q8_a prequant launch failed: invalid argument` → the worker
+drops → the request returns "distributed route incomplete: missing layer N". Small prompts
+never hit it. **Workaround:** `--prefill-chunk 512` in `ds4_serve.sh` keeps `x_rows` under the
+limit. **Proper fix (follow-up):** loop the launch over <=65535-row batches (offset xq/xscale/x
+pointers) or move x_rows into grid.x — removes the prompt-size ceiling with no prefill-speed
+hit. Variant-agnostic (any model with big-batch grouped attention output).

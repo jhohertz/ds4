@@ -25,7 +25,7 @@ fi
 # worker (background, its own GPU)
 CUDA_VISIBLE_DEVICES=$WGPU DS4_LOCK_FILE=$LOCKW \
   DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=$WCACHE DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=$WRES \
-  "$DS4" --role worker --layers "$WL" --coordinator 127.0.0.1 "$CPORT" -m "$M" -c "$CTX" &
+  "$DS4" --role worker --layers "$WL" --coordinator 127.0.0.1 "$CPORT" -m "$M" -c "$CTX" --prefill-chunk 512 &
 WPID=$!
 # stop the worker when this script (and thus the coordinator) dies
 trap 'kill -9 $WPID 2>/dev/null || true' EXIT
@@ -38,4 +38,4 @@ sleep 5
 exec env CUDA_VISIBLE_DEVICES=$CGPU DS4_LOCK_FILE=$LOCKC \
   DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=$WCACHE DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=$CRES \
   "$DS4" --role coordinator --layers "$CL" --listen 0.0.0.0 "$CPORT" \
-         --host "$HOST" --port "$PORT" -m "$M" -c "$CTX"
+         --host "$HOST" --port "$PORT" -m "$M" -c "$CTX" --prefill-chunk 512
