@@ -14,6 +14,16 @@ CGPU=$9; WGPU=${10}; CRES=${11}; WRES=${12}; WCACHE=${13}
 LOCKW=/tmp/ds4_gw_w.lock; LOCKC=/tmp/ds4_gw_c.lock
 rm -f "$LOCKW" "$LOCKC"
 
+# Single-process mode (tensor_parallel_size==1, e.g. DeepSeek-V4-Flash 81GB on ONE
+# H200): no worker/coordinator split. The gateway passes worker_layers="none".
+# CUDA_VISIBLE_DEVICES is already set by the caller (SLURM shard allocation, or the
+# gateway's _spawn_process) so we don't touch it.
+if [ "$WL" = "none" ]; then
+  exec env DS4_LOCK_FILE=$LOCKC \
+    DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=$WCACHE DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=$CRES \
+    "$DS4" -m "$M" -c "$CTX" --host "$HOST" --port "$PORT" --prefill-chunk 512
+fi
+
 # Under SLURM the 2 GPUs come from the allocation (CUDA_VISIBLE_DEVICES set by
 # SLURM), not the hardcoded 0/1. Bind worker -> first allocated, coordinator ->
 # second. Outside SLURM, use the passed coordinator_gpu/worker_gpu.
