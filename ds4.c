@@ -22598,7 +22598,32 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
     struct special {
         const char *text;
         int token;
-    } specials[] = {
+    };
+    /* GLM-5.2 marker set — checked first when serving a GLM model so a rendered
+     * chat that uses GLM-native markers (or the [gMASK]<sop> prefix) tokenizes to
+     * the right special ids. Gated on is_glm so the DeepSeek path is unchanged. */
+    if (vocab->is_glm) {
+        struct special glm[] = {
+            {"[gMASK]",        vocab->bos_id},
+            {"<sop>",          vocab->sop_id},
+            {"<|system|>",     vocab->system_id},
+            {"<|user|>",       vocab->user_id},
+            {"<|assistant|>",  vocab->assistant_id},
+            {"<|observation|>",vocab->observation_id},
+            {"<|endoftext|>",  vocab->eos_id},
+            {"<think>",        vocab->think_start_id},
+            {"</think>",       vocab->think_end_id},
+        };
+        for (size_t i = 0; i < sizeof(glm) / sizeof(glm[0]); i++) {
+            size_t n = strlen(glm[i].text);
+            if (glm[i].token >= 0 && !strncmp(p, glm[i].text, n)) {
+                *token = glm[i].token;
+                *len = n;
+                return true;
+            }
+        }
+    }
+    struct special specials[] = {
         {"<｜begin▁of▁sentence｜>", vocab->bos_id},
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"<｜User｜>",              vocab->user_id},
@@ -26293,6 +26318,10 @@ int ds4_engine_set_power(ds4_engine *e, int power_percent) {
 const char *ds4_engine_model_name(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_SHAPE_NAME;
+}
+
+bool ds4_engine_is_glm(ds4_engine *e) {
+    return e && e->vocab.is_glm;
 }
 
 int ds4_engine_layer_count(ds4_engine *e) {
