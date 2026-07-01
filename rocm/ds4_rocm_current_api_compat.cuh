@@ -362,6 +362,7 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
             DS4_ROCM_STREAM_READ_MAX_JOBS, sizeof(jobs[0]));
     if (!jobs) return 1;
     uint32_t job_count = 0;
+    uint32_t seeded_count = 0;
 
     for (uint32_t i = 0; i < n_experts; i++) {
         /* Stop once the configured cache is full; let warm decode misses
@@ -423,6 +424,7 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
                              NULL, NULL, 0, 0, 0};
         jobs[job_count++] = {entry.down, down_offset + down_rel, down_expert_bytes,
                              NULL, NULL, 0, 0, 0};
+        seeded_count++;
     }
 
     if (job_count != 0) {
@@ -438,7 +440,7 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
     }
     if (cuda_stream_cache_stats_on()) {
         g_stream_cache_stats.seed_calls++;
-        g_stream_cache_stats.seed_unique += n_experts;
+        g_stream_cache_stats.seed_unique += seeded_count;
     }
     free(jobs);
     return 1;

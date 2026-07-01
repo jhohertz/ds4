@@ -13633,6 +13633,12 @@ static bool metal_graph_use_q4_selected_shared_overlap(void) {
     return metal_graph_env_flag("DS4_METAL_Q4_SELECTED_OVERLAP_SHARED", &cache);
 }
 
+static bool metal_graph_decode_q4_selected_slots_expected(
+        const ds4_gpu_graph     *g,
+        const ds4_layer_weights *layer,
+        uint64_t                 gate_tensor_bytes,
+        uint64_t                 down_tensor_bytes);
+
 #ifdef DS4_ROCM_BUILD
 /*
  * ROCm has no batched/split decode kernels for Q4_K routed experts (those exist
@@ -13644,18 +13650,17 @@ static bool metal_graph_use_q4_selected_shared_overlap(void) {
 static bool metal_graph_use_rocm_q4_selected_shared_overlap(
         const ds4_gpu_graph     *g,
         const ds4_layer_weights *layer) {
-    return g &&
-           g->ssd_streaming &&
-           !g->quality &&
-           layer &&
-           layer->ffn_gate_exps &&
-           layer->ffn_up_exps &&
-           layer->ffn_down_exps &&
-           layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-           layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
-           layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
-           DS4_N_EXPERT_USED == 6 &&
-           DS4_N_EXPERT >= 128 &&
+    if (!g || !g->ssd_streaming || g->quality || !layer ||
+        !layer->ffn_gate_exps || !layer->ffn_up_exps || !layer->ffn_down_exps) {
+        return false;
+    }
+    if (!metal_graph_decode_q4_selected_slots_expected(
+            g, layer,
+            layer->ffn_gate_exps->bytes,
+            layer->ffn_down_exps->bytes)) {
+        return false;
+    }
+    return DS4_N_EXPERT >= 128 &&
            getenv("DS4_ROCM_DISABLE_Q4_SELECTED_SHARED_OVERLAP") == NULL;
 }
 #endif
