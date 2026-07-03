@@ -4,6 +4,10 @@ __device__ static float softplus_dev(float x) {
     return ds4_precise_log1pf(ds4_precise_expf(x));
 }
 
+__device__ static float sigmoid_dev(float x) {
+    return x >= 0.0f ? 1.0f / (1.0f + ds4_precise_expf(-x)) : ds4_precise_expf(x) / (1.0f + ds4_precise_expf(x));
+}
+
 __device__ __forceinline__ static bool router_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
     return av > bv || (av == bv && ai < bi);
 }
@@ -22,7 +26,8 @@ __global__ static void router_select_warp_topk_kernel(
         uint32_t n_tokens,
         float expert_weight_scale,
         int has_bias,
-        int hash_mode) {
+        int hash_mode,
+        int scoring_sigmoid) {
     const uint32_t lane = threadIdx.x;
     const uint32_t row_in_block = threadIdx.y;
     const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
@@ -37,15 +42,15 @@ __global__ static void router_select_warp_topk_kernel(
     float local_score[N_EXPERT / 32u];
 
     #pragma unroll
-    for (uint32_t j = 0; j < N_EXPERT / 32u; j++) {
-        const uint32_t e = lane + j * 32u;
-        const float p = ds4_precise_sqrtf(softplus_dev(log[e]));
-        local_prob[j] = p;
-        local_score[j] = p + (has_bias ? bias[e] : 0.0f);
-        sprob[row_in_block][e] = p;
-        prob[e] = p;
-    }
-    __syncwarp();
+     for (uint32_t j = 0; j < N_EXPERT / 32u; j++) {
+         const uint32_t e = lane + j * 32u;
+         const float p = scoring_sigmoid ? sigmoid_dev(log[e]) : ds4_precise_sqrtf(softplus_dev(log[e]));
+         local_prob[j] = p;
+         local_score[j] = p + (has_bias ? bias[e] : 0.0f);
+         sprob[row_in_block][e] = p;
+         prob[e] = p;
+     }
+     __syncwarp();
 
     if (hash_mode) {
         if (lane == 0) {
@@ -121,7 +126,7 @@ __global__ static void router_select_warp_topk_kernel(
     }
 }
 
-extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
+extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, int scoring_sigmoid) {
     const uint32_t active_n_expert = n_expert != 0u ? n_expert : DS4_ROCM_N_EXPERT;
     const float active_scale = expert_weight_scale != 0.0f ? expert_weight_scale : DS4_ROCM_EXPERT_WEIGHT_SCALE;
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u ||
@@ -156,18 +161,18 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
             router_select_warp_topk_kernel<DS4_ROCM_MAX_N_EXPERT><<<1, block>>>(
                     (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                     bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                    active_scale, has_bias && !hash_mode, hash_mode);
+                    active_scale, has_bias && !hash_mode, hash_mode, scoring_sigmoid);
         } else {
             router_select_warp_topk_kernel<DS4_ROCM_N_EXPERT><<<1, block>>>(
                     (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                     bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                    active_scale, has_bias && !hash_mode, hash_mode);
+                    active_scale, has_bias && !hash_mode, hash_mode, scoring_sigmoid);
         }
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
     }
     return ok;
 }
-extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
+extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens, int scoring_sigmoid) {
     const uint32_t active_n_expert = n_expert != 0u ? n_expert : DS4_ROCM_N_EXPERT;
     const float active_scale = expert_weight_scale != 0.0f ? expert_weight_scale : DS4_ROCM_EXPERT_WEIGHT_SCALE;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
@@ -211,7 +216,8 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                 n_tokens,
                 active_scale,
                 has_bias && !hash_mode,
-                hash_mode);
+                hash_mode,
+                scoring_sigmoid);
     } else {
         router_select_warp_topk_kernel<DS4_ROCM_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
                 (int32_t *)selected->ptr,
@@ -226,7 +232,40 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                 n_tokens,
                 active_scale,
                 has_bias && !hash_mode,
-                hash_mode);
+                hash_mode,
+                scoring_sigmoid);
     }
     return cuda_ok(cudaGetLastError(), "router_select launch");
+}
+
+__global__ static void glm_kv_norm_kernel(float *out, const float *x, const float *w,
+                                          uint32_t kvl, uint32_t nhd, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * nhd;
+    float *orow = out + (uint64_t)row * nhd;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < kvl; i += blockDim.x) { float v = xr[i]; sum += v * v; }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)kvl + eps);
+    for (uint32_t i = threadIdx.x; i < nhd; i += blockDim.x) {
+        orow[i] = (i < kvl) ? (xr[i] * scale * w[i]) : xr[i];
+    }
+}
+
+extern "C" int ds4_gpu_glm_kv_norm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t kvl, uint32_t nhd, uint32_t rows, float eps) {
+    if (!out || !x || !model_map || kvl == 0u || nhd == 0u || rows == 0u) return 0;
+    if (x->bytes < (uint64_t)rows * nhd * sizeof(float)) return 0;
+    if (out->bytes < (uint64_t)rows * nhd * sizeof(float)) return 0;
+    if (!cuda_model_range_fits(model_size, weight_offset, nhd * sizeof(float))) return 0;
+    const float *w = (const float *)cuda_model_range_ptr(model_map, weight_offset, nhd * sizeof(float), "glm_kv_norm_weight");
+    if (!w) return 0;
+    glm_kv_norm_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, kvl, nhd, rows, eps);
+    return cuda_ok(cudaGetLastError(), "glm_kv_norm launch");
 }
