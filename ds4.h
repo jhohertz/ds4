@@ -214,6 +214,8 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
+bool ds4_token_is_eot(ds4_engine *e, int token);
+bool ds4_engine_is_glm(ds4_engine *e);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
 
@@ -234,6 +236,7 @@ void ds4_session_report_progress(ds4_session *s, const char *event, int current,
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen);
+bool ds4_session_serving_ready(ds4_session *s);
 
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,

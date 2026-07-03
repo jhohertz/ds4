@@ -2286,7 +2286,7 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
 
 static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
-                                     ds4_think_mode think_mode) {
+                                     ds4_think_mode think_mode, bool is_glm) {
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
@@ -2310,9 +2310,13 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     }
 
     buf out = {0};
-    buf_puts(&out, "<｜begin▁of▁sentence｜>");
+    buf_puts(&out, "<｜begin▁of▁sentence｜>");   /* GLM: maps to [gMASK] */
+    if (is_glm) buf_puts(&out, "<sop>");        /* GLM prompt prefix [gMASK]<sop> */
     if (think_mode == DS4_THINK_MAX) buf_puts(&out, ds4_think_max_prefix());
-    buf_puts(&out, system.ptr ? system.ptr : "");
+    if (system.ptr && system.ptr[0]) {
+        if (is_glm) buf_puts(&out, "<|system|>");
+        buf_puts(&out, system.ptr);
+    }
 
     bool pending_assistant = false;
     bool pending_tool_result = false;
@@ -2810,7 +2814,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+                                             &r->tool_orders, r->think_mode,
+                                             ds4_engine_is_glm(e));
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
@@ -3020,7 +3025,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+                                             &r->tool_orders, r->think_mode,
+                                             ds4_engine_is_glm(e));
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);
@@ -3960,7 +3966,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+                                             &r->tool_orders, r->think_mode,
+                                             ds4_engine_is_glm(e));
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
@@ -10683,7 +10690,7 @@ decode_again:
             temperature = 0.0f;
         }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
-        if (token == ds4_token_eos(s->engine)) {
+        if (ds4_token_is_eot(s->engine, token)) {
             finish = "stop";
             break;
         }
@@ -10718,7 +10725,7 @@ decode_again:
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             token = toks[ti];
-            if (token == ds4_token_eos(s->engine)) {
+            if (ds4_token_is_eot(s->engine, token)) {
                 finish = "stop";
                 stop_decode = true;
                 break;
@@ -11709,6 +11716,22 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, s->enable_cors, 204, NULL, "");
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/health") || !strcmp(hr.path, "/healthz"))) {
+        /* Readiness probe (used by the Arma Gateway). For a distributed
+         * coordinator, report ready ONLY after the layer route is complete —
+         * otherwise the gateway proxies the first cold-load request before the
+         * workers register and it fails with "distributed route incomplete". */
+        if (ds4_session_serving_ready(s->session)) {
+            http_response(fd, s->enable_cors, 200, "application/json", "{\"status\":\"ok\"}\n");
+        } else {
+            http_response(fd, s->enable_cors, 503, "application/json",
+                          "{\"status\":\"loading\"}\n");
+        }
         http_request_free(&hr);
         goto done;
     }
