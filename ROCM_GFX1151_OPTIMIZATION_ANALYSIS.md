@@ -252,7 +252,7 @@ ROCM_CFLAGS = -O3 --amdgpu-early-optimizations --cuda-max-const-0-pointer
 
 5. **hipBLASLt workspace tuning** — ✅ **Completed**. Changed `max_workspace` from 0 to 4 MB. Benchmarking shows inconsistent results — prefill may improve but generation is unchanged. No regression observed, so this change is kept.
 
-6. **GTT memory for expert cache** — Use `hipMemoryTypeHostShared` for expert cache allocations on Strix Halo. Avoids VRAM fragmentation and simplifies memory management with unified memory.
+6. **GTT memory for expert cache** — ✅ **Completed**. Replaced `cudaMalloc` with `hipMallocHost` (pinned host memory) for expert cache allocations in `cuda_stream_selected_cache`, `cuda_stream_batch_selected_cache`, resident expert cache, and full-layer expert cache. Benchmarking shows no performance change for this workload but may reduce VRAM fragmentation for larger models.
 
 ### P2 (Medium Impact)
 
@@ -293,6 +293,7 @@ Key metrics:
 | All P0 changes | **55.11** (+7.6%) | 15.68 (+0.1%) |
 | + hipBLASLt workspace | **61.75** (+20.6% vs baseline) | 15.55 (-0.8%, noise) |
 | + hipBLASLt workspace (rerun) | 55.86 (+9.1% vs baseline) | 15.66 (-0.1%, noise) |
+| + GTT memory for expert cache | 51.53 (+0.6% vs baseline) | 15.70 (+0.2%, noise) |
 
 The prefill gain comes from always-cached IQ2 LUTs (P0.2) and skipping sorting for small batches (P0.3). Generation is unchanged — this model uses the Q8_K quantized mid path, so F16 mid (P0.1) defers its benefit to Q2_K models that use the float-down path.
 

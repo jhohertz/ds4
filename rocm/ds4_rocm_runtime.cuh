@@ -446,6 +446,25 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     return g_cuda_tmp;
 }
 
+// Allocate memory using host-pinned memory on Strix Halo to reduce VRAM fragmentation.
+// Falls back to cudaMalloc if host allocation fails.
+static int cuda_malloc_gtt(void **ptr, size_t bytes, const char *what) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    hipError_t err = hipMallocHost(ptr, bytes);
+    if (err == hipSuccess) return 1;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "host alloc failed for %s (%.2f MiB), falling back to VRAM: %s\n",
+            what ? what : "buffer", (double)bytes / 1048576.0, hipGetErrorString(err));
+#endif
+    cudaError_t cerr = cudaMalloc(ptr, bytes);
+    if (cerr != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "VRAM alloc failed for %s (%.2f MiB): %s\n",
+                what ? what : "buffer", (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
     return n_comp <= DS4_ROCM_ATTENTION_SCORE_CAP - DS4_ROCM_ATTENTION_RAW_SCORE_CAP;
 }
@@ -635,24 +654,17 @@ static int cuda_stream_selected_ensure_buffers(uint64_t gate_bytes, uint64_t dow
         g_stream_selected_cache.gate = NULL;
         g_stream_selected_cache.up = NULL;
         g_stream_selected_cache.gate_capacity = 0;
-        err = cudaMalloc((void **)&g_stream_selected_cache.gate, (size_t)gate_bytes);
-        if (err == cudaSuccess) {
-            err = cudaMalloc((void **)&g_stream_selected_cache.up, (size_t)gate_bytes);
-        }
-        if (err != cudaSuccess) {
-            fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming selected gate/up alloc failed (%.2f MiB): %s\n",
-                    (double)gate_bytes / 1048576.0,
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
+        if (!cuda_malloc_gtt((void **)&g_stream_selected_cache.gate, gate_bytes, "selected gate"))
             return 0;
-        }
+        if (!cuda_malloc_gtt((void **)&g_stream_selected_cache.up, gate_bytes, "selected up"))
+            return 0;
         g_stream_selected_cache.gate_capacity = gate_bytes;
     }
     if (g_stream_selected_cache.down_capacity < down_bytes) {
         if (g_stream_selected_cache.down) (void)cudaFree(g_stream_selected_cache.down);
         g_stream_selected_cache.down = NULL;
         g_stream_selected_cache.down_capacity = 0;
-        err = cudaMalloc((void **)&g_stream_selected_cache.down, (size_t)down_bytes);
+        if (!cuda_malloc_gtt((void **)&g_stream_selected_cache.down, down_bytes, "selected down"))
         if (err != cudaSuccess) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming selected down alloc failed (%.2f MiB): %s\n",
                     (double)down_bytes / 1048576.0,
@@ -1041,20 +1053,18 @@ static int cuda_stream_resident_alloc(
     }
 
     void *base = NULL;
-    cudaError_t err = cudaMalloc(&base, (size_t)bytes);
-    while (err != cudaSuccess && cuda_stream_resident_evict_one(layer, selected_ids, n_selected)) {
+    int ok = cuda_malloc_gtt(&base, bytes, "resident expert");
+    while (!ok && cuda_stream_resident_evict_one(layer, selected_ids, n_selected)) {
         (void)cudaGetLastError();
-        err = cudaMalloc(&base, (size_t)bytes);
+        ok = cuda_malloc_gtt(&base, bytes, "resident expert");
     }
-    if (err != cudaSuccess) {
+    if (!ok) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX "streaming expert cache allocation failed "
-                "for layer=%u expert=%d (%.2f MiB): %s\n",
+                "for layer=%u expert=%d (%.2f MiB)\n",
                 layer,
                 expert,
-                (double)bytes / 1048576.0,
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
+                (double)bytes / 1048576.0);
         return -1;
     }
 
@@ -1689,15 +1699,12 @@ static int cuda_stream_layer_expert_cache_load(
         }
         cuda_stream_resident_cache_release();
         void *base = NULL;
-        cudaError_t err = cudaMalloc(&base, (size_t)total_bytes);
-        if (err != cudaSuccess) {
+        if (!cuda_malloc_gtt(&base, total_bytes, "full-layer expert")) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX "streaming full-layer expert cache allocation "
-                    "failed for layer=%u (%.2f GiB): %s\n",
+                    "failed for layer=%u (%.2f GiB)\n",
                     layer,
-                    (double)total_bytes / 1073741824.0,
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
+                    (double)total_bytes / 1073741824.0);
             return 0;
         }
         slot.base = (char *)base;
