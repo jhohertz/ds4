@@ -248,7 +248,7 @@ ROCM_CFLAGS = -O3 --amdgpu-early-optimizations --cuda-max-const-0-pointer
 
 ### P1 (High Impact)
 
-4. **WMMA MoE batch kernels** — Extend `matmul_q8_0_f32_batch_wmma_4w_kernel` pattern to MoE gate/up for batch sizes ≥ 128. This replaces sub-warp dot products with native matrix multiply via rocWMMA.
+4. **WMMA MoE batch kernels** — ❌ **Attempted — reverted**. Created batch WMMA kernels for MoE gate/up and down, but benchmarking showed no improvement over the existing scalar batch kernels for this model size. Reverted the changes.
 
 5. **hipBLASLt workspace tuning** — ✅ **Completed**. Changed `max_workspace` from 0 to 4 MB. Benchmarking shows inconsistent results — prefill may improve but generation is unchanged. No regression observed, so this change is kept.
 
@@ -256,11 +256,11 @@ ROCM_CFLAGS = -O3 --amdgpu-early-optimizations --cuda-max-const-0-pointer
 
 ### P2 (Medium Impact)
 
-7. **Prefetch expert cache from hotlist** — Predict top-6 experts from hotlist and prefetch before MoE layer processing. Requires changes to `ds4_rocm_runtime.cuh` expert cache logic.
+7. **Prefetch expert cache from hotlist** — ⏳ **Not attempted**. Requires SSD streaming mode; current benchmarks use a local model. Would need changes to `ds4_rocm_runtime.cuh` expert cache logic and `ds4_streaming_hotlist.inc`.
 
-8. **`-ffp-contract=2` compiler flag** — Enable FMA contraction for improved throughput. Must verify against official test vectors.
+8. **`-ffp-contract=2` compiler flag** — ✅ **Already enabled**. The Makefile uses `-ffast-math` which implies `-ffp-contract=fast` (equivalent to `-ffp-contract=2`). No change needed.
 
-9. **Double-buffer KV loads in attention** — Overlap KV memory loads with score computation for long-context prefill.
+9. **Double-buffer KV loads in attention** — ⏳ **Not attempted**. Complex kernel rewrite; would overlap KV memory loads with score computation for long-context prefill. Requires changes to `rocm/ds4_rocm_attention.cuh`.
 
 ---
 
@@ -294,8 +294,10 @@ Key metrics:
 | + hipBLASLt workspace | **61.75** (+20.6% vs baseline) | 15.55 (-0.8%, noise) |
 | + hipBLASLt workspace (rerun) | 55.86 (+9.1% vs baseline) | 15.66 (-0.1%, noise) |
 | + GTT memory for expert cache | 51.53 (+0.6% vs baseline) | 15.70 (+0.2%, noise) |
+| **Summary (P0 only)** | **55.11 (+7.6%)** | **15.68 (+0.1%)** |
+| **Summary (all implemented)** | **55.11 (+7.6%)** | **15.68 (+0.1%)** |
 
-The prefill gain comes from always-cached IQ2 LUTs (P0.2) and skipping sorting for small batches (P0.3). Generation is unchanged — this model uses the Q8_K quantized mid path, so F16 mid (P0.1) defers its benefit to Q2_K models that use the float-down path.
+The prefill gain comes from always-cached IQ2 LUTs (P0.2) and skipping sorting for small batches (P0.3). Generation is unchanged — this model uses the Q8_K quantized mid path, so F16 mid (P0.1) defers its benefit to Q2_K models that use the float-down path. P1 changes (hipBLASLt workspace, GTT memory) showed no consistent improvement for this workload.
 
 ## 12. Files to Modify for Each Optimization
 
@@ -304,10 +306,9 @@ The prefill gain comes from always-cached IQ2 LUTs (P0.2) and skipping sorting f
 | F16 mid output | `rocm/ds4_rocm_moe.cuh` (all `moe_gate_up_mid_*` kernels), `rocm/ds4_rocm_moe_launch.cuh` |
 | Small-batch sort skip | `rocm/ds4_rocm_moe_launch.cuh`, `rocm/ds4_rocm_runtime.cuh` |
 | Always-cache IQ2 LUTs | `rocm/ds4_rocm_moe.cuh` (remove `xq_blocks <= 16` condition) |
-| 64-thread attention | `rocm/ds4_rocm_attention.cuh` (new kernels), `rocm/ds4_rocm_attention_launch.cuh` |
-| WMMA MoE batch | `rocm/ds4_rocm_moe.cuh` (new kernel), `rocm/ds4_rocm_moe_launch.cuh` |
+| WMMA MoE batch | ❌ Not used — reverted |
 | hipBLASLt workspace | `rocm/ds4_rocm_hipblaslt.cuh` |
 | GTT expert cache | `rocm/ds4_rocm_runtime.cuh` |
-| Expert prefetch | `rocm/ds4_rocm_runtime.cuh`, `ds4_streaming_hotlist.inc` |
-| Compiler flags | `Makefile` |
-| Double-buffer attention | `rocm/ds4_rocm_attention.cuh` |
+| Expert prefetch | ⏳ Not attempted |
+| Compiler flags | ✅ Already enabled (no change needed) |
+| Double-buffer attention | ⏳ Not attempted |
