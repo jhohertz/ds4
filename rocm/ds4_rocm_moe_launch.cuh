@@ -25,7 +25,7 @@ static int routed_moe_q2_float_down_launch(
         n_tokens == 0u || n_total_expert == 0u || n_total_expert > DS4_ROCM_MAX_N_EXPERT ||
         n_expert != DS4_ROCM_N_EXPERT_USED ||
         (expert_mid_dim % CUDA_QK_K) != 0u || expert_mid_dim == 0u || out_dim == 0u ||
-        !cuda_tensor_has_elems3(mid, n_tokens, n_expert, expert_mid_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems3(mid, n_tokens, n_expert, expert_mid_dim, sizeof(__half)) ||
         !cuda_tensor_has_elems3(down, n_tokens, n_expert, out_dim, sizeof(float)) ||
         !cuda_tensor_has_elems2(out, n_tokens, out_dim, sizeof(float))) {
         return 0;
@@ -69,34 +69,34 @@ static int routed_moe_q2_float_down_launch(
     const dim3 down_grid((out_dim + down_rpb - 1u) / down_rpb, n_total_expert, 1u);
     if (use_f16_down) {
         if (down_tile == 4u) {
-            moe_down_q2K_expert_batch_sharedmid_kernel<4,false,true><<<down_grid, down_threads, down_shmem>>>(
-                    NULL, down_h, down_w, (const float *)mid->ptr, NULL,
+            moe_down_q2K_expert_batch_sharedmid_kernel<4,true,true><<<down_grid, down_threads, down_shmem>>>(
+                    NULL, down_h, down_w, NULL, (const __half *)mid->ptr,
                     counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
                     down_expert_bytes, down_row_bytes);
         } else if (down_tile == 8u) {
-            moe_down_q2K_expert_batch_sharedmid_kernel<8,false,true><<<down_grid, down_threads, down_shmem>>>(
-                    NULL, down_h, down_w, (const float *)mid->ptr, NULL,
+            moe_down_q2K_expert_batch_sharedmid_kernel<8,true,true><<<down_grid, down_threads, down_shmem>>>(
+                    NULL, down_h, down_w, NULL, (const __half *)mid->ptr,
                     counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
                     down_expert_bytes, down_row_bytes);
         } else {
-            moe_down_q2K_expert_batch_sharedmid_kernel<16,false,true><<<down_grid, down_threads, down_shmem>>>(
-                    NULL, down_h, down_w, (const float *)mid->ptr, NULL,
+            moe_down_q2K_expert_batch_sharedmid_kernel<16,true,true><<<down_grid, down_threads, down_shmem>>>(
+                    NULL, down_h, down_w, NULL, (const __half *)mid->ptr,
                     counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
                     down_expert_bytes, down_row_bytes);
         }
     } else if (down_tile == 4u) {
         moe_down_q2K_expert_batch_sharedmid_kernel<4><<<down_grid, down_threads, down_shmem>>>(
-                (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                (float *)down->ptr, NULL, down_w, NULL, (const __half *)mid->ptr,
                 counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
                 down_expert_bytes, down_row_bytes);
     } else if (down_tile == 8u) {
         moe_down_q2K_expert_batch_sharedmid_kernel<8><<<down_grid, down_threads, down_shmem>>>(
-                (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                (float *)down->ptr, NULL, down_w, NULL, (const __half *)mid->ptr,
                 counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
                 down_expert_bytes, down_row_bytes);
     } else {
         moe_down_q2K_expert_batch_sharedmid_kernel<16><<<down_grid, down_threads, down_shmem>>>(
-                (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                (float *)down->ptr, NULL, down_w, NULL, (const __half *)mid->ptr,
                 counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
                 down_expert_bytes, down_row_bytes);
     }
@@ -126,8 +126,8 @@ static int routed_moe_q2_float_down_launch(
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 } else if (use_f16_down) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,false,true><<<grid, block, shmem_n2>>>(
-                            NULL, down_h, down_w, (const float *)mid->ptr, NULL,
+                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                            NULL, down_h, down_w, NULL, (const __half *)mid->ptr,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 } else if (hot_mid_f16 && mid_h_hot) {
@@ -136,8 +136,8 @@ static int routed_moe_q2_float_down_launch(
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 } else {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16><<<grid, block, shmem_n2>>>(
-                            (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true><<<grid, block, shmem_n2>>>(
+                            (float *)down->ptr, NULL, down_w, NULL, (const __half *)mid->ptr,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 }
@@ -154,8 +154,8 @@ static int routed_moe_q2_float_down_launch(
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 } else if (use_f16_down) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<16,16,16,16,false,true><<<grid, block, shmem_n2>>>(
-                            NULL, down_h, down_w, (const float *)mid->ptr, NULL,
+                    moe_down_q2K_hotlist_wmma_n2_kernel<16,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                            NULL, down_h, down_w, NULL, (const __half *)mid->ptr,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 } else if (hot_mid_f16 && mid_h_hot) {
@@ -164,8 +164,8 @@ static int routed_moe_q2_float_down_launch(
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 } else {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<16,16,16,16><<<grid, block, shmem_n2>>>(
-                            (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                    moe_down_q2K_hotlist_wmma_n2_kernel<16,16,16,16,true><<<grid, block, shmem_n2>>>(
+                            (float *)down->ptr, NULL, down_w, NULL, (const __half *)mid->ptr,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 }
@@ -182,8 +182,8 @@ static int routed_moe_q2_float_down_launch(
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 } else if (use_f16_down) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,false,true><<<grid, block, shmem_n2>>>(
-                            NULL, down_h, down_w, (const float *)mid->ptr, NULL,
+                    moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                            NULL, down_h, down_w, NULL, (const __half *)mid->ptr,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 } else if (hot_mid_f16 && mid_h_hot) {
@@ -192,8 +192,8 @@ static int routed_moe_q2_float_down_launch(
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 } else {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16><<<grid, block, shmem_n2>>>(
-                            (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                    moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,true><<<grid, block, shmem_n2>>>(
+                            (float *)down->ptr, NULL, down_w, NULL, (const __half *)mid->ptr,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
                 }
@@ -293,7 +293,7 @@ static int routed_moe_build_plan(
         !cuda_tensor_has_elems2(weights, n_tokens, n_expert, sizeof(float)) ||
         !cuda_tensor_has_elems3(gate, n_tokens, n_expert, expert_mid_dim, sizeof(float)) ||
         !cuda_tensor_has_elems3(up, n_tokens, n_expert, expert_mid_dim, sizeof(float)) ||
-        !cuda_tensor_has_elems3(mid, n_tokens, n_expert, expert_mid_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems3(mid, n_tokens, n_expert, expert_mid_dim, sizeof(__half)) ||
         !cuda_tensor_has_elems3(down, n_tokens, n_expert, out_dim, sizeof(float)) ||
         !cuda_tensor_has_elems2(out, n_tokens, out_dim, sizeof(float))) {
         return 0;
@@ -530,7 +530,7 @@ static int routed_moe_launch(
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
         const uint32_t pair_count = n_tokens * n_expert;
-        const uint32_t use_sorted_pairs = n_tokens > 1u &&
+        const uint32_t use_sorted_pairs = n_tokens > 8u &&
             (!q4k_path || n_tokens >= 32u);
         const uint32_t use_expert_tiles = use_sorted_pairs;
         const uint32_t expert_tile_m = 8u;
@@ -540,7 +540,7 @@ static int routed_moe_launch(
         const uint32_t use_gate_row2048 = !q4k_path && use_expert_tiles && n_tokens >= 128u;
         const uint32_t use_down_tile16 = !q4k_path && use_atomic_down && n_tokens >= 128u;
         const uint32_t use_decode_lut_gate =
-            n_tokens == 1u && xq_blocks <= 16u;
+            n_tokens == 1u;
         const uint32_t gate_row_span = 1024u;
         const uint32_t down_row_span = 1024u;
         const uint32_t use_down_row2048 = !q4k_path && use_atomic_down && use_down_tile16;
@@ -568,7 +568,7 @@ static int routed_moe_launch(
                     moe_gate_up_mid_qwarp32_ptrs_split_kernel<<<qgrid, 256>>>(
                             (float *)gate->ptr,
                             (float *)up->ptr,
-                            (float *)mid->ptr,
+                            (__half *)mid->ptr,
                             resident_gate_slot_ptrs,
                             resident_up_slot_ptrs,
                             stream_batch_pair_missing,
@@ -594,7 +594,7 @@ static int routed_moe_launch(
                     moe_gate_up_mid_qwarp32_ptrs_split_kernel<<<qgrid, 256>>>(
                             (float *)gate->ptr,
                             (float *)up->ptr,
-                            (float *)mid->ptr,
+                            (__half *)mid->ptr,
                             missing_gate_slot_ptrs,
                             missing_up_slot_ptrs,
                             stream_batch_pair_missing,
@@ -615,7 +615,7 @@ static int routed_moe_launch(
                 moe_gate_up_mid_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
-                        (float *)mid->ptr,
+                        (__half *)mid->ptr,
                         gate_slot_ptrs,
                         up_slot_ptrs,
                         xq,
@@ -632,9 +632,9 @@ static int routed_moe_launch(
             }
             if (ok) {
                 dim3 midq_grid(midq_blocks, pair_count, 1);
-                q8_K_quantize_kernel<<<midq_grid, 256>>>(
+                q8_K_quantize_half_kernel<<<midq_grid, 256>>>(
                         midq,
-                        (const float *)mid->ptr,
+                        (const __half *)mid->ptr,
                         expert_mid_dim,
                         pair_count);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe streaming batch mid quantize launch");
@@ -804,7 +804,7 @@ static int routed_moe_launch(
                     moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
-                        (float *)mid->ptr,
+                        (__half *)mid->ptr,
                         gate_slot_ptrs,
                         up_slot_ptrs,
                         xq,
@@ -821,7 +821,7 @@ static int routed_moe_launch(
                     moe_gate_up_mid_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
-                        (float *)mid->ptr,
+                        (__half *)mid->ptr,
                         gate_slot_ptrs,
                         up_slot_ptrs,
                         xq,
@@ -844,7 +844,7 @@ static int routed_moe_launch(
                     moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
-                        (float *)mid->ptr,
+                        (__half *)mid->ptr,
                         gate_slot_ptrs,
                         up_slot_ptrs,
                         xq,
@@ -861,7 +861,7 @@ static int routed_moe_launch(
                     moe_gate_up_mid_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
-                        (float *)mid->ptr,
+                        (__half *)mid->ptr,
                         gate_slot_ptrs,
                         up_slot_ptrs,
                         xq,
@@ -888,14 +888,14 @@ static int routed_moe_launch(
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
                     if (expert_tile_m == 8u) {
                         moe_gate_up_mid_q4K_expert_tile8_row32_kernel<<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            (float *)gate->ptr, (float *)up->ptr, (__half *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
                             0u, write_gate_up, clamp);
                     } else {
                         moe_gate_up_mid_q4K_expert_tile4_row32_kernel<<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            (float *)gate->ptr, (float *)up->ptr, (__half *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
@@ -905,7 +905,7 @@ static int routed_moe_launch(
                     if (gate_row_span == 512u) {
                         dim3 tgrid((expert_mid_dim + 511u) / 512u, tile_capacity, 1);
                         moe_gate_up_mid_expert_tile8_rowspan_kernel<512><<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            (float *)gate->ptr, (float *)up->ptr, (__half *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
@@ -913,7 +913,7 @@ static int routed_moe_launch(
                     } else if (gate_row_span == 1024u) {
                         dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
                         moe_gate_up_mid_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            (float *)gate->ptr, (float *)up->ptr, (__half *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
@@ -921,7 +921,7 @@ static int routed_moe_launch(
                     } else {
                         dim3 tgrid((expert_mid_dim + 2047u) / 2048u, tile_capacity, 1);
                         moe_gate_up_mid_expert_tile8_row2048_kernel<<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            (float *)gate->ptr, (float *)up->ptr, (__half *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
@@ -930,7 +930,7 @@ static int routed_moe_launch(
                 } else if (expert_tile_m == 8u) {
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
                     moe_gate_up_mid_expert_tile8_row32_kernel<<<tgrid, 256>>>(
-                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                        (float *)gate->ptr, (float *)up->ptr, (__half *)mid->ptr,
                         gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                         gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
@@ -938,7 +938,7 @@ static int routed_moe_launch(
                 } else {
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
                     moe_gate_up_mid_expert_tile4_row32_kernel<<<tgrid, 256>>>(
-                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                        (float *)gate->ptr, (float *)up->ptr, (__half *)mid->ptr,
                         gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                         gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
@@ -949,7 +949,7 @@ static int routed_moe_launch(
                 moe_gate_up_mid_sorted_p2_qwarp32_kernel<<<p2_mgrid, 256>>>(
                     (float *)gate->ptr,
                     (float *)up->ptr,
-                    (float *)mid->ptr,
+                    (__half *)mid->ptr,
                     gate_w,
                     up_w,
                     xq,
@@ -968,7 +968,7 @@ static int routed_moe_launch(
                     moe_gate_up_mid_q4K_sorted_qwarp32_kernel<<<mgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
-                        (float *)mid->ptr,
+                        (__half *)mid->ptr,
                         gate_w,
                         up_w,
                         xq,
@@ -985,7 +985,7 @@ static int routed_moe_launch(
                     moe_gate_up_mid_sorted_qwarp32_kernel<<<mgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
-                        (float *)mid->ptr,
+                        (__half *)mid->ptr,
                         gate_w,
                         up_w,
                         xq,
@@ -1005,7 +1005,7 @@ static int routed_moe_launch(
                     moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
-                        (float *)mid->ptr,
+                        (__half *)mid->ptr,
                         gate_w,
                         up_w,
                         xq,
@@ -1022,7 +1022,7 @@ static int routed_moe_launch(
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
-                        (float *)mid->ptr,
+                        (__half *)mid->ptr,
                         gate_w,
                         up_w,
                         xq,
@@ -1040,7 +1040,7 @@ static int routed_moe_launch(
                     moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
-                        (float *)mid->ptr,
+                        (__half *)mid->ptr,
                         gate_w,
                         up_w,
                         xq,
@@ -1070,25 +1070,25 @@ static int routed_moe_launch(
                                             (4u * mt * bm * bn) * sizeof(float);
                     if (use_iq2_hot_f16_mid && use_iq2_x_f16) {
                         moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
-                                NULL, iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
+                                iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else if (use_iq2_hot_f16_mid) {
                         moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<4,16,16,16,true><<<grid, block, shmem_n2>>>(
-                                NULL, iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, NULL,
+                                iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, NULL,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else if (use_iq2_x_f16) {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<4,16,16,16,false,true><<<grid, block, shmem_n2>>>(
-                                (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
+                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                                (__half *)mid->ptr, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<4,16,16,16><<<grid, block, shmem_n2>>>(
-                                (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, NULL,
+                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<4,16,16,16,true><<<grid, block, shmem_n2>>>(
+                                (__half *)mid->ptr, gate_w, up_w, (const float *)x->ptr, NULL,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
@@ -1103,25 +1103,25 @@ static int routed_moe_launch(
                                             (4u * mt * bm * bn) * sizeof(float);
                     if (use_iq2_hot_f16_mid && use_iq2_x_f16) {
                         moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<8,16,16,16,true,true><<<grid, block, shmem_n2>>>(
-                                NULL, iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
+                                iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else if (use_iq2_hot_f16_mid) {
                         moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<8,16,16,16,true><<<grid, block, shmem_n2>>>(
-                                NULL, iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, NULL,
+                                iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, NULL,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else if (use_iq2_x_f16) {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<8,16,16,16,false,true><<<grid, block, shmem_n2>>>(
-                                (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
+                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<8,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                                (__half *)mid->ptr, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<8,16,16,16><<<grid, block, shmem_n2>>>(
-                                (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, NULL,
+                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<8,16,16,16,true><<<grid, block, shmem_n2>>>(
+                                (__half *)mid->ptr, gate_w, up_w, (const float *)x->ptr, NULL,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
@@ -1136,7 +1136,7 @@ static int routed_moe_launch(
             sorted_pairs && sorted_offsets && sorted_counts && tile_experts;
         if (ok && !use_iq2_q2_float_down) {
             dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
-            q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
+            q8_K_quantize_half_kernel<<<midq_grid, 256>>>(midq, (const __half *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
             ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
         }
         int split_ptr_down_done = 0;
@@ -1447,7 +1447,7 @@ static int routed_moe_launch(
             ? wmma_hot_threshold : 0u;
         dim3 gate_grid((expert_mid_dim + gate_rpb - 1u) / gate_rpb, bucket_count, 1);
         moe_gate_up_mid_q2K_expert_batch_sharedx_kernel<4><<<gate_grid, gate_threads, gate_shmem>>>(
-                (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
+                (__half *)mid->ptr, gate_w, up_w, (const float *)x->ptr, (const float *)weights->ptr,
                 counts, offsets, sorted_pairs, 1u, scalar_max, expert_in_dim, expert_mid_dim,
                 gate_expert_bytes, gate_row_bytes, clamp);
         if (!cuda_ok(cudaGetLastError(), "routed_moe q2 expert gate/up launch")) return 0;
@@ -1464,7 +1464,7 @@ static int routed_moe_launch(
                                     wmma_f16_low_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
                          "routed_moe q2 wmma f16-low hot copy")) return 0;
             moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
-                    NULL, wmma_mid_h, gate_w, up_w, (const float *)x->ptr, wmma_x_h, (const float *)weights->ptr,
+                    wmma_mid_h, gate_w, up_w, (const float *)x->ptr, wmma_x_h, (const float *)weights->ptr,
                     counts, offsets, sorted_pairs, wmma_gate_f16_low_dev, wmma_f16_low_count,
                     expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
             if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma f16-low gate/up launch")) return 0;
@@ -1481,7 +1481,7 @@ static int routed_moe_launch(
                                     wmma_f16_hot_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
                          "routed_moe q2 wmma f16-mid hot copy")) return 0;
             moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel<8,16,16,16,true,true><<<grid, block, shmem_n2>>>(
-                    NULL, wmma_mid_h, gate_w, up_w, (const float *)x->ptr, wmma_x_h, (const float *)weights->ptr,
+                    wmma_mid_h, gate_w, up_w, (const float *)x->ptr, wmma_x_h, (const float *)weights->ptr,
                     counts, offsets, sorted_pairs, wmma_gate_hot_dev, wmma_f16_hot_count,
                     expert_in_dim, expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
             if (!cuda_ok(cudaGetLastError(), "routed_moe q2 wmma f16-mid gate/up launch")) return 0;
@@ -1489,13 +1489,13 @@ static int routed_moe_launch(
 #endif
         dim3 down_grid((out_dim + down_rpb - 1u) / down_rpb, bucket_count, 1);
         if (moe_wmma_hot) {
-            moe_down_q2K_expert_batch_sharedmid_kernel<4,false,true><<<down_grid, down_threads, down_shmem>>>(
-                    NULL, wmma_down_h, down_w, (const float *)mid->ptr, NULL,
+            moe_down_q2K_expert_batch_sharedmid_kernel<4,true,true><<<down_grid, down_threads, down_shmem>>>(
+                    NULL, wmma_down_h, down_w, NULL, (const __half *)mid->ptr,
                     counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
                     down_expert_bytes, down_row_bytes);
         } else {
             moe_down_q2K_expert_batch_sharedmid_kernel<4><<<down_grid, down_threads, down_shmem>>>(
-                    (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                    (float *)down->ptr, NULL, down_w, NULL, (const __half *)mid->ptr,
                     counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
                     down_expert_bytes, down_row_bytes);
         }
@@ -1573,7 +1573,7 @@ static int routed_moe_launch(
                 moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel<<<gate_grid, 256u>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
-                        (float *)mid->ptr,
+                        (__half *)mid->ptr,
                         gate_w,
                         up_w,
                         xq_gate,
@@ -1593,7 +1593,7 @@ static int routed_moe_launch(
             moe_gate_up_mid_q2K_rows_rpb1_w32_kernel<<<gate_grid, 32u>>>(
                     (float *)gate->ptr,
                     (float *)up->ptr,
-                    (float *)mid->ptr,
+                    (__half *)mid->ptr,
                     gate_w,
                     up_w,
                     (const float *)x->ptr,
@@ -1612,7 +1612,7 @@ static int routed_moe_launch(
             moe_gate_up_mid_q2K_rows_w32_kernel<<<gate_grid, threads>>>(
                     (float *)gate->ptr,
                     (float *)up->ptr,
-                    (float *)mid->ptr,
+                    (__half *)mid->ptr,
                     gate_w,
                     up_w,
                     (const float *)x->ptr,
@@ -1635,7 +1635,7 @@ static int routed_moe_launch(
         if (q8k_down) {
             cuda_block_q8_K *midq = (cuda_block_q8_K *)down->ptr;
             dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
-            q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
+            q8_K_quantize_half_kernel<<<midq_grid, 256>>>(midq, (const __half *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
             ok_decode_moe = cuda_ok(cudaGetLastError(), "routed_moe q2 oldhip q8k mid quantize launch");
             if (ok_decode_moe) {
                 moe_down_sum6_qwarp32_kernel<<<(out_dim + 31u) / 32u, 256>>>(
@@ -1654,7 +1654,7 @@ static int routed_moe_launch(
             moe_down_q2K_sum_rows_w32_kernel<<<down_grid, threads>>>(
                     (float *)out->ptr,
                     down_w,
-                    (const float *)mid->ptr,
+                    (const __half *)mid->ptr,
                     (const int32_t *)selected_exec->ptr,
                     n_tokens,
                     expert_mid_dim,
@@ -1672,7 +1672,7 @@ static int routed_moe_launch(
             moe_gate_up_mid_q2K_f32_kernel<<<mgrid, 256>>>(
                 (float *)gate->ptr,
                 (float *)up->ptr,
-                (float *)mid->ptr,
+                (__half *)mid->ptr,
                 gate_w,
                 up_w,
                 (const float *)x->ptr,
@@ -1688,7 +1688,7 @@ static int routed_moe_launch(
             moe_gate_up_mid_f32_kernel<<<mgrid, 256>>>(
                 (float *)gate->ptr,
                 (float *)up->ptr,
-                (float *)mid->ptr,
+                (__half *)mid->ptr,
                 gate_w,
                 up_w,
                 (const float *)x->ptr,
@@ -1708,7 +1708,7 @@ static int routed_moe_launch(
         moe_down_f32_kernel<<<dgrid, 256>>>(
             (float *)down->ptr,
             down_w,
-            (const float *)mid->ptr,
+            (const __half *)mid->ptr,
             (const int32_t *)selected_exec->ptr,
             down_expert_bytes,
             down_row_bytes,
@@ -1727,16 +1727,23 @@ static int routed_moe_launch(
 }
 
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
-                             gate_offset, up_offset, down_offset,
-                             gate_type, down_type,
-                             gate_expert_bytes, gate_row_bytes,
-                             down_expert_bytes, down_row_bytes,
-                             expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, layer_index, 1);
+    int ok = routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                               gate_offset, up_offset, down_offset,
+                               gate_type, down_type,
+                               gate_expert_bytes, gate_row_bytes,
+                               down_expert_bytes, down_row_bytes,
+                               expert_in_dim, expert_mid_dim, out_dim,
+                               selected, weights, n_total_expert, n_expert, clamp, x, layer_index, 1);
+    if (ok) {
+        const uint64_t n = (uint64_t)1 * n_expert * expert_mid_dim;
+        const uint64_t n_blocks = (n + 255u) / 256u;
+        f16_to_f32_kernel<<<n_blocks, 256>>>((float *)mid->ptr, (const __half *)mid->ptr, n);
+        ok = cuda_ok(cudaGetLastError(), "routed_moe f16_to_f32 conversion");
+    }
+    return ok;
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
-    if (mid_is_f16) *mid_is_f16 = false;
+    if (mid_is_f16) *mid_is_f16 = true;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,

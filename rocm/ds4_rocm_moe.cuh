@@ -480,6 +480,55 @@ __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
     return v;
 }
 
+__global__ static void q8_K_quantize_half_kernel(cuda_block_q8_K *out, const __half *x, uint32_t in_dim, uint32_t n_rows) {
+    uint32_t b = blockIdx.x;
+    uint32_t row = blockIdx.y;
+    if (row >= n_rows || b >= in_dim / CUDA_QK_K) return;
+    const __half *xr = x + (uint64_t)row * in_dim + (uint64_t)b * CUDA_QK_K;
+    cuda_block_q8_K *yb = out + (uint64_t)row * (in_dim / CUDA_QK_K) + b;
+    __shared__ float abs_part[256];
+    __shared__ float val_part[256];
+    __shared__ float maxv_s;
+    __shared__ float iscale_s;
+    uint32_t tid = threadIdx.x;
+    float v = tid < CUDA_QK_K ? __half2float(xr[tid]) : 0.0f;
+    abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
+    val_part[tid] = v;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+            abs_part[tid] = abs_part[tid + stride];
+            val_part[tid] = val_part[tid + stride];
+        }
+        __syncthreads();
+    }
+    float amax = abs_part[0];
+    if (amax == 0.0f) {
+        if (tid == 0) yb->d = 0.0f;
+        if (tid < CUDA_QK_K) yb->qs[tid] = 0;
+        if (tid < CUDA_QK_K / 16) yb->bsums[tid] = 0;
+        return;
+    }
+    if (tid == 0) {
+        maxv_s = val_part[0];
+        iscale_s = -127.0f / maxv_s;
+    }
+    __syncthreads();
+    if (tid < CUDA_QK_K) {
+        int qv = (int)lrintf(iscale_s * __half2float(xr[tid]));
+        if (qv > 127) qv = 127;
+        if (qv < -128) qv = -128;
+        yb->qs[tid] = (int8_t)qv;
+    }
+    __syncthreads();
+    if (tid < CUDA_QK_K / 16) {
+        int sum = 0;
+        for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
+        yb->bsums[tid] = (int16_t)sum;
+    }
+    if (tid == 0) yb->d = 1.0f / iscale_s;
+}
+
 __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x, uint32_t in_dim, uint32_t n_rows) {
     uint32_t b = blockIdx.x;
     uint32_t row = blockIdx.y;
@@ -532,7 +581,7 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
 __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -584,14 +633,14 @@ __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
     }
 }
 
 __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_warp8_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -633,14 +682,14 @@ __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_warp8_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
     }
 }
 
 __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_hwarp16_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -681,14 +730,14 @@ __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_hwarp16_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
     }
 }
 
 __global__ static void moe_gate_up_mid_qwarp32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -733,7 +782,7 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
             const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
             gate_out[off] = gate;
             up_out[off] = up;
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
         }
     }
 }
@@ -741,7 +790,7 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
 __global__ static void moe_gate_up_mid_qwarp32_ptrs_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char * const *gate_slots,
         const char * const *up_slots,
         const cuda_block_q8_K *xq,
@@ -788,7 +837,7 @@ __global__ static void moe_gate_up_mid_qwarp32_ptrs_kernel(
             const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
             gate_out[off] = gate;
             up_out[off] = up;
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
         }
     }
 }
@@ -796,7 +845,7 @@ __global__ static void moe_gate_up_mid_qwarp32_ptrs_kernel(
 __global__ static void moe_gate_up_mid_qwarp32_ptrs_split_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char * const *gate_slots,
         const char * const *up_slots,
         const uint8_t *pair_missing,
@@ -846,7 +895,7 @@ __global__ static void moe_gate_up_mid_qwarp32_ptrs_split_kernel(
             const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
             gate_out[off] = gate;
             up_out[off] = up;
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
         }
     }
 }
@@ -854,7 +903,7 @@ __global__ static void moe_gate_up_mid_qwarp32_ptrs_split_kernel(
 __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -883,11 +932,12 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     __shared__ uint8_t s_iq2_signs[128];
     if (xq_blocks <= 16u) {
         for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
         __syncthreads();
         xqb = sxq;
     }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
     for (uint32_t rr = 0; rr < 4u; rr++) {
         uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
@@ -912,7 +962,7 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
         }
     }
 }
@@ -920,7 +970,7 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
 __global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char * const *gate_slots,
         const char * const *up_slots,
         const cuda_block_q8_K *xq,
@@ -951,11 +1001,12 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
     __shared__ uint8_t s_iq2_signs[128];
     if (xq_blocks <= 16u) {
         for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
         __syncthreads();
         xqb = sxq;
     }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
     for (uint32_t rr = 0; rr < 4u; rr++) {
         uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
@@ -980,7 +1031,7 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
         }
     }
 }
@@ -1084,7 +1135,7 @@ __global__ static void moe_build_expert_tiles_kernel(
 __global__ static void moe_gate_up_mid_sorted_qwarp32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -1126,14 +1177,14 @@ __global__ static void moe_gate_up_mid_sorted_qwarp32_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
     }
 }
 
 __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_expert_tile8_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -1187,7 +1238,7 @@ __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_expert_tile8_kernel(
             const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
             gate_out[off] = gate;
             up_out[off] = up;
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
         }
     }
 }
@@ -1195,7 +1246,7 @@ __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_expert_tile8_kernel(
 __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -1270,7 +1321,7 @@ __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
                 gate_out[off] = gate[p];
                 up_out[off] = up[p];
             }
-            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+            mid_out[off] = (__half)((gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]]);
         }
     }
 }
@@ -1278,7 +1329,7 @@ __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
 __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -1327,11 +1378,12 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
         __syncthreads();
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
     if (row >= expert_mid_dim) return;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -1363,7 +1415,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
                 gate_out[off] = gate[p];
                 up_out[off] = up[p];
             }
-            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+            mid_out[off] = (__half)((gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]]);
         }
     }
 }
@@ -1371,7 +1423,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
 __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -1420,11 +1472,12 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
         __syncthreads();
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
     for (uint32_t rr = 0; rr < 64u; rr++) {
         uint32_t row = blockIdx.x * 2048u + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
@@ -1458,7 +1511,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
                     gate_out[off] = gate[p];
                     up_out[off] = up[p];
                 }
-                mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+                mid_out[off] = (__half)((gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]]);
             }
         }
     }
@@ -1468,7 +1521,7 @@ template <uint32_t ROW_SPAN>
 __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -1517,11 +1570,12 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
         __syncthreads();
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
@@ -1555,7 +1609,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
                     gate_out[off] = gate[p];
                     up_out[off] = up[p];
                 }
-                mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+                mid_out[off] = (__half)((gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]]);
             }
         }
     }
@@ -1564,7 +1618,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
 __global__ static void moe_gate_up_mid_sorted_p2_qwarp32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -1609,14 +1663,14 @@ __global__ static void moe_gate_up_mid_sorted_p2_qwarp32_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
     }
 }
 
 __global__ static void moe_gate_up_mid_q4K_sorted_qwarp32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -1658,14 +1712,14 @@ __global__ static void moe_gate_up_mid_q4K_sorted_qwarp32_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
     }
 }
 
 __global__ static void moe_gate_up_mid_q4K_expert_tile4_row32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -1740,7 +1794,7 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile4_row32_kernel(
                 gate_out[off] = gate[p];
                 up_out[off] = up[p];
             }
-            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+            mid_out[off] = (__half)((gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]]);
         }
     }
 }
@@ -1748,7 +1802,7 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile4_row32_kernel(
 __global__ static void moe_gate_up_mid_q4K_expert_tile8_row32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -1827,7 +1881,7 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_row32_kernel(
                 gate_out[off] = gate[p];
                 up_out[off] = up[p];
             }
-            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+            mid_out[off] = (__half)((gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]]);
         }
     }
 }
@@ -1945,7 +1999,7 @@ __global__ static void moe_down_qwarp32_kernel(
 __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -1991,7 +2045,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
         }
     }
 }
@@ -1999,7 +2053,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
 __global__ static void moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
@@ -2051,7 +2105,7 @@ __global__ static void moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
         }
     }
 }
@@ -3095,7 +3149,7 @@ __device__ __forceinline__ static float moe_silu_oldhip(float x) {
 __global__ __launch_bounds__(32) static void moe_gate_up_mid_q2K_rows_rpb1_w32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const float *x,
@@ -3153,14 +3207,14 @@ __global__ __launch_bounds__(32) static void moe_gate_up_mid_q2K_rows_rpb1_w32_k
             gate_out[off] = gate;
             up_out[off] = up;
         }
-        mid_out[off] = moe_silu_oldhip(gate) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (__half)(moe_silu_oldhip(gate) * up * weights[(uint64_t)tok * n_expert + slot]);
     }
 }
 
 __global__ static void moe_gate_up_mid_q2K_rows_w32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const float *x,
@@ -3221,14 +3275,14 @@ __global__ static void moe_gate_up_mid_q2K_rows_w32_kernel(
             gate_out[off] = gate;
             up_out[off] = up;
         }
-        mid_out[off] = moe_silu_oldhip(gate) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (__half)(moe_silu_oldhip(gate) * up * weights[(uint64_t)tok * n_expert + slot]);
     }
 }
 
 __global__ static void moe_down_q2K_sum_rows_w32_kernel(
         float *out,
         const char *down_base,
-        const float *mid,
+        const __half *mid,
         const int32_t *selected,
         uint32_t n_tokens,
         uint32_t expert_mid_dim,
@@ -3250,7 +3304,7 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
         int32_t expert_i = selected[(uint64_t)tok * 6u + slot];
         if (expert_i < 0) expert_i = 0;
         const unsigned char *dr = (const unsigned char *)down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
-        const float *mr = mid + ((uint64_t)tok * 6u + slot) * expert_mid_dim;
+        const __half *mr = mid + ((uint64_t)tok * 6u + slot) * expert_mid_dim;
         for (uint32_t b = 0; b < nb; b++) {
             const unsigned char *db = dr + (uint64_t)b * 84u;
             float d, dmin;
@@ -3259,7 +3313,7 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
 #pragma unroll
             for (uint32_t kk = 0; kk < 8u; kk++) {
                 const uint32_t i = lane + (kk << 5u);
-                acc += q2_K_dequant_256_scaled_w32(db, lane, kk, d, dmin) * mr[mbase + i];
+                acc += q2_K_dequant_256_scaled_w32(db, lane, kk, d, dmin) * __half2float(mr[mbase + i]);
             }
         }
     }
@@ -3269,8 +3323,8 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
 
 template <uint32_t PAIR_TILE, bool OUT_F16=false>
 __global__ static void moe_gate_up_mid_q2K_expert_batch_sharedx_kernel(
-        float *mid_out,
-        half *mid_out_h,
+
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const float *x,
@@ -3360,8 +3414,8 @@ __global__ static void moe_gate_up_mid_q2K_expert_batch_sharedx_kernel(
                         if (upv < -clamp) upv = -clamp;
                     }
                     const float v = moe_silu_oldhip(g) * upv * weights[pair[u]];
-                    if (OUT_F16) mid_out_h[(uint64_t)pair[u] * expert_mid_dim + row] = __float2half(v);
-                    else mid_out[(uint64_t)pair[u] * expert_mid_dim + row] = v;
+                    mid_out[(uint64_t)pair[u] * expert_mid_dim + row] = __float2half(v);
+
                 }
             }
         }
@@ -3533,8 +3587,8 @@ __device__ __forceinline__ static void iq2_xxs_dequant_dual_pair_tile_half_rowwi
 
 template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool OUT_F16=false, bool X_F16=false>
 __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
-        float *mid_out,
-        half *mid_out_h,
+
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const float *x,
@@ -3659,8 +3713,8 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
                     if (u < -clamp) u = -clamp;
                 }
                 const float v = moe_silu_oldhip(g) * u * wt;
-                if (OUT_F16) mid_out_h[(uint64_t)pair * expert_mid_dim + row0] = __float2half(v);
-                else mid_out[(uint64_t)pair * expert_mid_dim + row0] = v;
+                mid_out[(uint64_t)pair * expert_mid_dim + row0] = __float2half(v);
+
             }
             if (row1 < expert_mid_dim) {
                 float g = shCg1[j], u = shCu1[j];
@@ -3670,8 +3724,8 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
                     if (u < -clamp) u = -clamp;
                 }
                 const float v = moe_silu_oldhip(g) * u * wt;
-                if (OUT_F16) mid_out_h[(uint64_t)pair * expert_mid_dim + row1] = __float2half(v);
-                else mid_out[(uint64_t)pair * expert_mid_dim + row1] = v;
+                mid_out[(uint64_t)pair * expert_mid_dim + row1] = __float2half(v);
+
             }
         }
     }
@@ -3679,8 +3733,8 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
 
 template <int MTILES=8, int BM=16, int BN=16, int BK=16, bool OUT_F16=false, bool X_F16=false>
 __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
-        float *mid_out,
-        half *mid_out_h,
+
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const float *x,
@@ -3817,8 +3871,8 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
                     if (u < -clamp) u = -clamp;
                 }
                 const float v = moe_silu_oldhip(g) * u * wt;
-                if (OUT_F16) mid_out_h[(uint64_t)pair * expert_mid_dim + row0] = __float2half(v);
-                else mid_out[(uint64_t)pair * expert_mid_dim + row0] = v;
+                mid_out[(uint64_t)pair * expert_mid_dim + row0] = __float2half(v);
+
             }
             if (row1 < expert_mid_dim) {
                 float g = shCg1[j];
@@ -3829,8 +3883,8 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
                     if (u < -clamp) u = -clamp;
                 }
                 const float v = moe_silu_oldhip(g) * u * wt;
-                if (OUT_F16) mid_out_h[(uint64_t)pair * expert_mid_dim + row1] = __float2half(v);
-                else mid_out[(uint64_t)pair * expert_mid_dim + row1] = v;
+                mid_out[(uint64_t)pair * expert_mid_dim + row1] = __float2half(v);
+
             }
         }
     }
@@ -4112,10 +4166,34 @@ __device__ static float dev_q2_K_dot_f32(const cuda_block_q2_K *row, const float
     return acc;
 }
 
+__device__ static float dev_q2_K_dot_half(const cuda_block_q2_K *row, const __half *x, uint32_t nb) {
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < nb; b++) {
+        const cuda_block_q2_K *xb = row + b;
+        const float d = dev_f16_to_f32(xb->d);
+        const float dmin = dev_f16_to_f32(xb->dmin);
+        for (uint32_t il = 0; il < 16; il++) {
+            const uint32_t chunk = il / 8u;
+            const uint32_t pair = il & 1u;
+            const uint32_t shift = ((il / 2u) & 3u) * 2u;
+            const uint8_t sc = xb->scales[il];
+            const float dl = d * (float)(sc & 0x0fu);
+            const float ml = dmin * (float)(sc >> 4);
+            const uint8_t *q = xb->qs + 32u * chunk + 16u * pair;
+            const __half *xh = x + (uint64_t)b * CUDA_QK_K + chunk * 128u + ((il % 8u) / 2u) * 32u + pair * 16u;
+            for (uint32_t i = 0; i < 16; i++) {
+                const float w = dl * (float)((q[i] >> shift) & 3u) - ml;
+                acc += w * __half2float(xh[i]);
+            }
+        }
+    }
+    return acc;
+}
+
 __global__ static void moe_gate_up_mid_f32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const float *x,
@@ -4168,14 +4246,14 @@ __global__ static void moe_gate_up_mid_f32_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
     }
 }
 
 __global__ static void moe_gate_up_mid_q2K_f32_kernel(
         float *gate_out,
         float *up_out,
-        float *mid_out,
+        __half *mid_out,
         const char *gate_base,
         const char *up_base,
         const float *x,
@@ -4228,14 +4306,19 @@ __global__ static void moe_gate_up_mid_q2K_f32_kernel(
         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
         gate_out[off] = gate;
         up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        mid_out[off] = (__half)((gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot]);
     }
+}
+
+__global__ static void f16_to_f32_kernel(float *dst, const __half *src, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half2float(src[i]);
 }
 
 __global__ static void moe_down_f32_kernel(
         float *down_out,
         const char *down_base,
-        const float *mid,
+        const __half *mid,
         const int32_t *selected,
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
@@ -4251,9 +4334,9 @@ __global__ static void moe_down_f32_kernel(
     if (expert_i < 0) expert_i = 0;
     const uint32_t nb = expert_mid_dim / CUDA_QK_K;
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
-    const float *xr = mid + (uint64_t)pair * expert_mid_dim;
+    const __half *xr = mid + (uint64_t)pair * expert_mid_dim;
     float acc = 0.0f;
-    for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) acc += dev_q2_K_dot_f32(wr + b, xr + (uint64_t)b * CUDA_QK_K, 1);
+    for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) acc += dev_q2_K_dot_half(wr + b, xr + (uint64_t)b * CUDA_QK_K, 1);
     __shared__ float partial[256];
     partial[threadIdx.x] = acc;
     __syncthreads();
