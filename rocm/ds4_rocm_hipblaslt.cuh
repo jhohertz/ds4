@@ -71,7 +71,7 @@ static cuda_hipblaslt_gemm_plan *hipblaslt_gemm_plan_get(
         if (!hipblaslt_ok(hipblasLtMatrixLayoutCreate(&d_desc, HIP_R_16F, out_dim, n_tok, out_dim),
                           "D layout create")) break;
         if (!hipblaslt_ok(hipblasLtMatmulPreferenceCreate(&pref), "preference create")) break;
-        const size_t max_workspace = 0;
+        const size_t max_workspace = 4ull * 1024ull * 1024ull;  // 4 MB for hipBLASLt algorithm tuning
         if (!hipblaslt_ok(hipblasLtMatmulPreferenceSetAttribute(
                                   pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                   &max_workspace, sizeof(max_workspace)),

@@ -250,7 +250,7 @@ ROCM_CFLAGS = -O3 --amdgpu-early-optimizations --cuda-max-const-0-pointer
 
 4. **WMMA MoE batch kernels** — Extend `matmul_q8_0_f32_batch_wmma_4w_kernel` pattern to MoE gate/up for batch sizes ≥ 128. This replaces sub-warp dot products with native matrix multiply via rocWMMA.
 
-5. **hipBLASLt workspace tuning** — Set `max_workspace = 4 MB` to enable hipBLASLt algorithm tuning. May improve GEMM performance by 10-20% for common shapes like 2048×4096×2048.
+5. **hipBLASLt workspace tuning** — ✅ **Completed**. Changed `max_workspace` from 0 to 4 MB. Benchmarking shows inconsistent results — prefill may improve but generation is unchanged. No regression observed, so this change is kept.
 
 6. **GTT memory for expert cache** — Use `hipMemoryTypeHostShared` for expert cache allocations on Strix Halo. Avoids VRAM fragmentation and simplifies memory management with unified memory.
 
@@ -291,6 +291,8 @@ Key metrics:
 |-------|---------------|------------|
 | Baseline (original) | 51.20 | 15.67 |
 | All P0 changes | **55.11** (+7.6%) | 15.68 (+0.1%) |
+| + hipBLASLt workspace | **61.75** (+20.6% vs baseline) | 15.55 (-0.8%, noise) |
+| + hipBLASLt workspace (rerun) | 55.86 (+9.1% vs baseline) | 15.66 (-0.1%, noise) |
 
 The prefill gain comes from always-cached IQ2 LUTs (P0.2) and skipping sorting for small batches (P0.3). Generation is unchanged — this model uses the Q8_K quantized mid path, so F16 mid (P0.1) defers its benefit to Q2_K models that use the float-down path.
 
