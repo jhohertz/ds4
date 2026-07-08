@@ -308,8 +308,7 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(
     return 1;
 }
 
-// --- GLM 5.2 stub implementations (return 1 / no-op) ---
-// Replace with real kernels per ROCM-GLM-IMPLEMENTATION-PLAN.md
+// --- GLM 5.2 stub implementations (remaining: non-GLM stubs) ---
 
 extern "C" int ds4_gpu_flush_encoder(void) { return 1; }
 
@@ -370,79 +369,4 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
     (void)gate; (void)up; (void)mid; (void)model_map; (void)model_size;
     (void)gate_offset; (void)up_offset; (void)in_dim; (void)out_dim;
     (void)x; (void)n_tok; (void)clamp; return 1;
-}
-
-extern "C" int ds4_gpu_add_rms_norm_weight_tensor(
-        ds4_gpu_tensor *norm_out, ds4_gpu_tensor *sum_out,
-        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
-        const void *model_map, uint64_t model_size, uint64_t weight_offset,
-        uint32_t n, float eps) {
-    (void)norm_out; (void)sum_out; (void)a; (void)b; (void)model_map;
-    (void)model_size; (void)weight_offset; (void)n; (void)eps; return 1;
-}
-
-extern "C" int ds4_gpu_sort_i32_rows_asc_tensor(
-        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
-        uint32_t row_width, uint32_t n_rows) {
-    (void)dst; (void)src; (void)row_width; (void)n_rows; return 1;
-}
-
-extern "C" int ds4_gpu_add3_tensor(
-        ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
-        const ds4_gpu_tensor *c, uint32_t n) {
-    (void)out; (void)a; (void)b; (void)c; (void)n; return 1;
-}
-
-extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
-        const ds4_gpu_stream_expert_table *table,
-        const ds4_gpu_tensor *selected, uint32_t n_selected) {
-    (void)table; (void)selected; (void)n_selected; return 1;
-}
-
-extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
-        ds4_gpu_tensor *out, ds4_gpu_tensor *mid,
-        const void *model_map, uint64_t model_size,
-        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
-        uint32_t gate_type, uint32_t up_type, uint32_t down_type,
-        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
-        uint64_t up_expert_bytes, uint64_t up_row_bytes,
-        uint64_t down_expert_bytes, uint64_t down_row_bytes,
-        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
-        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
-        uint32_t n_total_expert, uint32_t n_expert, uint32_t layer_index,
-        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t mid_token_stride) {
-    (void)out; (void)mid; (void)model_map; (void)model_size;
-    (void)gate_offset; (void)up_offset; (void)down_offset;
-    (void)gate_type; (void)up_type; (void)down_type;
-    (void)gate_expert_bytes; (void)gate_row_bytes;
-    (void)up_expert_bytes; (void)up_row_bytes;
-    (void)down_expert_bytes; (void)down_row_bytes;
-    (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim;
-    (void)selected; (void)weights; (void)n_total_expert; (void)n_expert;
-    (void)layer_index; (void)x; (void)n_tokens; (void)mid_token_stride;
-    return 1;
-}
-
-extern "C" int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
-        ds4_gpu_tensor *out, ds4_gpu_tensor *mid,
-        const void *model_map, uint64_t model_size,
-        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
-        uint32_t gate_type, uint32_t up_type, uint32_t down_type,
-        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
-        uint64_t up_expert_bytes, uint64_t up_row_bytes,
-        uint64_t down_expert_bytes, uint64_t down_row_bytes,
-        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
-        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
-        uint32_t n_total_expert, uint32_t n_expert, uint32_t layer_index,
-        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t mid_token_stride) {
-    (void)out; (void)mid; (void)model_map; (void)model_size;
-    (void)gate_offset; (void)up_offset; (void)down_offset;
-    (void)gate_type; (void)up_type; (void)down_type;
-    (void)gate_expert_bytes; (void)gate_row_bytes;
-    (void)up_expert_bytes; (void)up_row_bytes;
-    (void)down_expert_bytes; (void)down_row_bytes;
-    (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim;
-    (void)selected; (void)weights; (void)n_total_expert; (void)n_expert;
-    (void)layer_index; (void)x; (void)n_tokens; (void)mid_token_stride;
-    return 1;
 }
