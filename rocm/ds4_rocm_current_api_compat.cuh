@@ -1,48 +1,3 @@
-extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
-    if (!event_value) return 0;
-    *event_value = 0;
-    if (!g_selected_readback_event) {
-        cudaError_t err =
-            cudaEventCreateWithFlags(&g_selected_readback_event,
-                                     cudaEventDisableTiming);
-        if (err != cudaSuccess) {
-            fprintf(stderr,
-                    DS4_GPU_LOG_PREFIX "selected readback event creation failed: %s\n",
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return 0;
-        }
-    }
-    cudaError_t err = cudaEventRecord(g_selected_readback_event, 0);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "selected readback event record failed: %s\n",
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-    *event_value = ++g_selected_readback_event_value;
-    return 1;
-}
-
-extern "C" int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label) {
-    if (event_value == 0 || !g_selected_readback_event) return 0;
-    cudaError_t err = cudaEventSynchronize(g_selected_readback_event);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "selected readback wait failed for %s: %s\n",
-                label ? label : "selected-id readback",
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-    return 1;
-}
-
-extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {
-    return ds4_gpu_commit_and_wait_selected_readback(event_value, label);
-}
-
 extern "C" int ds4_gpu_tensor_read_after_selected_event(
         const ds4_gpu_tensor *tensor,
         uint64_t offset,
@@ -350,5 +305,303 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(
         g_routed_moe_selected_override[i] = selected[i];
     }
     g_routed_moe_selected_override_n = n_selected;
+    return 1;
+}
+
+// --- GLM 5.2 stub implementations (return 1 / no-op) ---
+// Replace with real kernels per ROCM-GLM-IMPLEMENTATION-PLAN.md
+
+extern "C" int ds4_gpu_flush_encoder(void) { return 1; }
+
+extern "C" int ds4_gpu_embed_token_q8_0_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)n_vocab; (void)token; (void)n_embd; return 1;
+}
+
+extern "C" int ds4_gpu_embed_tokens_q8_0_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *tokens, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab,
+        uint32_t n_tokens, uint32_t n_embd) {
+    (void)out; (void)tokens; (void)model_map; (void)model_size;
+    (void)weight_offset; (void)n_vocab; (void)n_tokens; (void)n_embd; return 1;
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok; return 1;
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok; return 1;
+}
+
+extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
+        ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t in_dim,
+        uint64_t out_dim, const ds4_gpu_tensor *x, float clamp) {
+    (void)mid; (void)model_map; (void)model_size; (void)gate_offset;
+    (void)up_offset; (void)in_dim; (void)out_dim; (void)x; (void)clamp; return 1;
+}
+
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset,
+        uint64_t up_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, float clamp) {
+    (void)gate; (void)up; (void)mid; (void)model_map; (void)model_size;
+    (void)gate_offset; (void)up_offset; (void)in_dim; (void)out_dim;
+    (void)x; (void)clamp; return 1;
+}
+
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset,
+        uint64_t up_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok, float clamp) {
+    (void)gate; (void)up; (void)mid; (void)model_map; (void)model_size;
+    (void)gate_offset; (void)up_offset; (void)in_dim; (void)out_dim;
+    (void)x; (void)n_tok; (void)clamp; return 1;
+}
+
+extern "C" int ds4_gpu_add_rms_norm_weight_tensor(
+        ds4_gpu_tensor *norm_out, ds4_gpu_tensor *sum_out,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n, float eps) {
+    (void)norm_out; (void)sum_out; (void)a; (void)b; (void)model_map;
+    (void)model_size; (void)weight_offset; (void)n; (void)eps; return 1;
+}
+
+extern "C" int ds4_gpu_sort_i32_rows_asc_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
+        uint32_t row_width, uint32_t n_rows) {
+    (void)dst; (void)src; (void)row_width; (void)n_rows; return 1;
+}
+
+extern "C" int ds4_gpu_add3_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *c, uint32_t n) {
+    (void)out; (void)a; (void)b; (void)c; (void)n; return 1;
+}
+
+extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor *selected, uint32_t n_selected) {
+    (void)table; (void)selected; (void)n_selected; return 1;
+}
+
+extern "C" int ds4_gpu_glm_attention_full_tensor(
+        ds4_gpu_tensor *heads, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache, const ds4_gpu_tensor *value_cache,
+        uint32_t pos0, uint32_t n_tokens, uint32_t cache_len,
+        uint32_t cache_cap, uint32_t n_head, uint32_t qk_dim,
+        uint32_t value_dim, bool cache_f16) {
+    (void)heads; (void)q; (void)key_cache; (void)value_cache;
+    (void)pos0; (void)n_tokens; (void)cache_len; (void)cache_cap;
+    (void)n_head; (void)qk_dim; (void)value_dim; (void)cache_f16; return 1;
+}
+
+extern "C" int ds4_gpu_glm_fill_selected_range_tensor(
+        ds4_gpu_tensor *selected, uint32_t n_selected) {
+    (void)selected; (void)n_selected; return 1;
+}
+
+extern "C" int ds4_gpu_glm_fill_selected_range_batch_tensor(
+        ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t pos0,
+        uint32_t n_selected, uint32_t pad_row) {
+    (void)selected; (void)n_tokens; (void)pos0;
+    (void)n_selected; (void)pad_row; return 1;
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_decode_tensor(
+        ds4_gpu_tensor *heads, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low, const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache, const void *model_map,
+        uint64_t model_size, uint64_t value_weight_offset,
+        const ds4_gpu_tensor *selected, uint32_t n_selected,
+        uint32_t cache_cap, bool cache_f16, uint32_t n_head,
+        uint32_t kv_lora_dim, uint32_t qk_nope, uint32_t qk_rope,
+        uint32_t value_dim, uint32_t n_ctx_orig, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow) {
+    (void)heads; (void)q; (void)qk_low; (void)kv_lora_cache;
+    (void)k_rope_cache; (void)model_map; (void)model_size;
+    (void)value_weight_offset; (void)selected; (void)n_selected;
+    (void)cache_cap; (void)cache_f16; (void)n_head; (void)kv_lora_dim;
+    (void)qk_nope; (void)qk_rope; (void)value_dim; (void)n_ctx_orig;
+    (void)freq_base; (void)freq_scale; (void)ext_factor; (void)attn_factor;
+    (void)beta_fast; (void)beta_slow; return 1;
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
+        ds4_gpu_tensor *heads, ds4_gpu_tensor *partial_lora,
+        ds4_gpu_tensor *partial_ms, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low, const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache, const void *model_map,
+        uint64_t model_size, uint64_t value_weight_offset,
+        const ds4_gpu_tensor *selected, uint32_t n_selected,
+        bool selected_rows_valid, uint32_t cache_cap, bool cache_f16,
+        uint32_t n_head, uint32_t kv_lora_dim, uint32_t qk_nope,
+        uint32_t qk_rope, uint32_t value_dim, uint32_t n_ctx_orig,
+        uint32_t block_rows, uint32_t n_blocks, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow) {
+    (void)heads; (void)partial_lora; (void)partial_ms; (void)q;
+    (void)qk_low; (void)kv_lora_cache; (void)k_rope_cache; (void)model_map;
+    (void)model_size; (void)value_weight_offset; (void)selected;
+    (void)n_selected; (void)selected_rows_valid; (void)cache_cap;
+    (void)cache_f16; (void)n_head; (void)kv_lora_dim; (void)qk_nope;
+    (void)qk_rope; (void)value_dim; (void)n_ctx_orig; (void)block_rows;
+    (void)n_blocks; (void)freq_base; (void)freq_scale; (void)ext_factor;
+    (void)attn_factor; (void)beta_fast; (void)beta_slow; return 1;
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_batch_tensor(
+        ds4_gpu_tensor *heads, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low, const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache, const void *model_map,
+        uint64_t model_size, uint64_t value_weight_offset,
+        const ds4_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_selected,
+        uint32_t cache_cap, bool cache_f16, uint32_t n_head,
+        uint32_t kv_lora_dim, uint32_t qk_nope, uint32_t qk_rope,
+        uint32_t value_dim, uint32_t n_ctx_orig, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow) {
+    (void)heads; (void)q; (void)qk_low; (void)kv_lora_cache;
+    (void)k_rope_cache; (void)model_map; (void)model_size;
+    (void)value_weight_offset; (void)selected; (void)n_tokens;
+    (void)n_selected; (void)cache_cap; (void)cache_f16; (void)n_head;
+    (void)kv_lora_dim; (void)qk_nope; (void)qk_rope; (void)value_dim;
+    (void)n_ctx_orig; (void)freq_base; (void)freq_scale; (void)ext_factor;
+    (void)attn_factor; (void)beta_fast; (void)beta_slow; return 1;
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
+        ds4_gpu_tensor *lora_out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low, const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache, const ds4_gpu_tensor *selected,
+        uint32_t n_tokens, uint32_t n_selected, uint32_t cache_cap,
+        bool cache_f16, uint32_t n_head, uint32_t kv_lora_dim,
+        uint32_t qk_nope, uint32_t qk_rope, uint32_t n_ctx_orig,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow) {
+    (void)lora_out; (void)q; (void)qk_low; (void)kv_lora_cache;
+    (void)k_rope_cache; (void)selected; (void)n_tokens; (void)n_selected;
+    (void)cache_cap; (void)cache_f16; (void)n_head; (void)kv_lora_dim;
+    (void)qk_nope; (void)qk_rope; (void)n_ctx_orig; (void)freq_base;
+    (void)freq_scale; (void)ext_factor; (void)attn_factor;
+    (void)beta_fast; (void)beta_slow; return 1;
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+        ds4_gpu_tensor *lora_out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low, const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache, uint32_t n_tokens,
+        uint32_t pos0, uint32_t n_selected, uint32_t cache_cap,
+        bool cache_f16, uint32_t n_head, uint32_t kv_lora_dim,
+        uint32_t qk_nope, uint32_t qk_rope, uint32_t n_ctx_orig,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow) {
+    (void)lora_out; (void)q; (void)qk_low; (void)kv_lora_cache;
+    (void)k_rope_cache; (void)n_tokens; (void)pos0; (void)n_selected;
+    (void)cache_cap; (void)cache_f16; (void)n_head; (void)kv_lora_dim;
+    (void)qk_nope; (void)qk_rope; (void)n_ctx_orig; (void)freq_base;
+    (void)freq_scale; (void)ext_factor; (void)attn_factor;
+    (void)beta_fast; (void)beta_slow; return 1;
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+        ds4_gpu_tensor *lora_out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low, const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache, const ds4_gpu_tensor *selected,
+        uint32_t n_tokens, uint32_t n_selected, uint32_t cache_cap,
+        bool cache_f16, uint32_t n_head, uint32_t kv_lora_dim,
+        uint32_t qk_nope, uint32_t qk_rope, uint32_t n_ctx_orig,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow) {
+    (void)lora_out; (void)q; (void)qk_low; (void)kv_lora_cache;
+    (void)k_rope_cache; (void)selected; (void)n_tokens; (void)n_selected;
+    (void)cache_cap; (void)cache_f16; (void)n_head; (void)kv_lora_dim;
+    (void)qk_nope; (void)qk_rope; (void)n_ctx_orig; (void)freq_base;
+    (void)freq_scale; (void)ext_factor; (void)attn_factor;
+    (void)beta_fast; (void)beta_slow; return 1;
+}
+
+extern "C" int ds4_gpu_glm_attention_flash_staged_tensor(
+        ds4_gpu_tensor *heads, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache, const ds4_gpu_tensor *value_cache,
+        uint32_t pos0, uint32_t n_tokens, uint32_t cache_len,
+        uint32_t cache_cap, uint32_t n_head, uint32_t qk_dim,
+        uint32_t value_dim, bool cache_f16) {
+    (void)heads; (void)q; (void)key_cache; (void)value_cache;
+    (void)pos0; (void)n_tokens; (void)cache_len; (void)cache_cap;
+    (void)n_head; (void)qk_dim; (void)value_dim; (void)cache_f16; return 1;
+}
+
+extern "C" int ds4_gpu_glm_attention_flash_tensor(
+        ds4_gpu_tensor *heads, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache, const ds4_gpu_tensor *value_cache,
+        uint32_t pos0, uint32_t n_tokens, uint32_t cache_len,
+        uint32_t cache_cap, uint32_t n_head, uint32_t qk_dim,
+        uint32_t value_dim, bool cache_f16) {
+    (void)heads; (void)q; (void)key_cache; (void)value_cache;
+    (void)pos0; (void)n_tokens; (void)cache_len; (void)cache_cap;
+    (void)n_head; (void)qk_dim; (void)value_dim; (void)cache_f16; return 1;
+}
+
+extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t up_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes, uint64_t up_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t layer_index,
+        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t mid_token_stride) {
+    (void)out; (void)mid; (void)model_map; (void)model_size;
+    (void)gate_offset; (void)up_offset; (void)down_offset;
+    (void)gate_type; (void)up_type; (void)down_type;
+    (void)gate_expert_bytes; (void)gate_row_bytes;
+    (void)up_expert_bytes; (void)up_row_bytes;
+    (void)down_expert_bytes; (void)down_row_bytes;
+    (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim;
+    (void)selected; (void)weights; (void)n_total_expert; (void)n_expert;
+    (void)layer_index; (void)x; (void)n_tokens; (void)mid_token_stride;
+    return 1;
+}
+
+extern "C" int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t up_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t up_expert_bytes, uint64_t up_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t layer_index,
+        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t mid_token_stride) {
+    (void)out; (void)mid; (void)model_map; (void)model_size;
+    (void)gate_offset; (void)up_offset; (void)down_offset;
+    (void)gate_type; (void)up_type; (void)down_type;
+    (void)gate_expert_bytes; (void)gate_row_bytes;
+    (void)up_expert_bytes; (void)up_row_bytes;
+    (void)down_expert_bytes; (void)down_row_bytes;
+    (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim;
+    (void)selected; (void)weights; (void)n_total_expert; (void)n_expert;
+    (void)layer_index; (void)x; (void)n_tokens; (void)mid_token_stride;
     return 1;
 }

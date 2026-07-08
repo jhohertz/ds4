@@ -128,4 +128,9 @@ typedef struct {
 
 #include "rocm/ds4_rocm_hc_output_launch.cuh"
 
+#include "rocm/ds4_rocm_glm_router.cuh"
+#include "rocm/ds4_rocm_glm_moe.cuh"
+#include "rocm/ds4_rocm_glm_kv.cuh"
+#include "rocm/ds4_rocm_glm_indexer.cuh"
+
 #include "rocm/ds4_rocm_current_api_compat.cuh"
