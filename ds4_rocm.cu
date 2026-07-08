@@ -132,5 +132,6 @@ typedef struct {
 #include "rocm/ds4_rocm_glm_moe.cuh"
 #include "rocm/ds4_rocm_glm_kv.cuh"
 #include "rocm/ds4_rocm_glm_indexer.cuh"
+#include "rocm/ds4_rocm_glm_attention.cuh"
 
 #include "rocm/ds4_rocm_current_api_compat.cuh"
