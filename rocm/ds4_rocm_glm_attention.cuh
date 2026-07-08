@@ -819,7 +819,7 @@ __global__ static void glm_attn_split_g8_partial_kernel(
             for (uint32_t i = 0; i < 16u; i++) kvv[i] = 0.0f;
         }
         for (uint32_t off = 16u; off > 0; off >>= 1) {
-            part += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, part, off);
+            part += __shfl_xor_sync(FULL_WARP_MASK, part, off);
         }
         if (valid_row) {
             const float score = part * scale;
