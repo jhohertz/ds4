@@ -1,4 +1,8 @@
 // DS4 ROCm common embedding/dense-matmul kernels and device helpers.
+
+#ifndef DS4_ROCM_Q4K_PREFILL_EXPERT_TILE
+#define DS4_ROCM_Q4K_PREFILL_EXPERT_TILE 8
+#endif
 //
 // Included from ds4_cuda.cu before more specialized modules; these helpers are
 // intentionally kept static in the single translation unit.

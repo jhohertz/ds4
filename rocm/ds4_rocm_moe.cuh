@@ -1886,6 +1886,97 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_row32_kernel(
     }
 }
 
+#if DS4_ROCM_Q4K_PREFILL_EXPERT_TILE == 16
+__global__ static void moe_gate_up_mid_q4K_expert_tile16_row32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t max_count,
+        uint32_t write_aux,
+        float clamp) {
+    uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+
+    /* One tile16 block covers 32 output rows.  Each row gets two independent
+       8-lane groups: group 0 handles pairs 0..7 and group 1 handles pairs
+       8..15.  This preserves a real tile16 launch shape without keeping
+       16-wide per-thread accumulators that make gfx1151 spill over 64 KiB. */
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t half = (threadIdx.x >> 3u) & 1u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 4u);
+    uint32_t expert = tile_experts[tile];
+    uint32_t count = counts[expert];
+    if (max_count != 0u && count >= max_count) return;
+
+    uint32_t tile_start = tile_starts[tile];
+    uint32_t local_start = tile_start + half * 8u;
+    if (local_start >= count) return;
+
+    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+    uint32_t np = 0;
+    for (; np < 8u; np++) {
+        uint32_t local_pair = local_start + np;
+        if (local_pair >= count) break;
+        pair[np] = sorted_pairs[offsets[expert] + local_pair];
+        tok[np] = pair[np] / n_expert;
+        slot[np] = pair[np] - tok[np] * n_expert;
+        xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
+    }
+
+
+    if (row >= expert_mid_dim) return;
+    const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        dev_dot_q4_K_q8_K_block8(gr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate);
+        dev_dot_q4_K_q8_K_block8(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up);
+    }
+    for (uint32_t p = 0; p < np; p++) {
+        gate[p] = quarter_warp_sum_f32(gate[p], lane);
+        up[p] = quarter_warp_sum_f32(up[p], lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate[p] > clamp) gate[p] = clamp;
+                if (up[p] > clamp) up[p] = clamp;
+                if (up[p] < -clamp) up[p] = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate[p];
+                up_out[off] = up[p];
+            }
+            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+        }
+    }
+}
+#endif
+
 __global__ static DS4_ROCM_UNUSED void moe_down_kernel(
         float *down_out,
         const char *down_base,

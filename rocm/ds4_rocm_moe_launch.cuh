@@ -538,7 +538,7 @@ static int routed_moe_launch(
         const uint32_t use_p2_sorted = 0u;
         const uint32_t use_atomic_down = use_expert_tiles && n_tokens >= 128u;
         const uint32_t use_gate_row2048 = !q4k_path && use_expert_tiles && n_tokens >= 128u;
-        const uint32_t use_down_tile16 = !q4k_path && use_atomic_down && n_tokens >= 128u;
+        const uint32_t use_down_tile16 = (!q4k_path && use_atomic_down && n_tokens >= 128u) || (q4k_path && DS4_ROCM_Q4K_PREFILL_EXPERT_TILE == 16);
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u;
         const uint32_t gate_row_span = 1024u;
@@ -893,6 +893,15 @@ static int routed_moe_launch(
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
                             0u, write_gate_up, clamp);
+#if DS4_ROCM_Q4K_PREFILL_EXPERT_TILE == 16
+		    } else if (expert_tile_m == 16u) {
+                        moe_gate_up_mid_q4K_expert_tile16_row32_kernel<<<tgrid, 512>>>(
+                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            0u, write_gate_up, clamp);
+#endif
                     } else {
                         moe_gate_up_mid_q4K_expert_tile4_row32_kernel<<<tgrid, 256>>>(
                             (float *)gate->ptr, (float *)up->ptr, (__half *)mid->ptr,
