@@ -107,7 +107,7 @@ cuda:
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o" \
-		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
+		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_Q4K_PREFILL_EXPERT_TILE=16" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
