@@ -21,6 +21,27 @@ typedef struct {
     uint16_t d;
 } glm_block_q6_K;
 
+/* GLM MoE cache hit/miss counters for end-of-inference stats */
+static int g_glm_moe_selected_cache_hits;
+static int g_glm_moe_batch_cache_hits;
+static int g_glm_moe_layer_cache_hits;
+static int g_glm_moe_fallback_range_ptr;
+static int g_glm_moe_fallback_mmap;
+
+extern "C" void ds4_gpu_glm_moe_stats(void) {
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "GLM MoE stats: selected_cache=%d batch_cache=%d layer_cache=%d range_ptr=%d mmap=%d\n",
+            g_glm_moe_selected_cache_hits,
+            g_glm_moe_batch_cache_hits,
+            g_glm_moe_layer_cache_hits,
+            g_glm_moe_fallback_range_ptr,
+            g_glm_moe_fallback_mmap);
+    g_glm_moe_selected_cache_hits = 0;
+    g_glm_moe_batch_cache_hits = 0;
+    g_glm_moe_layer_cache_hits = 0;
+    g_glm_moe_fallback_range_ptr = 0;
+    g_glm_moe_fallback_mmap = 0;
+}
+
 /* IQ2_XXS tables — ported from ds4_iq2_tables_cuda.inc */
 #define DS4_ROCKM_IQ2_KSIGN_SIZE 128u
 #define DS4_ROCKM_IQ2_GRID_SIZE 256u
@@ -630,6 +651,7 @@ static int glm_routed_moe_launch(
         !glm_down_type_supported(down_type)) {
         return 0;
     }
+
     const uint64_t per_token_mid = (uint64_t)n_expert * expert_mid_dim;
     if ((uint64_t)mid_token_stride < per_token_mid ||
         (uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
@@ -696,12 +718,12 @@ static int glm_routed_moe_launch(
         const char *lg = NULL, *lu = NULL, *ld = NULL;
         if (n_tokens != 1u || n_expert > 8u ||
             cuda_stream_layer_expert_cache_apply(model_map, layer_index,
-                                                n_total_expert,
-                                                gate_offset, up_offset,
-                                                down_offset,
-                                                gate_expert_bytes,
-                                                down_expert_bytes,
-                                                &lg, &lu, &ld)) {
+                                                 n_total_expert,
+                                                 gate_offset, up_offset,
+                                                 down_offset,
+                                                 gate_expert_bytes,
+                                                 down_expert_bytes,
+                                                 &lg, &lu, &ld)) {
             break;
         }
         int32_t ids[8];
@@ -719,21 +741,50 @@ static int glm_routed_moe_launch(
         }
     }
 
+    /* GLM batch selected cache: used during prefill (n_tokens > 1) when the
+     * single-token selected cache doesn't apply. Populated by
+     * glm_batch_selected_prepare before the MoE dispatch. */
+    int use_batch_cache = 0;
+    if (!use_selected_cache && streaming && uniform_gate_up &&
+        n_tokens > 1u &&
+        g_glm_batch_selected_cache.loaded &&
+        g_glm_batch_selected_cache.model_map == model_map &&
+        g_glm_batch_selected_cache.layer == layer_index &&
+        g_glm_batch_selected_cache.n_total_expert == n_total_expert &&
+        g_glm_batch_selected_cache.n_selected == n_expert &&
+        g_glm_batch_selected_cache.n_tokens == n_tokens &&
+        g_glm_batch_selected_cache.gate_expert_bytes == gate_expert_bytes &&
+        g_glm_batch_selected_cache.down_expert_bytes == down_expert_bytes &&
+        g_glm_batch_selected_cache.gate &&
+        g_glm_batch_selected_cache.up &&
+        g_glm_batch_selected_cache.down &&
+        g_glm_batch_selected_cache.slot_tensor.ptr &&
+        g_glm_batch_selected_cache.slot_tensor.bytes >=
+            slot_values * sizeof(int32_t)) {
+        use_batch_cache = 1;
+    }
+
     if (use_selected_cache) {
+        g_glm_moe_selected_cache_hits++;
         selected_exec = &g_stream_selected_cache.slot_tensor;
         gate_w = g_stream_selected_cache.gate;
         up_w = g_stream_selected_cache.up;
         down_w = g_stream_selected_cache.down;
+    } else if (use_batch_cache) {
+        g_glm_moe_batch_cache_hits++;
+        selected_exec = &g_glm_batch_selected_cache.slot_tensor;
+        gate_w = g_glm_batch_selected_cache.gate;
+        up_w = g_glm_batch_selected_cache.up;
+        down_w = g_glm_batch_selected_cache.down;
     } else if (streaming && uniform_gate_up &&
                cuda_stream_layer_expert_cache_apply(model_map, layer_index,
-                                                     n_total_expert,
-                                                     gate_offset, up_offset,
-                                                     down_offset,
-                                                     gate_expert_bytes,
-                                                     down_expert_bytes,
-                                                     &gate_w, &up_w, &down_w)) {
-        /* full-layer cache hit */
-        /* cache HIT */
+                                                       n_total_expert,
+                                                       gate_offset, up_offset,
+                                                       down_offset,
+                                                       gate_expert_bytes,
+                                                       down_expert_bytes,
+                                                       &gate_w, &up_w, &down_w)) {
+        g_glm_moe_layer_cache_hits++;
     } else if (streaming) {
         /* Layer cache MISS — load synchronously on-demand */
         /* cache MISS — load on-demand */
@@ -753,15 +804,16 @@ static int glm_routed_moe_launch(
                                                  &gate_w, &up_w, &down_w);
         }
         if (!gate_w || !up_w || !down_w) {
+            g_glm_moe_fallback_range_ptr++;
             gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_tensor_bytes,
-                                          "glm_moe_gate");
+                                           "glm_moe_gate");
             up_w = cuda_model_range_ptr(model_map, up_offset, up_tensor_bytes,
-                                        "glm_moe_up");
+                                         "glm_moe_up");
             down_w = cuda_model_range_ptr(model_map, down_offset, down_tensor_bytes,
-                                          "glm_moe_down");
+                                           "glm_moe_down");
         }
     } else {
-        /* direct mmap fallback */
+        g_glm_moe_fallback_mmap++;
         gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_tensor_bytes,
                                        "glm_moe_gate");
         up_w = cuda_model_range_ptr(model_map, up_offset, up_tensor_bytes,
@@ -857,6 +909,190 @@ static int glm_routed_moe_launch(
     return cuda_ok(cudaGetLastError(), "glm routed moe down launch");
 }
 
+/* Seed the GLM batch selected cache for prefill (n_tokens > 1).
+ * Reads all selected IDs from the GPU tensor, deduplicates, copies unique
+ * expert weights to slot-ordered GPU buffers, and creates a re-indexed slot
+ * tensor so the GLM MoE kernel uses slot-based indexing.
+ */
+static int glm_batch_selected_prepare(
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t layer,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (!g_ssd_streaming_mode || !model_map || !selected ||
+        n_tokens <= 1 || n_tokens > 65535u ||
+        n_total_expert == 0 || n_total_expert > DS4_ROCM_MAX_N_EXPERT ||
+        n_selected == 0 || n_selected > DS4_ROCM_N_EXPERT_USED ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0) {
+        return 0;
+    }
+
+    /* Read all selected IDs from GPU to host */
+    const uint64_t n_ids = (uint64_t)n_tokens * n_selected;
+    int32_t *ids = (int32_t *)malloc(n_ids * sizeof(int32_t));
+    if (!ids) return 0;
+    if (!ds4_gpu_tensor_read(selected, 0, ids, n_ids * sizeof(int32_t))) {
+        free(ids);
+        return 0;
+    }
+
+    /* Deduplicate: collect unique expert IDs */
+    int32_t unique[DS4_ROCM_N_EXPERT_USED * 64]; /* max 512 unique experts */
+    uint32_t n_unique = 0;
+    for (uint32_t i = 0; i < n_ids; i++) {
+        const int32_t e = ids[i];
+        if (e < 0 || (uint32_t)e >= n_total_expert) continue;
+        uint32_t j;
+        for (j = 0; j < n_unique; j++) {
+            if (unique[j] == e) break;
+        }
+        if (j == n_unique && n_unique < DS4_ROCM_N_EXPERT_USED * 64u) {
+            unique[n_unique++] = e;
+        }
+    }
+    if (n_unique == 0) {
+        free(ids);
+        return 0;
+    }
+
+    /* Allocate or reuse slot-ordered GPU buffers for gate, up, down */
+    const uint64_t gate_bytes = (uint64_t)n_unique * gate_expert_bytes;
+    const uint64_t down_bytes = (uint64_t)n_unique * down_expert_bytes;
+    if (g_glm_batch_selected_cache.gate_capacity < gate_bytes) {
+        if (g_glm_batch_selected_cache.gate) (void)cudaFree(g_glm_batch_selected_cache.gate);
+        if (g_glm_batch_selected_cache.up) (void)cudaFree(g_glm_batch_selected_cache.up);
+        g_glm_batch_selected_cache.gate = NULL;
+        g_glm_batch_selected_cache.up = NULL;
+        g_glm_batch_selected_cache.gate_capacity = 0;
+        cudaError_t err = cudaMalloc((void **)&g_glm_batch_selected_cache.gate, (size_t)gate_bytes);
+        if (err != cudaSuccess) {
+            free(ids);
+            return 0;
+        }
+        err = cudaMalloc((void **)&g_glm_batch_selected_cache.up, (size_t)gate_bytes);
+        if (err != cudaSuccess) {
+            (void)cudaFree(g_glm_batch_selected_cache.gate);
+            g_glm_batch_selected_cache.gate = NULL;
+            free(ids);
+            return 0;
+        }
+        g_glm_batch_selected_cache.gate_capacity = gate_bytes;
+    }
+    if (g_glm_batch_selected_cache.down_capacity < down_bytes) {
+        if (g_glm_batch_selected_cache.down) (void)cudaFree(g_glm_batch_selected_cache.down);
+        g_glm_batch_selected_cache.down = NULL;
+        g_glm_batch_selected_cache.down_capacity = 0;
+        cudaError_t err = cudaMalloc((void **)&g_glm_batch_selected_cache.down, (size_t)down_bytes);
+        if (err != cudaSuccess) {
+            free(ids);
+            return 0;
+        }
+        g_glm_batch_selected_cache.down_capacity = down_bytes;
+    }
+
+    /* Ensure the upload stream is initialized */
+    if (!g_model_upload_stream) {
+        cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream,
+                                                    cudaStreamNonBlocking);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            free(ids);
+            return 0;
+        }
+    }
+
+    /* Copy unique expert weights from host to slot-ordered GPU buffers.
+     * Gate and up share the same expert_bytes stride (verified by caller). */
+    for (uint32_t i = 0; i < n_unique; i++) {
+        const uint64_t expert = (uint64_t)(uint32_t)unique[i];
+        const uint64_t src_gate_off = gate_offset + expert * gate_expert_bytes;
+        const uint64_t src_up_off   = up_offset   + expert * gate_expert_bytes;
+        const uint64_t src_down_off = down_offset + expert * down_expert_bytes;
+        const uint64_t dst_off = (uint64_t)i * gate_expert_bytes;
+        cudaError_t err;
+        err = cudaMemcpyAsync(g_glm_batch_selected_cache.gate + dst_off,
+                              (const char *)model_map + src_gate_off,
+                              (size_t)gate_expert_bytes,
+                              cudaMemcpyHostToDevice,
+                              g_model_upload_stream);
+        if (err != cudaSuccess) { free(ids); return 0; }
+        err = cudaMemcpyAsync(g_glm_batch_selected_cache.up + dst_off,
+                              (const char *)model_map + src_up_off,
+                              (size_t)gate_expert_bytes,
+                              cudaMemcpyHostToDevice,
+                              g_model_upload_stream);
+        if (err != cudaSuccess) { free(ids); return 0; }
+        const uint64_t dst_down_off = (uint64_t)i * down_expert_bytes;
+        err = cudaMemcpyAsync(g_glm_batch_selected_cache.down + dst_down_off,
+                              (const char *)model_map + src_down_off,
+                              (size_t)down_expert_bytes,
+                              cudaMemcpyHostToDevice,
+                              g_model_upload_stream);
+        if (err != cudaSuccess) { free(ids); return 0; }
+    }
+
+    /* Wait for copies to complete */
+    cudaError_t err = cudaStreamSynchronize(g_model_upload_stream);
+    if (err != cudaSuccess) { free(ids); return 0; }
+
+    /* Create re-indexed slot tensor on GPU:
+     * for each token+slot, store the slot index of the corresponding expert. */
+    const uint64_t slot_entries = n_ids;
+    const uint64_t slot_bytes = slot_entries * sizeof(int32_t);
+    if (g_glm_batch_selected_cache.slot_capacity < slot_bytes) {
+        if (g_glm_batch_selected_cache.slot_ids)
+            (void)cudaFree(g_glm_batch_selected_cache.slot_ids);
+        g_glm_batch_selected_cache.slot_ids = NULL;
+        g_glm_batch_selected_cache.slot_capacity = 0;
+        err = cudaMalloc((void **)&g_glm_batch_selected_cache.slot_ids,
+                         (size_t)slot_bytes);
+        if (err != cudaSuccess) { free(ids); return 0; }
+        g_glm_batch_selected_cache.slot_capacity = slot_bytes;
+    }
+
+    int32_t *slot_host = (int32_t *)malloc(slot_bytes);
+    if (!slot_host) { free(ids); return 0; }
+    for (uint32_t i = 0; i < n_ids; i++) {
+        const int32_t e = ids[i];
+        uint32_t s;
+        for (s = 0; s < n_unique; s++) {
+            if (unique[s] == e) break;
+        }
+        slot_host[i] = s < n_unique ? (int32_t)s : -1;
+    }
+    err = cudaMemcpy(g_glm_batch_selected_cache.slot_ids,
+                     slot_host,
+                     (size_t)slot_bytes,
+                     cudaMemcpyHostToDevice);
+    free(slot_host);
+    free(ids);
+    if (err != cudaSuccess) return 0;
+
+    g_glm_batch_selected_cache.slot_tensor.ptr = g_glm_batch_selected_cache.slot_ids;
+    g_glm_batch_selected_cache.slot_tensor.bytes = slot_bytes;
+    g_glm_batch_selected_cache.slot_tensor.owner = 0;
+
+    /* Populate cache header */
+    g_glm_batch_selected_cache.loaded = 1;
+    g_glm_batch_selected_cache.model_map = model_map;
+    g_glm_batch_selected_cache.layer = layer;
+    g_glm_batch_selected_cache.n_total_expert = n_total_expert;
+    g_glm_batch_selected_cache.n_selected = n_selected;
+    g_glm_batch_selected_cache.n_tokens = n_tokens;
+    g_glm_batch_selected_cache.n_unique = n_unique;
+    g_glm_batch_selected_cache.gate_expert_bytes = gate_expert_bytes;
+    g_glm_batch_selected_cache.down_expert_bytes = down_expert_bytes;
+    return 1;
+}
+
 /* Streaming layer cache lookup — delegates to runtime's existing cache. */
 
 extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
@@ -902,6 +1138,73 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                                                         n_selected);
     /* early_load seed_selected result logged */
     return ret;
+}
+
+extern "C" int ds4_gpu_glm_stream_expert_cache_seed_batch_selected(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens,
+        uint32_t n_selected) {
+    if (!g_ssd_streaming_mode ||
+        getenv("DS4_CUDA_DISABLE_GLM_STREAMING_EXPERT_EARLY_LOAD") != NULL ||
+        getenv("DS4_METAL_DISABLE_GLM_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
+        /* batch_seed SKIP */
+        return 1;
+    }
+    if (!table || !selected || n_tokens <= 1 || n_selected == 0 || n_selected > 8u) {
+        /* batch_seed INVALID_PARAMS */
+        return 1;
+    }
+    /* Check if the batch cache already matches (reuse from previous layer).
+     * This is the fast path: if the same layer+tokens were already seeded,
+     * skip the expensive prepare step. */
+    if (g_glm_batch_selected_cache.loaded &&
+        g_glm_batch_selected_cache.model_map == table->model_map &&
+        g_glm_batch_selected_cache.layer == table->layer &&
+        g_glm_batch_selected_cache.n_tokens == n_tokens &&
+        g_glm_batch_selected_cache.n_selected == n_selected &&
+        g_glm_batch_selected_cache.gate_expert_bytes == table->gate_expert_bytes &&
+        g_glm_batch_selected_cache.down_expert_bytes == table->down_expert_bytes &&
+        g_glm_batch_selected_cache.gate &&
+        g_glm_batch_selected_cache.slot_tensor.ptr) {
+        /* batch_seed CACHE_HIT */
+        return 1;
+    }
+    /* Check if the layer cache is already loaded — if so, we can skip the
+     * batch cache entirely because the MoE dispatch will use the layer cache. */
+    const char *lg = NULL, *lu = NULL, *ld = NULL;
+    if (cuda_stream_layer_expert_cache_apply(table->model_map,
+                                             table->layer,
+                                             table->n_total_expert,
+                                             table->gate_offset,
+                                             table->up_offset,
+                                             table->down_offset,
+                                             table->gate_expert_bytes,
+                                             table->down_expert_bytes,
+                                             &lg, &lu, &ld)) {
+        /* batch_seed LAYER_CACHE_HIT */
+        return 1;
+    }
+    /* Seed the batch cache with the selected experts for all tokens.
+     * This copies only the needed experts to GPU-local memory. */
+    if (!glm_batch_selected_prepare(table->model_map,
+                                    table->model_size,
+                                    table->layer,
+                                    selected,
+                                    n_tokens,
+                                    table->n_total_expert,
+                                    n_selected,
+                                    table->gate_offset,
+                                    table->up_offset,
+                                    table->down_offset,
+                                    table->gate_expert_bytes,
+                                    table->down_expert_bytes)) {
+        /* batch_seed PREPARE_FAILED */
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "glm batch seed FAILED il=%u\n", table->layer);
+        return 0;
+    }
+    /* batch_seed OK */
+    return 1;
 }
 
 /* =========================================================================

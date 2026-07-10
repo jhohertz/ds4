@@ -29272,6 +29272,30 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
                                   pos0);
 
     if (ok) {
+#ifdef DS4_ROCM_BUILD
+        /* Seed the GLM batch selected cache before the MoE dispatch so the
+         * GPU reads expert weights from fast GPU-local memory instead of
+         * falling through to slow host-memory reads via cuda_model_range_ptr. */
+        if (g->ssd_streaming &&
+            n_tokens > 1 &&
+            il >= DS4_N_LEADING_DENSE) {
+            const uint64_t gate_expert_bytes = gate_out * gate_row_bytes;
+            const uint64_t down_expert_bytes = down_out * down_row_bytes;
+            const ds4_gpu_stream_expert_table table =
+                graph_stream_expert_table_make(model,
+                                               l,
+                                               il,
+                                               gate_expert_bytes,
+                                               down_expert_bytes);
+            if (!ds4_gpu_glm_stream_expert_cache_seed_batch_selected(
+                    &table,
+                    g->batch_router_selected,
+                    n_tokens,
+                    DS4_N_EXPERT_USED)) {
+                /* seeding skipped (e.g., not streaming, cache already hit, etc.) */
+            }
+        }
+#endif
         const bool use_grouped_moe =
             glm_graph_indexed_prefill_grouped_moe_default(g);
         ok = glm_graph_routed_moe_batch_dispatch(
@@ -29657,10 +29681,32 @@ static bool glm_graph_encode_ffn_batch(
                                                   n_tokens,
                                                   stage_t0);
     if (ok) ok = glm_graph_profile_router_selection_batch(g,
-                                                          l,
-                                                          il,
-                                                          pos0,
-                                                          n_tokens);
+                                                           l,
+                                                           il,
+                                                           pos0,
+                                                           n_tokens);
+#ifdef DS4_ROCM_BUILD
+    /* Seed the expert cache with the selected expert indices so the GPU
+     * reads expert weights from fast GPU-local memory instead of falling
+     * through to slow host-memory reads. */
+    if (ok && g->ssd_streaming &&
+        n_tokens > 1 &&
+        il >= DS4_N_LEADING_DENSE) {
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(model,
+                                           l,
+                                           il,
+                                           gate_out * gate_row_bytes,
+                                           down_out * down_row_bytes);
+        if (!ds4_gpu_glm_stream_expert_cache_seed_batch_selected(
+                &table,
+                g->batch_router_selected,
+                n_tokens,
+                DS4_N_EXPERT_USED)) {
+            /* seeding skipped */
+        }
+    }
+#endif
     if (ok) ok = glm_graph_routed_moe_batch_dispatch(
             g,
             model,

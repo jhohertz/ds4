@@ -131,6 +131,11 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_routed_moe_selected_override_n = 0;
     g_stream_selected_cache.loaded = 0;
     g_stream_batch_selected_cache.loaded = 0;
+    static bool stats_atexit_registered = false;
+    if (enabled && !stats_atexit_registered) {
+        atexit(ds4_gpu_glm_moe_stats);
+        stats_atexit_registered = true;
+    }
 }
 
 extern "C" void ds4_gpu_set_glm_model(bool enabled) {

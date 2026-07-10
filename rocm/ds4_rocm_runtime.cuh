@@ -176,6 +176,29 @@ struct cuda_stream_batch_selected_cache {
     ds4_gpu_tensor selected_tensor;
 };
 
+/* GLM batch selected cache: slot-ordered weight buffers + re-indexed slot tensor.
+ * Used by glm_routed_moe_launch during prefill (n_tokens > 1) to avoid
+ * falling through to cuda_model_range_ptr (host memory reads). */
+struct cuda_glm_batch_selected_cache {
+    int loaded;
+    const void *model_map;
+    uint32_t layer;
+    uint32_t n_total_expert;
+    uint32_t n_selected;
+    uint32_t n_tokens;
+    uint32_t n_unique;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    char *gate;
+    char *up;
+    char *down;
+    uint64_t gate_capacity;
+    uint64_t down_capacity;
+    int32_t *slot_ids;
+    uint64_t slot_capacity;
+    ds4_gpu_tensor slot_tensor;
+};
+
 struct cuda_stream_layer_expert_cache {
     int active;
     const void *model_map;
@@ -242,6 +265,7 @@ static uint64_t g_model_stage_bytes;
 static uint32_t g_stream_expert_cache_budget;
 static cuda_stream_selected_cache g_stream_selected_cache;
 static cuda_stream_batch_selected_cache g_stream_batch_selected_cache;
+static cuda_glm_batch_selected_cache g_glm_batch_selected_cache;
 static cuda_stream_layer_expert_cache g_stream_layer_expert_cache[2];
 static std::vector<cuda_stream_resident_expert> g_stream_resident_experts;
 static std::unordered_map<cuda_stream_resident_key,
@@ -539,6 +563,14 @@ static void cuda_stream_batch_selected_cache_release(void) {
     memset(&g_stream_batch_selected_cache, 0, sizeof(g_stream_batch_selected_cache));
 }
 
+static void cuda_glm_batch_selected_cache_release(void) {
+    if (g_glm_batch_selected_cache.gate) (void)cudaFree(g_glm_batch_selected_cache.gate);
+    if (g_glm_batch_selected_cache.up) (void)cudaFree(g_glm_batch_selected_cache.up);
+    if (g_glm_batch_selected_cache.down) (void)cudaFree(g_glm_batch_selected_cache.down);
+    if (g_glm_batch_selected_cache.slot_ids) (void)cudaFree(g_glm_batch_selected_cache.slot_ids);
+    memset(&g_glm_batch_selected_cache, 0, sizeof(g_glm_batch_selected_cache));
+}
+
 static void cuda_stream_selected_cache_release(void) {
     (void)cuda_stream_selected_reuse_wait("streaming selected cache release");
     if (g_stream_selected_cache.gate) (void)cudaFree(g_stream_selected_cache.gate);
@@ -555,6 +587,7 @@ static void cuda_stream_selected_cache_release(void) {
     g_stream_selected_reuse_event_pending = 0;
     memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
     cuda_stream_batch_selected_cache_release();
+    cuda_glm_batch_selected_cache_release();
     cuda_stream_resident_cache_release();
     cuda_stream_layer_expert_cache_release();
     cuda_stream_read_stage_release();
