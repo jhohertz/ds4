@@ -207,9 +207,13 @@ extern "C" void ds4_gpu_stream_expert_cache_reset_selected(void) {
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
-    (void)gate_expert_bytes;
-    (void)down_expert_bytes;
-    return ds4_gpu_stream_expert_cache_configured_count();
+    if (!g_ssd_streaming_mode ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        gate_expert_bytes > UINT64_MAX / 2u ||
+        down_expert_bytes > UINT64_MAX / 2u) {
+        return 0;
+    }
+    return g_stream_expert_cache_budget;
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(

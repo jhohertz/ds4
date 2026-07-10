@@ -29279,6 +29279,9 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
         if (g->ssd_streaming &&
             n_tokens > 1 &&
             il >= DS4_N_LEADING_DENSE) {
+            /* Ensure GPU commands (router selection) are flushed before the
+             * host reads the selected tensor. */
+            ds4_gpu_flush_commands();
             const uint64_t gate_expert_bytes = gate_out * gate_row_bytes;
             const uint64_t down_expert_bytes = down_out * down_row_bytes;
             const ds4_gpu_stream_expert_table table =
@@ -29692,6 +29695,10 @@ static bool glm_graph_encode_ffn_batch(
     if (ok && g->ssd_streaming &&
         n_tokens > 1 &&
         il >= DS4_N_LEADING_DENSE) {
+        /* Ensure GPU commands (router selection) are flushed before the
+         * host reads the selected tensor — avoids a blocking D2H copy
+         * waiting on a kernel that hasn't been submitted. */
+        ds4_gpu_flush_commands();
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
                                            l,

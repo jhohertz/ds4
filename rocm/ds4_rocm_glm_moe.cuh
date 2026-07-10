@@ -1010,7 +1010,24 @@ static int glm_batch_selected_prepare(
     }
 
     /* Copy unique expert weights from host to slot-ordered GPU buffers.
-     * Gate and up share the same expert_bytes stride (verified by caller). */
+     * Gate and up share the same expert_bytes stride (verified by caller).
+     * Use the model file descriptor when available to avoid slow mmap page
+     * faults: read into a pinned staging buffer, then async copy to GPU. */
+    int use_fd =
+        g_model_fd >= 0 &&
+        (g_model_fd_host_base == NULL || model_map == g_model_fd_host_base);
+    void *stage_buf = NULL;
+    size_t stage_size = 0;
+    if (use_fd) {
+        stage_size = gate_expert_bytes > down_expert_bytes
+            ? (size_t)gate_expert_bytes : (size_t)down_expert_bytes;
+        cudaError_t err = cudaMallocHost(&stage_buf, stage_size);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            /* fall through to mmap path */
+            use_fd = 0;
+        }
+    }
     for (uint32_t i = 0; i < n_unique; i++) {
         const uint64_t expert = (uint64_t)(uint32_t)unique[i];
         const uint64_t src_gate_off = gate_offset + expert * gate_expert_bytes;
@@ -1018,26 +1035,70 @@ static int glm_batch_selected_prepare(
         const uint64_t src_down_off = down_offset + expert * down_expert_bytes;
         const uint64_t dst_off = (uint64_t)i * gate_expert_bytes;
         cudaError_t err;
-        err = cudaMemcpyAsync(g_glm_batch_selected_cache.gate + dst_off,
-                              (const char *)model_map + src_gate_off,
-                              (size_t)gate_expert_bytes,
-                              cudaMemcpyHostToDevice,
-                              g_model_upload_stream);
-        if (err != cudaSuccess) { free(ids); return 0; }
-        err = cudaMemcpyAsync(g_glm_batch_selected_cache.up + dst_off,
-                              (const char *)model_map + src_up_off,
-                              (size_t)gate_expert_bytes,
-                              cudaMemcpyHostToDevice,
-                              g_model_upload_stream);
-        if (err != cudaSuccess) { free(ids); return 0; }
-        const uint64_t dst_down_off = (uint64_t)i * down_expert_bytes;
-        err = cudaMemcpyAsync(g_glm_batch_selected_cache.down + dst_down_off,
-                              (const char *)model_map + src_down_off,
-                              (size_t)down_expert_bytes,
-                              cudaMemcpyHostToDevice,
-                              g_model_upload_stream);
-        if (err != cudaSuccess) { free(ids); return 0; }
+        if (use_fd) {
+            /* Read gate weights from file into staging buffer */
+            if (!cuda_pread_full(g_model_fd, stage_buf, gate_expert_bytes,
+                                 src_gate_off)) {
+                free(ids);
+                if (stage_buf) (void)cudaFreeHost(stage_buf);
+                return 0;
+            }
+            err = cudaMemcpyAsync(g_glm_batch_selected_cache.gate + dst_off,
+                                  stage_buf,
+                                  (size_t)gate_expert_bytes,
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+            if (err != cudaSuccess) { free(ids); if (stage_buf) (void)cudaFreeHost(stage_buf); return 0; }
+            /* Read up weights from file into staging buffer */
+            if (!cuda_pread_full(g_model_fd, stage_buf, gate_expert_bytes,
+                                 src_up_off)) {
+                free(ids);
+                if (stage_buf) (void)cudaFreeHost(stage_buf);
+                return 0;
+            }
+            err = cudaMemcpyAsync(g_glm_batch_selected_cache.up + dst_off,
+                                  stage_buf,
+                                  (size_t)gate_expert_bytes,
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+            if (err != cudaSuccess) { free(ids); if (stage_buf) (void)cudaFreeHost(stage_buf); return 0; }
+            /* Read down weights from file into staging buffer */
+            const uint64_t dst_down_off = (uint64_t)i * down_expert_bytes;
+            if (!cuda_pread_full(g_model_fd, stage_buf, down_expert_bytes,
+                                 src_down_off)) {
+                free(ids);
+                if (stage_buf) (void)cudaFreeHost(stage_buf);
+                return 0;
+            }
+            err = cudaMemcpyAsync(g_glm_batch_selected_cache.down + dst_down_off,
+                                  stage_buf,
+                                  (size_t)down_expert_bytes,
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+            if (err != cudaSuccess) { free(ids); if (stage_buf) (void)cudaFreeHost(stage_buf); return 0; }
+        } else {
+            err = cudaMemcpyAsync(g_glm_batch_selected_cache.gate + dst_off,
+                                  (const char *)model_map + src_gate_off,
+                                  (size_t)gate_expert_bytes,
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+            if (err != cudaSuccess) { free(ids); return 0; }
+            err = cudaMemcpyAsync(g_glm_batch_selected_cache.up + dst_off,
+                                  (const char *)model_map + src_up_off,
+                                  (size_t)gate_expert_bytes,
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+            if (err != cudaSuccess) { free(ids); return 0; }
+            const uint64_t dst_down_off = (uint64_t)i * down_expert_bytes;
+            err = cudaMemcpyAsync(g_glm_batch_selected_cache.down + dst_down_off,
+                                  (const char *)model_map + src_down_off,
+                                  (size_t)down_expert_bytes,
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+            if (err != cudaSuccess) { free(ids); return 0; }
+        }
     }
+    if (stage_buf) (void)cudaFreeHost(stage_buf);
 
     /* Wait for copies to complete */
     cudaError_t err = cudaStreamSynchronize(g_model_upload_stream);
