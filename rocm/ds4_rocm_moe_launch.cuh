@@ -299,7 +299,8 @@ static int routed_moe_build_plan(
         return 0;
     }
     plan->q4k_path = (gate_type == 12u && down_type == 12u);
-    plan->iq2_path = (gate_type == 16u && down_type == 10u);
+    plan->iq2_path = (gate_type == 16u && down_type == 10u) ||
+                     (gate_type == 16u && down_type == 16u);
     plan->q2k_path = (gate_type == 10u && down_type == 10u);
     if (!plan->q4k_path && !plan->iq2_path && !plan->q2k_path) return 0;
     if (!cuda_u64_mul_checked(n_total_expert, gate_expert_bytes, &plan->gate_bytes) ||
@@ -447,6 +448,7 @@ static int routed_moe_launch(
     const int split_selected =
         n_tokens == 1u &&
         getenv("DS4_ROCM_DISABLE_STREAMING_SPLIT_SELECTED") == NULL &&
+        g_stream_selected_cache.loaded &&
         cuda_stream_selected_apply_split(model_map,
                                          layer_index,
                                          n_total_expert,
@@ -462,45 +464,47 @@ static int routed_moe_launch(
                                          &down_slot_ptrs,
                                          &stream_resident_mask,
                                          &stream_missing_mask);
-    const int compact_selected =
+    int compact_selected =
         split_selected ||
         (n_tokens == 1u &&
         cuda_stream_selected_apply(model_map,
-                                   layer_index,
-                                   n_total_expert,
-                                   n_expert,
-                                   gate_expert_bytes,
-                                   down_expert_bytes,
-                                   &selected_exec,
-                                   &gate_w,
-                                   &up_w,
-                                   &down_w));
-    const int full_table_cached =
-        !stream_full_layer &&
-        routed_moe_full_table_is_cached(model_map,
-                                        gate_offset,
-                                        up_offset,
-                                        down_offset,
-                                        gate_bytes,
-                                        down_bytes);
-    if (!compact_selected && !batch_stream_selected && !batch_stream_split_selected) {
-        if (g_ssd_streaming_mode &&
-            n_total_expert > n_expert &&
-            !stream_full_layer &&
-            !full_table_cached) {
-            fprintf(stderr,
-                    DS4_GPU_LOG_PREFIX "SSD streaming routed MoE missing compact selected experts "
-                    "(layer=%u tokens=%u total_experts=%u selected=%u); full expert table is not mapped\n",
-                    layer_index,
-                    n_tokens,
-                    n_total_expert,
-                    n_expert);
+                                     layer_index,
+                                     n_total_expert,
+                                     n_expert,
+                                     gate_expert_bytes,
+                                     down_expert_bytes,
+                                     &selected_exec,
+                                     &gate_w,
+                                     &up_w,
+                                     &down_w));
+    if (n_tokens == 1u && !compact_selected) {
+        fprintf(stderr, "ds4: moe compact_selected FAILED il=%u loaded=%u pending=%u\n",
+                layer_index, g_stream_selected_cache.loaded, g_stream_selected_pending.active);
+    }
+    if (!compact_selected && !batch_stream_selected && !batch_stream_split_selected &&
+        n_tokens == 1u && iq2_path && n_expert == DS4_ROCM_N_EXPERT_USED &&
+        !stream_full_layer) {
+        /* GLM prefill doesn't seed the streaming cache.
+         * Fall back to loading pointers directly from the model map. */
+        fprintf(stderr, "ds4: moe fallback to model map ptr il=%u\n", layer_index);
+        gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
+        up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
+        down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+        if (!gate_w || !up_w || !down_w) {
+            fprintf(stderr, "ds4: moe model map ptr NULL il=%u\n", layer_index);
             return 0;
         }
+    }
+    if (!compact_selected && !batch_stream_selected && !batch_stream_split_selected) {
         if (!stream_full_layer) {
+            fprintf(stderr, "ds4: moe fallback model map ptr il=%u n_tok=%u\n", layer_index, n_tokens);
             gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
             up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
             down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+            if (!gate_w || !up_w || !down_w) {
+                fprintf(stderr, "ds4: moe model map ptr NULL il=%u n_tok=%u\n", layer_index, n_tokens);
+                return 0;
+            }
         }
     }
     if (batch_stream_selected || batch_stream_split_selected) {

@@ -3763,11 +3763,11 @@ static bool ds4_streaming_max_routed_layer_bytes(
                                                  &per_expert_bytes)) {
             continue;
         }
-        if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
+        if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT_USED) {
             return false;
         }
         const uint64_t layer_bytes =
-            per_expert_bytes * (uint64_t)DS4_N_EXPERT;
+            per_expert_bytes * (uint64_t)DS4_N_EXPERT_USED;
         if (layer_bytes > max_bytes) max_bytes = layer_bytes;
     }
 
@@ -27988,6 +27988,7 @@ static int glm_graph_routed_moe_one_dispatch(
             l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             return 0;
         }
+#ifndef DS4_ROCM_BUILD
         return ds4_gpu_routed_moe_one_tensor(out,
                                              g->routed_gate,
                                              g->routed_up,
@@ -28015,6 +28016,10 @@ static int glm_graph_routed_moe_one_dispatch(
                                              x,
                                              il,
                                              force_resident);
+#else
+        (void)g;
+        (void)force_resident;
+#endif
     }
 
     return ds4_gpu_glm_routed_moe_one_tensor(out,
@@ -28371,10 +28376,12 @@ static bool glm_graph_encode_sparse_ffn_one(
                 stream_t0 = glm_graph_streaming_async_profile_ms();
             }
         } else {
+            /* early-load start */
             ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                     &table,
                     g->router_selected,
                     DS4_N_EXPERT_USED) != 0;
+            /* begin_selected_load_tensor result */
             if (async_profile) {
                 g_glm_streaming_async_profile.sync_early_load_ms +=
                     glm_graph_streaming_async_profile_ms() - stream_t0;
@@ -38120,7 +38127,8 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return false;
     }
 
-    const uint64_t max_model_experts = (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_EXPERT;
+    const uint64_t max_model_experts =
+        (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_EXPERT;
     ds4_ssd_cache_plan plan;
     if (!ds4_ssd_auto_cache_plan(recommended,
                                  non_routed_bytes,
@@ -38229,13 +38237,13 @@ static bool ds4_glm_streaming_resident_prefix_bytes(
             return false;
         }
         uint64_t per_expert_bytes = 0;
-        if (!streaming_layer_routed_expert_bytes(&weights->layer[il],
-                                                 &per_expert_bytes) ||
-            per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
+    if (!streaming_layer_routed_expert_bytes(&weights->layer[il],
+                                                  &per_expert_bytes) ||
+            per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT_USED) {
             return false;
         }
         const uint64_t layer_bytes =
-            per_expert_bytes * (uint64_t)DS4_N_EXPERT;
+            per_expert_bytes * (uint64_t)DS4_N_EXPERT_USED;
         if (total > UINT64_MAX - layer_bytes) return false;
         total += layer_bytes;
     }

@@ -726,22 +726,53 @@ static int glm_routed_moe_launch(
         down_w = g_stream_selected_cache.down;
     } else if (streaming && uniform_gate_up &&
                cuda_stream_layer_expert_cache_apply(model_map, layer_index,
-                                                    n_total_expert,
-                                                    gate_offset, up_offset,
-                                                    down_offset,
-                                                    gate_expert_bytes,
-                                                    down_expert_bytes,
-                                                    &gate_w, &up_w, &down_w)) {
+                                                     n_total_expert,
+                                                     gate_offset, up_offset,
+                                                     down_offset,
+                                                     gate_expert_bytes,
+                                                     down_expert_bytes,
+                                                     &gate_w, &up_w, &down_w)) {
         /* full-layer cache hit */
+        /* cache HIT */
+    } else if (streaming) {
+        /* Layer cache MISS — load synchronously on-demand */
+        /* cache MISS — load on-demand */
+        if (cuda_stream_layer_expert_cache_load(model_map, model_size,
+                                                layer_index, n_total_expert,
+                                                gate_offset, up_offset,
+                                                down_offset,
+                                                gate_expert_bytes,
+                                                down_expert_bytes)) {
+            /* Retry apply after load */
+            cuda_stream_layer_expert_cache_apply(model_map, layer_index,
+                                                 n_total_expert,
+                                                 gate_offset, up_offset,
+                                                 down_offset,
+                                                 gate_expert_bytes,
+                                                 down_expert_bytes,
+                                                 &gate_w, &up_w, &down_w);
+        }
+        if (!gate_w || !up_w || !down_w) {
+            gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_tensor_bytes,
+                                          "glm_moe_gate");
+            up_w = cuda_model_range_ptr(model_map, up_offset, up_tensor_bytes,
+                                        "glm_moe_up");
+            down_w = cuda_model_range_ptr(model_map, down_offset, down_tensor_bytes,
+                                          "glm_moe_down");
+        }
     } else {
+        /* direct mmap fallback */
         gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_tensor_bytes,
-                                      "glm_moe_gate");
+                                       "glm_moe_gate");
         up_w = cuda_model_range_ptr(model_map, up_offset, up_tensor_bytes,
-                                    "glm_moe_up");
+                                     "glm_moe_up");
         down_w = cuda_model_range_ptr(model_map, down_offset, down_tensor_bytes,
-                                      "glm_moe_down");
+                                       "glm_moe_down");
     }
-    if (!gate_w || !up_w || !down_w) return 0;
+    if (!gate_w || !up_w || !down_w) {
+        /* ptrs FAILED */
+        return 0;
+    }
 
     const uint32_t rows_per_block = 4u;
     dim3 block(32, rows_per_block, 1);
@@ -756,6 +787,8 @@ static int glm_routed_moe_launch(
     const float *x_ptr = (const float *)x->ptr;
     float *mid_ptr = (float *)mid->ptr;
     float *out_ptr = (float *)out->ptr;
+
+    /* debug: x and gate/up values omitted */
 
     switch (gate_type) {
     case GLM_CUDA_TENSOR_IQ2_XXS:
@@ -833,32 +866,42 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
     if (!g_ssd_streaming_mode ||
         getenv("DS4_CUDA_DISABLE_GLM_STREAMING_EXPERT_EARLY_LOAD") != NULL ||
         getenv("DS4_METAL_DISABLE_GLM_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
+        /* early_load SKIP */
         return 1;
     }
     if (!table || !selected || n_selected == 0 || n_selected > 8u) {
+        /* early_load INVALID_PARAMS */
         return 1;
     }
     const char *g = NULL, *u = NULL, *d = NULL;
     if (cuda_stream_layer_expert_cache_apply(table->model_map,
-                                            table->layer,
-                                            table->n_total_expert,
-                                            table->gate_offset,
-                                            table->up_offset,
-                                            table->down_offset,
-                                            table->gate_expert_bytes,
-                                            table->down_expert_bytes,
-                                            &g, &u, &d)) {
+                                             table->layer,
+                                             table->n_total_expert,
+                                             table->gate_offset,
+                                             table->up_offset,
+                                             table->down_offset,
+                                             table->gate_expert_bytes,
+                                             table->down_expert_bytes,
+                                             &g, &u, &d)) {
+        /* early_load cache HIT */
         return 1;
     }
+    /* early_load cache MISS, reading selected_ids */
 
     int32_t selected_ids[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
     if (!ds4_gpu_tensor_read(selected, 0, selected_ids,
                              (uint64_t)n_selected * sizeof(selected_ids[0]))) {
+        /* early_load tensor_read FAILED */
         return 0;
     }
-    return ds4_gpu_stream_expert_cache_begin_selected_load(table,
-                                                           selected_ids,
-                                                           n_selected);
+    /* selected_ids debug omitted */
+    /* Use seed_selected (load + finish_pending) instead of begin_selected_load
+     * so the read pool is idle before the next layer starts. */
+    int ret = ds4_gpu_stream_expert_cache_seed_selected(table,
+                                                        selected_ids,
+                                                        n_selected);
+    /* early_load seed_selected result logged */
+    return ret;
 }
 
 /* =========================================================================

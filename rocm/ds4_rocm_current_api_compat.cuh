@@ -1,3 +1,9 @@
+#if defined(__linux__)
+#include <sys/sysinfo.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
 extern "C" int ds4_gpu_tensor_read_after_selected_event(
         const ds4_gpu_tensor *tensor,
         uint64_t offset,
@@ -105,6 +111,8 @@ extern "C" int ds4_gpu_preload_q4_expert_tables(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
         uint32_t n_total_expert) {
+    /* Q4 expert tables are accessed via model_map at inference time;
+     * no separate preload needed on ROCm (matches CUDA behavior). */
     (void)model_map;
     (void)model_size;
     (void)gate_offset;
@@ -113,7 +121,7 @@ extern "C" int ds4_gpu_preload_q4_expert_tables(
     (void)gate_expert_bytes;
     (void)down_expert_bytes;
     (void)n_total_expert;
-    return 0;
+    return 1;
 }
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
@@ -142,14 +150,29 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) 
 }
 
 extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
+    /* ROCm on UMA (Strix Halo): cudaMemGetInfo returns only dedicated VRAM
+     * (~1 GiB), not the GTT (~110 GiB shared system RAM).  Query host memory
+     * instead so the streaming auto-cache can use the full GTT budget. */
     size_t free_b = 0;
     size_t total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        (void)cudaGetLastError();
-        return 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess &&
+        total_b > 4ull * 1024ull * 1024ull * 1024ull) {
+        /* total_b looks like real VRAM (not the 1 GiB Strix Halo stub) */
+        return (uint64_t)total_b;
     }
-    (void)free_b;
-    return (uint64_t)total_b;
+    /* Fallback: use host memory (sysinfo on Linux, sysctl on macOS). */
+#if defined(__linux__)
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        uint64_t total = (uint64_t)si.totalram * (uint64_t)si.mem_unit;
+        if (total > 0) return total;
+    }
+#elif defined(__APPLE__)
+    uint64_t mem = 0;
+    size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0 && mem > 0) return mem;
+#endif
+    return 0;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
@@ -165,6 +188,15 @@ extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     cuda_stream_resident_cache_release();
+}
+
+extern "C" void ds4_gpu_stream_expert_cache_reset_selected(void) {
+    fprintf(stderr, "ds4: diag reset selected active=%d loaded=%d override_n=%u\n",
+            g_stream_selected_pending.active, g_stream_selected_cache.loaded,
+            g_routed_moe_selected_override_n);
+    g_stream_selected_cache.loaded = 0;
+    g_routed_moe_selected_override_n = 0;
+    memset(&g_stream_selected_pending, 0, sizeof(g_stream_selected_pending));
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
@@ -290,10 +322,105 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts) {
-    (void)table;
-    (void)expert_ids;
-    (void)expert_priorities;
-    (void)n_experts;
+    if (!g_ssd_streaming_mode) return 1;
+    if (!table || !expert_ids || n_experts == 0) return 0;
+
+    const void *model_map = table->model_map;
+    const uint64_t model_size = table->model_size;
+    const uint32_t layer = table->layer;
+    const uint32_t n_total_expert = table->n_total_expert;
+    const uint64_t gate_offset = table->gate_offset;
+    const uint64_t up_offset = table->up_offset;
+    const uint64_t down_offset = table->down_offset;
+    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+    const uint64_t down_expert_bytes = table->down_expert_bytes;
+
+    /* Priority sort: highest priority first.  If no priorities given,
+     * use reverse index (last expert highest). */
+    std::vector<uint32_t> order;
+    try {
+        order.reserve(n_experts);
+    } catch (...) {
+        return 1;
+    }
+    for (uint32_t i = 0; i < n_experts; i++) {
+        const uint32_t prio = expert_priorities ? expert_priorities[i]
+                            : (n_experts - i);
+        uint32_t pos = 0;
+        while (pos < order.size()) {
+            const uint32_t other_prio = expert_priorities
+                ? expert_priorities[order[pos]]
+                : (n_experts - order[pos]);
+            if (prio > other_prio) break;
+            pos++;
+        }
+        order.insert(order.begin() + pos, i);
+    }
+
+    for (uint32_t ri = 0; ri < (uint32_t)order.size(); ri++) {
+        const uint32_t i = order[ri];
+        const int32_t expert = expert_ids[i];
+        if (expert < 0 || (uint32_t)expert >= n_total_expert) continue;
+
+        /* Already resident? */
+        int idx = cuda_stream_resident_find(model_map,
+                                            layer,
+                                            expert,
+                                            gate_offset,
+                                            up_offset,
+                                            down_offset,
+                                            gate_expert_bytes,
+                                            down_expert_bytes);
+        if (idx >= 0) continue;
+
+        /* Allocate and load.  We pass no selected_ids context so
+         * eviction doesn't protect any in-flight selected experts. */
+        idx = cuda_stream_resident_alloc(model_map,
+                                         layer,
+                                         expert,
+                                         NULL,
+                                         0,
+                                         gate_offset,
+                                         up_offset,
+                                         down_offset,
+                                         gate_expert_bytes,
+                                         down_expert_bytes);
+        if (idx < 0) return 1;
+
+        cuda_stream_resident_expert &entry =
+            g_stream_resident_experts[(size_t)idx];
+        const uint64_t expert_u64 = (uint64_t)(uint32_t)expert;
+        const uint64_t gate_src =
+            gate_offset + expert_u64 * gate_expert_bytes;
+        const uint64_t down_src =
+            down_offset + expert_u64 * down_expert_bytes;
+
+        /* Load gate, up, down via upload stream. */
+        cudaError_t err = cudaMemcpyAsync(entry.gate,
+            (const char *)model_map + gate_src,
+            (size_t)gate_expert_bytes,
+            cudaMemcpyHostToDevice,
+            g_model_upload_stream);
+        if (err == cudaSuccess)
+            err = cudaMemcpyAsync(entry.up,
+                (const char *)model_map + up_offset + expert_u64 * gate_expert_bytes,
+                (size_t)gate_expert_bytes,
+                cudaMemcpyHostToDevice,
+                g_model_upload_stream);
+        if (err == cudaSuccess)
+            err = cudaMemcpyAsync(entry.down,
+                (const char *)model_map + down_src,
+                (size_t)down_expert_bytes,
+                cudaMemcpyHostToDevice,
+                g_model_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "streaming hotlist seed copy failed at layer=%u expert=%d: %s\n",
+                layer, expert, cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 1;
+        }
+    }
     return 1;
 }
 
