@@ -384,7 +384,7 @@ static int routed_moe_launch(
     uint32_t stream_batch_unique = 0;
     uint32_t stream_batch_resident_count = 0;
     uint32_t stream_batch_missing_count = 0;
-    const int stream_full_layer =
+    int stream_full_layer =
         n_tokens > 1u &&
         cuda_stream_layer_expert_cache_apply(model_map,
                                              layer_index,
@@ -397,6 +397,33 @@ static int routed_moe_launch(
                                              &gate_w,
                                              &up_w,
                                              &down_w);
+    /* On MISS during prefill, load the expert tensors into the layer cache
+     * (same as glm_routed_moe_launch does). This avoids falling through to
+     * cuda_model_range_ptr which caches permanently and exhausts GTT.
+     * Only applies to MoE layers (n_expert >= 2); dense FFN layers skip this. */
+    if (!stream_full_layer && n_tokens > 1u && g_ssd_streaming_mode &&
+        n_expert >= 2u &&
+        (q4k_path || iq2_path || q2k_path)) {
+        if (cuda_stream_layer_expert_cache_load(model_map, model_size,
+                                                layer_index, n_total_expert,
+                                                gate_offset, up_offset,
+                                                down_offset,
+                                                gate_expert_bytes,
+                                                down_expert_bytes)) {
+            stream_full_layer =
+                cuda_stream_layer_expert_cache_apply(model_map,
+                                                     layer_index,
+                                                     n_total_expert,
+                                                     gate_offset,
+                                                     up_offset,
+                                                     down_offset,
+                                                     gate_expert_bytes,
+                                                     down_expert_bytes,
+                                                     &gate_w,
+                                                     &up_w,
+                                                     &down_w);
+        }
+    }
     const int batch_stream_split_selected =
         !stream_full_layer &&
         n_tokens > 1u &&
@@ -428,6 +455,7 @@ static int routed_moe_launch(
         n_tokens > 1u &&
         iq2_path &&
         n_expert == DS4_ROCM_N_EXPERT_USED &&
+        n_tokens <= 64 &&
         cuda_stream_batch_selected_prepare(model_map,
                                            model_size,
                                            layer_index,

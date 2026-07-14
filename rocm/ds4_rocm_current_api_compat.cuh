@@ -350,7 +350,7 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
     try {
         order.reserve(n_experts);
     } catch (...) {
-        return 1;
+        return 0;
     }
     for (uint32_t i = 0; i < n_experts; i++) {
         const uint32_t prio = expert_priorities ? expert_priorities[i]
@@ -394,7 +394,7 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
                                          down_offset,
                                          gate_expert_bytes,
                                          down_expert_bytes);
-        if (idx < 0) return 1;
+        if (idx < 0) return 0;
 
         cuda_stream_resident_expert &entry =
             g_stream_resident_experts[(size_t)idx];
@@ -427,7 +427,7 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
                 "streaming hotlist seed copy failed at layer=%u expert=%d: %s\n",
                 layer, expert, cudaGetErrorString(err));
             (void)cudaGetLastError();
-            return 1;
+            return 0;
         }
     }
     return 1;

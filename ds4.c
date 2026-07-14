@@ -22288,7 +22288,13 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
                     experts[il],
                     priorities[il],
                     n) == 0) {
-            return false;
+            /* Cache full — skip remaining layers; the batch cache will
+             * handle this layer's experts during prefill. */
+            fprintf(stderr,
+                    "ds4: expert hotlist seed full at layer %u, "
+                    "seeded %u layers %u experts, skipping remaining\n",
+                    il, seeded_layers, seeded_experts);
+            break;
         }
         seeded_layers++;
         seeded_experts += n;

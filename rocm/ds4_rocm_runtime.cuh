@@ -4229,9 +4229,6 @@ static const char *cuda_model_range_ptr_from_fd(
     }
 
     char *dev = cuda_model_arena_alloc(bytes, what);
-    if (!dev) {
-        return cuda_model_ptr(model_map, offset);
-    }
     cudaError_t err = cudaSuccess;
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
