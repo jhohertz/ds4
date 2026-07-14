@@ -3820,11 +3820,11 @@ static bool ds4_streaming_max_routed_layer_bytes(
                                                  &per_expert_bytes)) {
             continue;
         }
-        if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
+        if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT_USED) {
             return false;
         }
         const uint64_t layer_bytes =
-            per_expert_bytes * (uint64_t)DS4_N_EXPERT;
+            per_expert_bytes * (uint64_t)DS4_N_EXPERT_USED;
         if (layer_bytes > max_bytes) max_bytes = layer_bytes;
     }
 
@@ -22556,7 +22556,13 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
                     experts[il],
                     priorities[il],
                     n) == 0) {
-            return false;
+            /* Cache full — skip remaining layers; the batch cache will
+             * handle this layer's experts during prefill. */
+            fprintf(stderr,
+                    "ds4: expert hotlist seed full at layer %u, "
+                    "seeded %u layers %u experts, skipping remaining\n",
+                    il, seeded_layers, seeded_experts);
+            break;
         }
         seeded_layers++;
         seeded_experts += n;
@@ -28305,6 +28311,7 @@ static int glm_graph_routed_moe_one_dispatch(
             l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             return 0;
         }
+#ifndef DS4_ROCM_BUILD
         return ds4_gpu_routed_moe_one_tensor(out,
                                              g->routed_gate,
                                              g->routed_up,
@@ -28332,6 +28339,10 @@ static int glm_graph_routed_moe_one_dispatch(
                                              x,
                                              il,
                                              force_resident);
+#else
+        (void)g;
+        (void)force_resident;
+#endif
     }
 
     return ds4_gpu_glm_routed_moe_one_tensor(out,
@@ -28688,10 +28699,12 @@ static bool glm_graph_encode_sparse_ffn_one(
                 stream_t0 = glm_graph_streaming_async_profile_ms();
             }
         } else {
+            /* early-load start */
             ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                     &table,
                     g->router_selected,
                     DS4_N_EXPERT_USED) != 0;
+            /* begin_selected_load_tensor result */
             if (async_profile) {
                 g_glm_streaming_async_profile.sync_early_load_ms +=
                     glm_graph_streaming_async_profile_ms() - stream_t0;
@@ -29582,6 +29595,33 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
                                   pos0);
 
     if (ok) {
+#ifdef DS4_ROCM_BUILD
+        /* Seed the GLM batch selected cache before the MoE dispatch so the
+         * GPU reads expert weights from fast GPU-local memory instead of
+         * falling through to slow host-memory reads via cuda_model_range_ptr. */
+        if (g->ssd_streaming &&
+            n_tokens > 1 &&
+            il >= DS4_N_LEADING_DENSE) {
+            /* Ensure GPU commands (router selection) are flushed before the
+             * host reads the selected tensor. */
+            ds4_gpu_flush_commands();
+            const uint64_t gate_expert_bytes = gate_out * gate_row_bytes;
+            const uint64_t down_expert_bytes = down_out * down_row_bytes;
+            const ds4_gpu_stream_expert_table table =
+                graph_stream_expert_table_make(model,
+                                               l,
+                                               il,
+                                               gate_expert_bytes,
+                                               down_expert_bytes);
+            if (!ds4_gpu_glm_stream_expert_cache_seed_batch_selected(
+                    &table,
+                    g->batch_router_selected,
+                    n_tokens,
+                    DS4_N_EXPERT_USED)) {
+                /* seeding skipped (e.g., not streaming, cache already hit, etc.) */
+            }
+        }
+#endif
         const bool use_grouped_moe =
             glm_graph_indexed_prefill_grouped_moe_default(g);
         ok = glm_graph_routed_moe_batch_dispatch(
@@ -29967,10 +30007,36 @@ static bool glm_graph_encode_ffn_batch(
                                                   n_tokens,
                                                   stage_t0);
     if (ok) ok = glm_graph_profile_router_selection_batch(g,
-                                                          l,
-                                                          il,
-                                                          pos0,
-                                                          n_tokens);
+                                                           l,
+                                                           il,
+                                                           pos0,
+                                                           n_tokens);
+#ifdef DS4_ROCM_BUILD
+    /* Seed the expert cache with the selected expert indices so the GPU
+     * reads expert weights from fast GPU-local memory instead of falling
+     * through to slow host-memory reads. */
+    if (ok && g->ssd_streaming &&
+        n_tokens > 1 &&
+        il >= DS4_N_LEADING_DENSE) {
+        /* Ensure GPU commands (router selection) are flushed before the
+         * host reads the selected tensor — avoids a blocking D2H copy
+         * waiting on a kernel that hasn't been submitted. */
+        ds4_gpu_flush_commands();
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(model,
+                                           l,
+                                           il,
+                                           gate_out * gate_row_bytes,
+                                           down_out * down_row_bytes);
+        if (!ds4_gpu_glm_stream_expert_cache_seed_batch_selected(
+                &table,
+                g->batch_router_selected,
+                n_tokens,
+                DS4_N_EXPERT_USED)) {
+            /* seeding skipped */
+        }
+    }
+#endif
     if (ok) ok = glm_graph_routed_moe_batch_dispatch(
             g,
             model,
@@ -38833,7 +38899,8 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return false;
     }
 
-    const uint64_t max_model_experts = (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_EXPERT;
+    const uint64_t max_model_experts =
+        (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_EXPERT;
     ds4_ssd_cache_plan plan;
     if (!ds4_ssd_auto_cache_plan(recommended,
                                  non_routed_bytes,
@@ -38942,13 +39009,13 @@ static bool ds4_glm_streaming_resident_prefix_bytes(
             return false;
         }
         uint64_t per_expert_bytes = 0;
-        if (!streaming_layer_routed_expert_bytes(&weights->layer[il],
-                                                 &per_expert_bytes) ||
-            per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
+    if (!streaming_layer_routed_expert_bytes(&weights->layer[il],
+                                                  &per_expert_bytes) ||
+            per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT_USED) {
             return false;
         }
         const uint64_t layer_bytes =
-            per_expert_bytes * (uint64_t)DS4_N_EXPERT;
+            per_expert_bytes * (uint64_t)DS4_N_EXPERT_USED;
         if (total > UINT64_MAX - layer_bytes) return false;
         total += layer_bytes;
     }

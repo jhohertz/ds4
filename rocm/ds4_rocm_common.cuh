@@ -82,6 +82,43 @@ __global__ static void embed_tokens_hc_kernel(
     out[gid] = __half2float(w[(uint64_t)tok * n_embd + d]);
 }
 
+/* --- q8_0 token embedding (non-HC, pure n_embd) --- */
+
+__global__ static void embed_token_q8_0_kernel(
+        float *out,
+        const unsigned char *w,
+        uint32_t n_embd) {
+    uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_embd) return;
+    const uint32_t blk = e >> 5u;
+    const uint32_t idx = e & 31u;
+    const unsigned char *b = w + (uint64_t)blk * 34u;
+    out[e] = embed_q8_0_scale(b) * (float)((const int8_t *)(b + 2u))[idx];
+}
+
+__global__ static void embed_tokens_q8_0_kernel(
+        float *out,
+        const int32_t *tokens,
+        const unsigned char *w,
+        uint32_t n_vocab,
+        uint32_t n_tokens,
+        uint32_t n_embd,
+        uint64_t row_bytes) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (gid >= n) return;
+    const uint32_t e = (uint32_t)(gid % n_embd);
+    const uint32_t t = (uint32_t)(gid / n_embd);
+    int32_t tok_i = tokens[t];
+    uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
+    if (tok >= n_vocab) tok = 0;
+    const unsigned char *row = w + (uint64_t)tok * row_bytes;
+    const uint32_t blk = e >> 5u;
+    const uint32_t idx = e & 31u;
+    const unsigned char *b = row + (uint64_t)blk * 34u;
+    out[gid] = embed_q8_0_scale(b) * (float)((const int8_t *)(b + 2u))[idx];
+}
+
 __device__ static float warp_sum_f32(float v);
 
 __global__ static void matmul_f16_kernel(
