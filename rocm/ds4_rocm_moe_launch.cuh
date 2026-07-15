@@ -365,6 +365,7 @@ static int routed_moe_launch(
     const int q4k_path = plan.q4k_path;
     const int iq2_path = plan.iq2_path;
     const int q2k_path = plan.q2k_path;
+    const int iq2xxs_down = !plan.q4k_path && down_type == 16u;
     const uint64_t gate_bytes = plan.gate_bytes;
     const uint64_t down_bytes = plan.down_bytes;
     const ds4_gpu_tensor *selected_exec = selected;
@@ -496,15 +497,43 @@ static int routed_moe_launch(
         split_selected ||
         (n_tokens == 1u &&
         cuda_stream_selected_apply(model_map,
-                                     layer_index,
-                                     n_total_expert,
-                                     n_expert,
-                                     gate_expert_bytes,
-                                     down_expert_bytes,
-                                     &selected_exec,
-                                     &gate_w,
-                                     &up_w,
-                                     &down_w));
+                                      layer_index,
+                                      n_total_expert,
+                                      n_expert,
+                                      gate_expert_bytes,
+                                      down_expert_bytes,
+                                      &selected_exec,
+                                      &gate_w,
+                                      &up_w,
+                                      &down_w));
+    /* Retry: re-populate the selected cache when it misses (different layer
+     * or stale IDs). Same logic as glm_routed_moe_launch's safety net. */
+    if (n_tokens == 1u && !compact_selected && g_ssd_streaming_mode &&
+        n_expert <= 8u && !stream_full_layer) {
+        int32_t ids[8];
+        if (ds4_gpu_tensor_read(selected, 0, ids,
+                                (uint64_t)n_expert * sizeof(ids[0]))) {
+            const ds4_gpu_stream_expert_table table = {
+                model_map, model_size, layer_index, n_total_expert,
+                gate_offset, up_offset, down_offset,
+                gate_expert_bytes, down_expert_bytes,
+            };
+            if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                    &table, ids, n_expert)) {
+                compact_selected =
+                    cuda_stream_selected_apply(model_map,
+                                               layer_index,
+                                               n_total_expert,
+                                               n_expert,
+                                               gate_expert_bytes,
+                                               down_expert_bytes,
+                                               &selected_exec,
+                                               &gate_w,
+                                               &up_w,
+                                               &down_w);
+            }
+        }
+    }
     if (n_tokens == 1u && !compact_selected) {
         fprintf(stderr, "ds4: moe compact_selected FAILED il=%u loaded=%u pending=%u\n",
                 layer_index, g_stream_selected_cache.loaded, g_stream_selected_pending.active);
@@ -1324,6 +1353,18 @@ static int routed_moe_launch(
                         midq_blocks,
                         out_dim,
                         n_expert);
+                } else if (iq2xxs_down) {
+                    moe_down_iq2xxs_sorted_qwarp32_kernel<<<dgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w,
+                        midq,
+                        sorted_pairs,
+                        (const int32_t *)selected_exec->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert);
                 } else {
                     moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
                         (float *)down->ptr,
@@ -1340,6 +1381,17 @@ static int routed_moe_launch(
             } else {
                 if (q4k_path) {
                     moe_down_q4K_qwarp32_kernel<<<dgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w,
+                        midq,
+                        (const int32_t *)selected_exec->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert);
+                } else if (iq2xxs_down) {
+                    moe_down_iq2xxs_qwarp32_kernel<<<dgrid, 256>>>(
                         (float *)down->ptr,
                         down_w,
                         midq,
@@ -1738,16 +1790,29 @@ static int routed_moe_launch(
     }
     if (ok) {
         dim3 dgrid(out_dim, n_tokens * n_expert, 1);
-        moe_down_f32_kernel<<<dgrid, 256>>>(
-            (float *)down->ptr,
-            down_w,
-            (const float *)mid->ptr,
-            (const int32_t *)selected_exec->ptr,
-            down_expert_bytes,
-            down_row_bytes,
-            expert_mid_dim,
-            out_dim,
-            n_expert);
+        if (iq2xxs_down) {
+            moe_down_iq2xxs_f32_kernel<<<dgrid, 256>>>(
+                (float *)down->ptr,
+                down_w,
+                (const float *)mid->ptr,
+                (const int32_t *)selected_exec->ptr,
+                down_expert_bytes,
+                down_row_bytes,
+                expert_mid_dim,
+                out_dim,
+                n_expert);
+        } else {
+            moe_down_f32_kernel<<<dgrid, 256>>>(
+                (float *)down->ptr,
+                down_w,
+                (const float *)mid->ptr,
+                (const int32_t *)selected_exec->ptr,
+                down_expert_bytes,
+                down_row_bytes,
+                expert_mid_dim,
+                out_dim,
+                n_expert);
+        }
         ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
     }
     if (ok) {

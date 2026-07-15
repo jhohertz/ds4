@@ -3322,7 +3322,8 @@ static int cuda_stream_selected_finish_pending_missing(uint32_t compact_mask) {
         cuda_stream_resident_cache_release();
         return 0;
     }
-    g_stream_selected_cache.loaded = compact_mask != 0 ? 1 : 0;
+    g_stream_selected_cache.loaded = 1;
+    g_routed_moe_selected_override_n = 0;
     memset(&g_stream_selected_pending, 0, sizeof(g_stream_selected_pending));
     return 1;
 }

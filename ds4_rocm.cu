@@ -91,6 +91,8 @@ typedef struct {
 
 #include "rocm/ds4_rocm_runtime.cuh"
 
+#include "ds4_cuda_gqa.inc"
+
 #include "rocm/ds4_rocm_common.cuh"
 
 #include "rocm/ds4_rocm_q8.cuh"
