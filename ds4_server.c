@@ -6665,6 +6665,7 @@ typedef enum {
 typedef struct {
     responses_stream_mode mode;
     size_t emit_pos;
+    size_t reasoning_token_end; /* hold newest token while checking </think> */
     bool active;
     bool checked_think_prefix;
     bool reasoning_item_opened;
@@ -7218,6 +7219,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
             const char *open = "<think>";
             const size_t open_len = strlen(open);
             if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
+                st->reasoning_token_end = raw_len;
                 return true;
             }
             if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
@@ -7241,8 +7243,8 @@ static bool responses_sse_stream_update(int fd, const request *r,
         } else if (final) {
             limit = raw_len;
         } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            limit = st->reasoning_token_end;
+            if (limit < st->emit_pos) limit = st->emit_pos;
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
 
@@ -7271,6 +7273,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
                 st->emit_pos = (size_t)(tool - raw);
                 st->mode = RESP_STREAM_SUPPRESS;
             }
+            st->reasoning_token_end = raw_len;
             return true;
         }
 
@@ -7282,6 +7285,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
             st->mode = RESP_STREAM_SUPPRESS;
             return true;
         } else {
+            st->reasoning_token_end = raw_len;
             return true;
         }
     }
@@ -7640,6 +7644,7 @@ typedef struct {
     anthropic_block_type open_block;
     int next_index;
     size_t emit_pos;
+    size_t reasoning_token_end; /* hold newest token while checking </think> */
     bool active;
     bool checked_think_prefix;
     bool guard_second_reasoning;
@@ -8114,6 +8119,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
             const char *open = "<think>";
             const size_t open_len = strlen(open);
             if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
+                st->reasoning_token_end = raw_len;
                 return true;
             }
             if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
@@ -8137,8 +8143,8 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         } else if (final) {
             limit = raw_len;
         } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            limit = st->reasoning_token_end;
+            if (limit < st->emit_pos) limit = st->emit_pos;
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
 
@@ -8157,6 +8163,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
                 st->emit_pos = (size_t)(tool - raw);
                 st->mode = ANTH_STREAM_SUPPRESS;
             }
+            st->reasoning_token_end = raw_len;
             return true;
         }
 
@@ -8170,6 +8177,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
                 return true;
             }
         } else {
+            st->reasoning_token_end = raw_len;
             return true;
         }
     }
@@ -13975,6 +13983,63 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     close(sv[1]);
 }
 
+/* Regression test for issue #685: reasoning deltas were split at a fixed
+ * byte offset (7 bytes before the end of whatever text had accumulated so
+ * far, to detect a possibly-split "</think>" marker) instead of at the
+ * actual token boundaries the caller feeds in -- production code calls
+ * *_sse_stream_update() once per newly decoded token, so the boundary
+ * between two calls is always a real token edge. Three update calls
+ * simulate three decode steps; the fix must emit exactly two reasoning
+ * deltas aligned to where the accumulated text grew between calls, not an
+ * arbitrary mid-word suffix cut on every call. */
+static void test_anthropic_stream_preserves_reasoning_token_boundaries(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_test", 10, &st));
+
+    const char *raw1 = "We need";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_test", &st,
+                                            raw1, strlen(raw1), false));
+    const char *raw2 = "We need to generate a title";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_test", &st,
+                                            raw2, strlen(raw2), false));
+    const char *raw3 =
+        "We need to generate a title</think>Free disk space check";
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_test", &st,
+                                          raw3, strlen(raw3), NULL,
+                                          "stop", 8));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *delta1 = strstr(out, "\"thinking\":\"We need\"");
+    const char *delta2 = strstr(out, "\"thinking\":\" to generate a title\"");
+    const char *text = strstr(out, "\"text\":\"Free disk space check\"");
+    TEST_ASSERT(delta1 != NULL);
+    TEST_ASSERT(delta2 != NULL);
+    TEST_ASSERT(text != NULL);
+    TEST_ASSERT(delta1 < delta2);
+    TEST_ASSERT(delta2 < text);
+    /* Neither the old fixed 7-byte holdback shape nor any other mid-word
+     * cut should appear. */
+    TEST_ASSERT(strstr(out, "\"thinking\":\"We nee\"") == NULL);
+    TEST_ASSERT(strstr(out, "\"thinking\":\"d to generate a titl\"") == NULL);
+
+    free(out);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_anthropic_usage_reports_cache_details(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -14202,6 +14267,59 @@ static void test_responses_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
     TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
     TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
+
+    free(out);
+    responses_stream_free(&st);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
+}
+
+/* Regression test for issue #685, Responses variant: same bug and same fix
+ * as test_anthropic_stream_preserves_reasoning_token_boundaries() -- see
+ * that comment. Three update calls simulate three decode steps; the fix
+ * must emit exactly two reasoning_summary_text.delta events aligned to
+ * where the accumulated text grew between calls. */
+static void test_responses_stream_preserves_reasoning_token_boundaries(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.reasoning_summary_emit = true;
+
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    st.active = true;
+
+    const char *raw1 = "We need";
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &st,
+                                            raw1, strlen(raw1), false));
+    const char *raw2 = "We need to generate a title";
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &st,
+                                            raw2, strlen(raw2), false));
+    const char *raw3 =
+        "We need to generate a title</think>Free disk space check";
+    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, &st,
+                                          raw3, strlen(raw3), NULL, NULL,
+                                          "stop", 10, 8, 0));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *delta1 = strstr(out, "\"delta\":\"We need\"");
+    const char *delta2 = strstr(out, "\"delta\":\"" " to generate a title\"");
+    const char *content = strstr(out, "\"delta\":\"Free disk space check\"");
+    TEST_ASSERT(delta1 != NULL);
+    TEST_ASSERT(delta2 != NULL);
+    TEST_ASSERT(content != NULL);
+    TEST_ASSERT(delta1 < delta2);
+    TEST_ASSERT(delta2 < content);
+    TEST_ASSERT(strstr(out, "\"delta\":\"We nee\"") == NULL);
+    TEST_ASSERT(strstr(out, "\"delta\":\"d to generate a titl\"") == NULL);
 
     free(out);
     responses_stream_free(&st);
@@ -17940,12 +18058,14 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_sse_headers();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_stream_reroutes_second_reasoning_pass();
+    test_anthropic_stream_preserves_reasoning_token_boundaries();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_reroutes_second_reasoning_pass();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
+    test_responses_stream_preserves_reasoning_token_boundaries();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
