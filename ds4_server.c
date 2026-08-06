@@ -5685,6 +5685,7 @@ typedef struct {
 typedef struct {
     openai_stream_mode mode;
     size_t emit_pos;
+    size_t reasoning_token_end; /* hold newest token while checking </think> */
     bool active;
     bool checked_think_prefix;
     bool guard_second_reasoning;
@@ -6485,6 +6486,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             const char *open = "<think>";
             const size_t open_len = strlen(open);
             if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
+                st->reasoning_token_end = raw_len;
                 return true;
             }
             if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
@@ -6508,8 +6510,8 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         } else if (final) {
             limit = raw_len;
         } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            limit = st->reasoning_token_end;
+            if (limit < st->emit_pos) limit = st->emit_pos;
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
 
@@ -6526,6 +6528,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                 st->emit_pos = (size_t)(tool - raw);
                 st->mode = OPENAI_STREAM_SUPPRESS;
             }
+            st->reasoning_token_end = raw_len;
             return true;
         }
 
@@ -6536,6 +6539,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             st->mode = OPENAI_STREAM_SUPPRESS;
             return true;
         } else {
+            st->reasoning_token_end = raw_len;
             return true;
         }
     }
@@ -14397,6 +14401,7 @@ static void test_responses_usage_reports_cache_details(void) {
     request_free(&r);
 }
 
+<<<<<<< HEAD
 /* Regression test for issue #685, Responses variant: same bug and same fix
  * as test_anthropic_stream_preserves_reasoning_token_boundaries() -- see
  * that comment. Three update calls simulate three decode steps; the fix
@@ -14481,20 +14486,18 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     char *out = read_socket_text(sv[1]);
 
     const char *role = strstr(out, "\"role\":\"assistant\"");
-    const char *reasoning1 = strstr(out, "\"reasoning_content\":\"We need to generate \"");
-    const char *reasoning2 = strstr(out, "\"reasoning_content\":\"a title\"");
+    const char *reasoning = strstr(out, "\"reasoning_content\":\"We need to generate a title\"");
     const char *content = strstr(out, "\"content\":\"Free disk space check\"");
     const char *done = strstr(out, "data: [DONE]");
     TEST_ASSERT(role != NULL);
-    TEST_ASSERT(reasoning1 != NULL);
-    TEST_ASSERT(reasoning2 != NULL);
+    TEST_ASSERT(reasoning != NULL);
     TEST_ASSERT(content != NULL);
     TEST_ASSERT(done != NULL);
-    TEST_ASSERT(role < reasoning1);
-    TEST_ASSERT(reasoning1 < reasoning2);
-    TEST_ASSERT(reasoning2 < content);
+    TEST_ASSERT(role < reasoning);
+    TEST_ASSERT(reasoning < content);
     TEST_ASSERT(content < done);
     TEST_ASSERT(strstr(out, "\"content\":\"We need to generate a title") == NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"We need to generate \"") == NULL);
     TEST_ASSERT(strstr(out, "</think>") == NULL);
 
     free(out);
