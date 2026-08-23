@@ -233,6 +233,7 @@ static int compare_repeated(const char *name,
                             uint32_t n_tokens,
                             uint32_t token_elems,
                             const reference_pattern patterns[N_PATTERN],
+                            uint32_t pattern_offset,
                             float abs_tolerance,
                             float rel_tolerance) {
     float max_abs = 0.0f;
@@ -243,7 +244,8 @@ static int compare_repeated(const char *name,
     const uint64_t count = (uint64_t)n_tokens * token_elems;
 
     for (uint32_t token = 0; token < n_tokens; token++) {
-        const float *expected = patterns[token % N_PATTERN].mid;
+        const float *expected =
+            patterns[(token + pattern_offset) % N_PATTERN].mid;
         for (uint32_t i = 0; i < token_elems; i++) {
             const uint64_t index = (uint64_t)token * token_elems + i;
             const float got = actual[index];
@@ -291,6 +293,7 @@ static int check_out_from_gpu_mid(const float *out_actual,
                                   const float *mid_actual,
                                   uint32_t n_tokens,
                                   const reference_pattern patterns[N_PATTERN],
+                                  uint32_t pattern_offset,
                                   const block_mxfp4 *down_matrix,
                                   float abs_tolerance,
                                   float rel_tolerance) {
@@ -305,7 +308,7 @@ static int check_out_from_gpu_mid(const float *out_actual,
     const uint64_t count = (uint64_t)n_tokens * MODEL_DIM;
 
     for (uint32_t token = 0; token < n_tokens; token++) {
-        const uint32_t p = token % N_PATTERN;
+        const uint32_t p = (token + pattern_offset) % N_PATTERN;
         const reference_pattern *pattern = &patterns[p];
         const float *mid = mid_actual + (uint64_t)token * N_EXPERT * FFN_DIM;
         const uint64_t mid_bytes = (uint64_t)N_EXPERT * FFN_DIM * sizeof(float);
@@ -465,9 +468,9 @@ static int run_case(uint32_t n_tokens,
          * mid is the public, stable result of that fused stage. */
         const int mid_ok = compare_repeated(
             "mid", mid_actual, n_tokens, N_EXPERT * FFN_DIM, patterns,
-            1.0e-4f, 1.0e-4f);
+            pattern_offset, 1.0e-4f, 1.0e-4f);
         const int out_ok = check_out_from_gpu_mid(
-            out_actual, mid_actual, n_tokens, patterns,
+            out_actual, mid_actual, n_tokens, patterns, pattern_offset,
             (const block_mxfp4 *)((const char *)model + down_offset),
             2.0e-4f, 1.0e-4f);
         ok = mid_ok && out_ok;
