@@ -1354,13 +1354,17 @@ static void nhi_close(ds4_transport *t) {
     ctx->stopping = 1;
     nhi_broadcast_locked(ctx);
     pthread_mutex_unlock(&ctx->mu);
+    /* Log the kernel counters before teardown work begins so the line
+     * survives SIGTERM-driven exits (systemd stop) that may cut short the
+     * joins below; fflush for the same reason. */
+    nhi_log_stats(ctx, ctx->device_path);
+    fflush(stderr);
     if (ctx->wake_fd >= 0) {
         uint64_t one = 1;
         (void)write(ctx->wake_fd, &one, sizeof(one));
     }
     if (ctx->dispatcher_started)
         (void)pthread_join(ctx->dispatcher, NULL);
-    nhi_log_stats(ctx, ctx->device_path);
     const int mapping_unregistered = nhi_unregister_gpu_mapping(ctx);
     if (ctx->mapping != MAP_FAILED && mapping_unregistered)
         (void)munmap(ctx->mapping, ctx->mapping_bytes);
