@@ -110,6 +110,39 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* ROCm mapped-host handoff helpers for driver-owned mmap() regions.  A
+ * successful registration pins/maps the complete range and returns the GPU
+ * address corresponding to host_ptr.  Call synchronize before transferring
+ * ownership between the GPU and an external DMA device.  Non-ROCm builds
+ * expose the same source-level API and report it unsupported.
+ */
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+int ds4_gpu_host_mapping_supported(void);
+int ds4_gpu_host_register_mapped(void *host_ptr, uint64_t bytes,
+                                 void **device_ptr);
+int ds4_gpu_host_mapped_synchronize(const char *label);
+int ds4_gpu_host_unregister_mapped(void *host_ptr);
+#else
+static inline int ds4_gpu_host_mapping_supported(void) {
+    return 0;
+}
+static inline int ds4_gpu_host_register_mapped(void *host_ptr, uint64_t bytes,
+                                                void **device_ptr) {
+    (void)host_ptr;
+    (void)bytes;
+    if (device_ptr) *device_ptr = NULL;
+    return 0;
+}
+static inline int ds4_gpu_host_mapped_synchronize(const char *label) {
+    (void)label;
+    return 0;
+}
+static inline int ds4_gpu_host_unregister_mapped(void *host_ptr) {
+    (void)host_ptr;
+    return 0;
+}
+#endif
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
