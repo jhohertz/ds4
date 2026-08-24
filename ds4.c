@@ -59857,10 +59857,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
         if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
         if (ok && output_hc) {
-            ok = ds4_gpu_tensor_read(metal_graph_cur_hc(g), 0, output_hc, hc_dim * sizeof(float)) != 0;
+            ok = ds4_gpu_tensor_read_any(metal_graph_cur_hc(g), 0, output_hc, hc_dim * sizeof(float)) != 0;
         }
         if (ok && output_logits) {
-            ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            ok = ds4_gpu_tensor_read_any(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
@@ -59983,7 +59983,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     if (ok && output_hc) {
         const bool time_readback = getenv("DS4_DIST_SYNC_TIMING") != NULL;
         const double rb_t0 = time_readback ? now_sec() : 0.0;
-        ok = ds4_gpu_tensor_read(metal_graph_batch_cur_hc(g), 0, output_hc, hc_bytes) != 0;
+        ok = ds4_gpu_tensor_read_any(metal_graph_batch_cur_hc(g), 0, output_hc, hc_bytes) != 0;
         if (time_readback) {
             fprintf(stderr,
                     "ds4: dist sync timing hidden readback n=%u bytes=%llu elapsed=%.1f ms (%.1f MiB/s)\n",
@@ -59996,7 +59996,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
     }
     if (ok && output_logits) {
-        ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        ok = ds4_gpu_tensor_read_any(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {

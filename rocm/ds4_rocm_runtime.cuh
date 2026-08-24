@@ -5919,6 +5919,84 @@ extern "C" int ds4_gpu_host_unregister_mapped(void *host_ptr) {
     return cuda_ok(hipHostUnregister(host_ptr),
                    "mapped host unregister");
 }
+
+extern "C" int ds4_gpu_pool_alloc_export(uint64_t bytes, void **ptr_out,
+                                         int *fd_out) {
+    if (ptr_out) *ptr_out = NULL;
+    if (fd_out) *fd_out = -1;
+    if (!ptr_out || !fd_out || bytes == 0 || (uint64_t)(size_t)bytes != bytes)
+        return 0;
+
+    void *ptr = NULL;
+    if (!cuda_ok(hipMalloc(&ptr, (size_t)bytes), "imported pool allocation"))
+        return 0;
+
+    /* Small hipMallocs are suballocated from shared slab BOs; the exported
+     * DMA-BUF would then name the whole slab and the driver could not map
+     * this pool exclusively. Require a proven-dedicated allocation. */
+    hipDeviceptr_t base = NULL;
+    size_t range = 0;
+    hipError_t err = hipMemGetAddressRange(&base, &range, (hipDeviceptr_t)ptr);
+    if (err != hipSuccess || base != (hipDeviceptr_t)ptr || range != (size_t)bytes) {
+        if (err != hipSuccess)
+            (void)cuda_ok(err, "imported pool address range");
+        else
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "imported pool is not a dedicated allocation "
+                    "(base=%p self=%p range=%zu bytes=%llu)\n",
+                    (void *)base, ptr, range, (unsigned long long)bytes);
+        (void)hipFree(ptr);
+        return 0;
+    }
+
+    int fd = -1;
+    err = hipMemGetHandleForAddressRange(&fd, (hipDeviceptr_t)ptr,
+                                         (size_t)bytes,
+                                         hipMemRangeHandleTypeDmaBufFd, 0);
+    if (err != hipSuccess || fd < 0) {
+        if (err != hipSuccess)
+            (void)cuda_ok(err, "imported pool DMA-BUF export");
+        else
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "imported pool DMA-BUF export returned an invalid fd\n");
+        (void)hipFree(ptr);
+        return 0;
+    }
+    *ptr_out = ptr;
+    *fd_out = fd;
+    return 1;
+}
+
+extern "C" int ds4_gpu_pool_free_exported(void *ptr) {
+    if (!ptr) return 1;
+    const int sync_ok = ds4_gpu_host_mapped_synchronize(
+        "imported pool free synchronization");
+    if (!sync_ok) return 0;
+    return cuda_ok(hipFree(ptr), "imported pool free");
+}
+
+extern "C" int ds4_gpu_memcpy_to_device_sync(void *dst, const void *src,
+                                             uint64_t bytes,
+                                             const char *label) {
+    if (!dst || (!src && bytes != 0) || (uint64_t)(size_t)bytes != bytes)
+        return 0;
+    if (bytes == 0) return 1;
+    return cuda_ok(hipMemcpy(dst, src, (size_t)bytes, hipMemcpyHostToDevice),
+                   label && label[0] ? label : "imported pool host-to-device stage");
+}
+
+extern "C" int ds4_gpu_tensor_read_any(const ds4_gpu_tensor *tensor,
+                                       uint64_t offset, void *data,
+                                       uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes ||
+        bytes > tensor->bytes - offset)
+        return 0;
+    return cuda_ok(hipMemcpy(data, (const char *)tensor->ptr + offset,
+                             (size_t)bytes, hipMemcpyDefault),
+                   "tensor read (any destination)");
+}
 #endif
 
 

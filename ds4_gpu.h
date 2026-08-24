@@ -143,6 +143,58 @@ static inline int ds4_gpu_host_unregister_mapped(void *host_ptr) {
 }
 #endif
 
+/* Native GPU frame pools for the NHI imported-pool mode (thunderbolt_stream
+ * patch 14). ds4_gpu_pool_alloc_export allocates a dedicated device pool and
+ * exports it as a DMA-BUF fd; the allocation must be backed by its own BO
+ * (verified via hipMemGetAddressRange) or the export fails, because the
+ * driver maps the whole buffer object. ds4_gpu_memcpy_to_device_sync stages
+ * small CPU-originated records into such a pool with a synchronous H2D copy.
+ * Non-ROCm builds report the API unsupported.
+ */
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+int ds4_gpu_pool_alloc_export(uint64_t bytes, void **ptr_out, int *fd_out);
+int ds4_gpu_pool_free_exported(void *ptr);
+int ds4_gpu_memcpy_to_device_sync(void *dst, const void *src, uint64_t bytes,
+                                  const char *label);
+#else
+static inline int ds4_gpu_pool_alloc_export(uint64_t bytes, void **ptr_out,
+                                            int *fd_out) {
+    (void)bytes;
+    if (ptr_out) *ptr_out = NULL;
+    if (fd_out) *fd_out = -1;
+    return 0;
+}
+static inline int ds4_gpu_pool_free_exported(void *ptr) {
+    (void)ptr;
+    return 1;
+}
+static inline int ds4_gpu_memcpy_to_device_sync(void *dst, const void *src,
+                                                uint64_t bytes,
+                                                const char *label) {
+    (void)dst;
+    (void)src;
+    (void)bytes;
+    (void)label;
+    return 0;
+}
+#endif
+
+/* Tensor readback that tolerates a device-pointer destination in addition to
+ * a host destination. The NHI imported-pool mode hands the engine a native
+ * GPU address as its result buffer, so the logits/hidden readback becomes a
+ * device-to-device copy there. All other builds/backends only ever receive
+ * host destinations and keep the ordinary host readback. */
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+int ds4_gpu_tensor_read_any(const ds4_gpu_tensor *tensor, uint64_t offset,
+                            void *data, uint64_t bytes);
+#else
+static inline int ds4_gpu_tensor_read_any(const ds4_gpu_tensor *tensor,
+                                          uint64_t offset,
+                                          void *data, uint64_t bytes) {
+    return ds4_gpu_tensor_read(tensor, offset, data, bytes);
+}
+#endif
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);

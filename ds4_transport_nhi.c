@@ -32,9 +32,16 @@
 #define DS4_NHI_ENVELOPE_BYTES 64u
 #define DS4_NHI_REAP_BATCH 64u
 #define DS4_NHI_DEFAULT_TIMEOUT_SEC 30u
+#define DS4_NHI_DEFAULT_RING_FRAMES 4096u
 
 typedef char ds4_nhi_envelope_is_64_bytes[
     DS4_NHI_ENVELOPE_BYTES == DS4_TRANSPORT_BULK_DESC_BYTES ? 1 : -1];
+_Static_assert(sizeof(struct tbstream_zc_import) == 88,
+               "tbstream_zc_import layout drifted from the kernel UAPI");
+_Static_assert(sizeof(struct tbstream_zc_ring_stats) == 128,
+               "tbstream_zc_ring_stats layout drifted from the kernel UAPI");
+_Static_assert(sizeof(struct tbstream_zc_stats) == 528,
+               "tbstream_zc_stats layout drifted from the kernel UAPI");
 
 typedef struct {
     uint32_t first;
@@ -55,6 +62,20 @@ typedef struct {
     uint32_t ring_size;
     uint32_t tx_frame_limit;
     uint32_t timeout_sec;
+
+    /* Imported-pool mode (thunderbolt_stream patch 14): the TX pool is a
+     * dedicated native GPU allocation imported as a DMA-BUF instead of the
+     * kernel page-backed pool. tx_import_base is the GPU base VA (non-NULL
+     * iff imported). tx_device_base/rx_device_base are the GPU-visible base
+     * addresses usable for leases per direction: the imported pool, or the
+     * hipHostRegister'd page-backed pool when mapped mode registered it, or
+     * NULL when that direction has no GPU-visible pool. With an imported TX
+     * half the CPU must never touch ctx->tx_pool; its mmap is a hole. */
+    int import_tx;
+    void *tx_import_base;
+    void *tx_device_base;
+    void *rx_device_base;
+    char *device_path;
 
     pthread_mutex_t mu;
     pthread_cond_t tx_cv;
@@ -102,6 +123,33 @@ static int nhi_mapped_model_io_enabled(void) {
     return value &&
         (!strcmp(value, "1") || !strcmp(value, "true") ||
          !strcmp(value, "yes") || !strcmp(value, "on"));
+}
+
+/* Imported native-GPU TX pool (thunderbolt_stream patch 14). Opt-in
+ * diagnostic while the kernel side requires zc_diagnostic_dmabuf=1 and
+ * CAP_SYS_RAWIO. The engine's result buffer becomes a device pointer into
+ * GPU memory the NHI reads directly, removing the hipHostRegister write
+ * path. Only the TX direction is supported; RX stays page-backed. */
+static int nhi_imported_tx_enabled(void) {
+    const char *value = getenv("DS4_DIST_NHI_IMPORTED");
+    return value &&
+        (!strcmp(value, "1") || !strcmp(value, "true") ||
+         !strcmp(value, "yes") || !strcmp(value, "on") ||
+         !strcmp(value, "tx"));
+}
+
+/* The import ioctl must precede ring construction, so the pool length cannot
+ * be learned from TBSTREAM_ZC_GET_INFO first. The kernel validates the
+ * length against its configured ring and rejects a mismatch with EINVAL. */
+static uint32_t nhi_ring_frames_hint(void) {
+    const char *text = getenv("DS4_DIST_NHI_RING_FRAMES");
+    if (!text || !text[0]) return DS4_NHI_DEFAULT_RING_FRAMES;
+    errno = 0;
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' ||
+        value < 2 || value > (1u << 20)) return DS4_NHI_DEFAULT_RING_FRAMES;
+    return (uint32_t)value;
 }
 
 static void nhi_trace(ds4_nhi_ctx *ctx, const char *format, ...) {
@@ -207,6 +255,35 @@ static void nhi_ring_copy_in(ds4_nhi_ctx *ctx,
         bytes -= chunk;
         offset = 0;
     }
+}
+
+/* Imported-TX variant of nhi_ring_copy_in: the pool has no CPU mapping, so
+ * CPU-originated bytes (envelopes, small copy-path payloads) are staged with
+ * a synchronous host-to-device copy per wrapped chunk. Synchronous
+ * completion is the ownership release that lets a later SUBMIT_TX observe
+ * the bytes; the payload visibility contract for GPU-written leases is the
+ * commit-time device synchronize, exactly as in mapped mode. */
+static int nhi_ring_stage_in(ds4_nhi_ctx *ctx,
+                             uint32_t first,
+                             size_t message_offset,
+                             const void *source,
+                             size_t bytes,
+                             const char *label) {
+    const unsigned char *src = source;
+    size_t offset = (size_t)first * ctx->frame_size + message_offset;
+    offset %= ctx->pool_bytes;
+    while (bytes != 0) {
+        size_t chunk = ctx->pool_bytes - offset;
+        if (chunk > bytes) chunk = bytes;
+        if (!ds4_gpu_memcpy_to_device_sync(
+                (unsigned char *)ctx->tx_import_base + offset,
+                src, chunk, label))
+            return -1;
+        src += chunk;
+        bytes -= chunk;
+        offset = 0;
+    }
+    return 0;
 }
 
 static void nhi_ring_copy_out(ds4_nhi_ctx *ctx,
@@ -555,8 +632,21 @@ static int nhi_send_desc(ds4_transport *t,
     }
 
     const uint32_t first = ctx->tx_next;
-    nhi_ring_copy_in(ctx, first, 0, envelope, sizeof(envelope));
-    nhi_ring_copy_in(ctx, first, sizeof(envelope), buf, len);
+    if (ctx->import_tx) {
+        if (nhi_ring_stage_in(ctx, first, 0, envelope, sizeof(envelope),
+                              "NHI envelope stage") != 0 ||
+            nhi_ring_stage_in(ctx, first, sizeof(envelope), buf, len,
+                              "NHI payload stage") != 0) {
+            int saved = nhi_fail_locked(ctx, EIO);
+            pthread_mutex_unlock(&ctx->mu);
+            ds4_transport_internal_fail(t, saved);
+            errno = EIO;
+            return -1;
+        }
+    } else {
+        nhi_ring_copy_in(ctx, first, 0, envelope, sizeof(envelope));
+        nhi_ring_copy_in(ctx, first, sizeof(envelope), buf, len);
+    }
 
     struct tbstream_zc_tx tx;
     memset(&tx, 0, sizeof(tx));
@@ -694,9 +784,8 @@ static int nhi_mapped_leases_supported(const ds4_transport *t) {
     if (!ctx_const) return 0;
     ds4_nhi_ctx *ctx = (ds4_nhi_ctx *)ctx_const;
     pthread_mutex_lock(&ctx->mu);
-    const int supported = nhi_mapped_model_io_enabled() &&
-        ctx->gpu_mapping_registered &&
-        ctx->gpu_mapping != NULL;
+    const int supported = (ctx->tx_device_base != NULL) ||
+        (ctx->rx_device_base != NULL);
     pthread_mutex_unlock(&ctx->mu);
     return supported;
 }
@@ -724,9 +813,9 @@ static int nhi_tx_lease_acquire(ds4_transport *t,
     }
 
     pthread_mutex_lock(&ctx->mu);
-    if (!ctx->gpu_mapping_registered || !ctx->gpu_mapping) {
+    if (!ctx->tx_device_base) {
         pthread_mutex_unlock(&ctx->mu);
-        nhi_set_err(err, errlen, "NHI GPU mapping is unavailable");
+        nhi_set_err(err, errlen, "NHI TX GPU pool is unavailable");
         errno = ENOTSUP;
         return -1;
     }
@@ -766,13 +855,28 @@ static int nhi_tx_lease_acquire(ds4_transport *t,
 
     unsigned char envelope[DS4_NHI_ENVELOPE_BYTES];
     nhi_envelope_encode(desc, envelope);
-    nhi_ring_copy_in(ctx, first, 0, envelope, sizeof(envelope));
-
-    const size_t mapping_offset =
-        (size_t)(ctx->tx_pool - (unsigned char *)ctx->mapping) +
-        payload_offset;
-    lease->host_ptr = ctx->tx_pool + payload_offset;
-    lease->device_ptr = (unsigned char *)ctx->gpu_mapping + mapping_offset;
+    if (ctx->import_tx) {
+        /* No CPU mapping of the imported pool: stage the envelope with a
+         * synchronous H2D copy. The engine writes the payload into the same
+         * pool through lease->host_ptr (a device VA), and the commit-time
+         * device synchronize releases both to the NHI. */
+        if (nhi_ring_stage_in(ctx, first, 0, envelope, sizeof(envelope),
+                              "NHI envelope stage") != 0) {
+            int saved = nhi_fail_locked(ctx, EIO);
+            pthread_mutex_unlock(&ctx->mu);
+            ds4_transport_internal_fail(t, saved);
+            errno = EIO;
+            return -1;
+        }
+        lease->host_ptr =
+            (unsigned char *)ctx->tx_import_base + payload_offset;
+        lease->device_ptr = lease->host_ptr;
+    } else {
+        nhi_ring_copy_in(ctx, first, 0, envelope, sizeof(envelope));
+        lease->host_ptr = ctx->tx_pool + payload_offset;
+        lease->device_ptr =
+            (unsigned char *)ctx->tx_device_base + payload_offset;
+    }
     lease->bytes = desc->payload_bytes;
     lease->first = first;
     lease->nframes = nframes;
@@ -812,9 +916,9 @@ static int nhi_rx_lease_acquire(ds4_transport *t,
     }
 
     pthread_mutex_lock(&ctx->mu);
-    if (!ctx->gpu_mapping_registered || !ctx->gpu_mapping) {
+    if (!ctx->rx_device_base) {
         pthread_mutex_unlock(&ctx->mu);
-        nhi_set_err(err, errlen, "NHI GPU mapping is unavailable");
+        nhi_set_err(err, errlen, "NHI RX GPU pool is unavailable");
         errno = ENOTSUP;
         return -1;
     }
@@ -880,11 +984,9 @@ static int nhi_rx_lease_acquire(ds4_transport *t,
         return -1;
     }
 
-    const size_t mapping_offset =
-        (size_t)(ctx->rx_pool - (unsigned char *)ctx->mapping) +
-        payload_offset;
     lease->host_ptr = ctx->rx_pool + payload_offset;
-    lease->device_ptr = (unsigned char *)ctx->gpu_mapping + mapping_offset;
+    lease->device_ptr = (unsigned char *)ctx->rx_device_base +
+        payload_offset;
     lease->bytes = desc->payload_bytes;
     lease->first = ev.first;
     lease->nframes = ev.nframes;
@@ -980,7 +1082,7 @@ static int nhi_tx_lease_commit(ds4_transport_lease *lease,
     }
 
     pthread_mutex_lock(&ctx->mu);
-    if (ctx->active_tx_lease != lease || !ctx->gpu_mapping_registered ||
+    if (ctx->active_tx_lease != lease || !ctx->tx_device_base ||
         ctx->failed || ctx->peer_closed || ctx->stopping ||
         lease->first != ctx->tx_next || lease->nframes == 0 ||
         ctx->tx_inflight > ctx->tx_frame_limit ||
@@ -1075,7 +1177,7 @@ static int nhi_rx_lease_commit(ds4_transport_lease *lease,
     }
 
     pthread_mutex_lock(&ctx->mu);
-    if (ctx->active_rx_lease != lease || !ctx->gpu_mapping_registered ||
+    if (ctx->active_rx_lease != lease || !ctx->rx_device_base ||
         ctx->failed || ctx->stopping || ctx->rx_count == 0) {
         int error_code = ctx->failed ? ctx->failed : EPROTO;
         ctx->active_rx_lease = NULL;
@@ -1196,7 +1298,9 @@ static int nhi_lease_abort_finish(ds4_transport_lease *lease) {
 
 static int nhi_unregister_gpu_mapping(ds4_nhi_ctx *ctx) {
     if (!ctx || !ctx->gpu_mapping_registered) return 1;
-    if (!ds4_gpu_host_unregister_mapped(ctx->mapping)) {
+    /* The registered range is the RX half only when TX is imported. */
+    void *registered = ctx->import_tx ? (void *)ctx->rx_pool : ctx->mapping;
+    if (!ds4_gpu_host_unregister_mapped(registered)) {
         fprintf(stderr,
                 "ds4: NHI mapped-host unregister failed; preserving mmap\n");
         return 0;
@@ -1204,6 +1308,42 @@ static int nhi_unregister_gpu_mapping(ds4_nhi_ctx *ctx) {
     ctx->gpu_mapping_registered = 0;
     ctx->gpu_mapping = NULL;
     return 1;
+}
+
+/* Best-effort diagnostic snapshot for gate artifacts: logs the kernel
+ * zero-copy/NHI counters, including the imported-pool flags, failures and
+ * event drops, before the device is closed. */
+static void nhi_log_stats(ds4_nhi_ctx *ctx, const char *device_path) {
+    if (!ctx || ctx->device_fd < 0) return;
+    struct tbstream_zc_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    stats.version = TBSTREAM_ZC_STATS_VERSION;
+    stats.struct_size = sizeof(stats);
+    if (ioctl(ctx->device_fd, TBSTREAM_ZC_GET_STATS, &stats) != 0) {
+        nhi_trace(ctx, "stats unavailable: %s", strerror(errno));
+        return;
+    }
+    fprintf(stderr,
+            "ds4: NHI stats %s: flags=0x%x%s%s failures=%llu "
+            "event_drops=%llu crc=%llu overrun=%llu last_error=%u "
+            "tx_submit=%llu/%llu rx_events=%llu reaped=%llu "
+            "tx_ring=%llu/%llu rx_ring=%llu/%llu\n",
+            device_path ? device_path : "?", stats.flags,
+            (stats.flags & TBSTREAM_ZC_STATS_F_TX_IMPORTED) ? " TX_IMPORTED" : "",
+            (stats.flags & TBSTREAM_ZC_STATS_F_RX_IMPORTED) ? " RX_IMPORTED" : "",
+            (unsigned long long)stats.failures,
+            (unsigned long long)stats.event_drops,
+            (unsigned long long)stats.crc_errors,
+            (unsigned long long)stats.overrun_errors,
+            stats.last_error,
+            (unsigned long long)stats.tx_submit_calls,
+            (unsigned long long)stats.tx_submit_frames,
+            (unsigned long long)stats.rx_events,
+            (unsigned long long)stats.reaped_events,
+            (unsigned long long)stats.tx.descriptors_posted,
+            (unsigned long long)stats.tx.descriptors_completed,
+            (unsigned long long)stats.rx.descriptors_posted,
+            (unsigned long long)stats.rx.descriptors_completed);
 }
 
 static void nhi_close(ds4_transport *t) {
@@ -1220,14 +1360,24 @@ static void nhi_close(ds4_transport *t) {
     }
     if (ctx->dispatcher_started)
         (void)pthread_join(ctx->dispatcher, NULL);
+    nhi_log_stats(ctx, ctx->device_path);
     const int mapping_unregistered = nhi_unregister_gpu_mapping(ctx);
     if (ctx->mapping != MAP_FAILED && mapping_unregistered)
         (void)munmap(ctx->mapping, ctx->mapping_bytes);
     if (ctx->device_fd >= 0) close(ctx->device_fd);
+    /* The kernel drops its DMA-BUF attachment at close; only then release
+     * the exported GPU pool. */
+    if (ctx->tx_import_base) {
+        if (!ds4_gpu_pool_free_exported(ctx->tx_import_base))
+            fprintf(stderr, "ds4: NHI imported TX pool free failed\n");
+        ctx->tx_import_base = NULL;
+        ctx->tx_device_base = NULL;
+    }
     if (ctx->wake_fd >= 0) close(ctx->wake_fd);
     pthread_cond_destroy(&ctx->rx_cv);
     pthread_cond_destroy(&ctx->tx_cv);
     pthread_mutex_destroy(&ctx->mu);
+    free(ctx->device_path);
     free(ctx->rx_events);
     free(ctx->tx_pending);
     free(ctx);
@@ -1263,10 +1413,17 @@ static void nhi_unstarted_cleanup(ds4_nhi_ctx *ctx,
     if (ctx->mapping != MAP_FAILED && mapping_unregistered)
         (void)munmap(ctx->mapping, ctx->mapping_bytes);
     if (ctx->device_fd >= 0) close(ctx->device_fd);
+    /* The device close above drops the kernel DMA-BUF attachment first. */
+    if (ctx->tx_import_base) {
+        if (!ds4_gpu_pool_free_exported(ctx->tx_import_base))
+            fprintf(stderr, "ds4: NHI imported TX pool free failed\n");
+        ctx->tx_import_base = NULL;
+    }
     if (ctx->wake_fd >= 0) close(ctx->wake_fd);
     if (rx_cv_ready) pthread_cond_destroy(&ctx->rx_cv);
     if (tx_cv_ready) pthread_cond_destroy(&ctx->tx_cv);
     if (mutex_ready) pthread_mutex_destroy(&ctx->mu);
+    free(ctx->device_path);
     free(ctx->rx_events);
     free(ctx->tx_pending);
     free(ctx);
@@ -1297,12 +1454,65 @@ static ds4_transport *nhi_create_common(
     ctx->timeout_sec = nhi_timeout_sec();
     int mutex_ready = 0, tx_cv_ready = 0, rx_cv_ready = 0;
 
+    ctx->device_path = strdup(device_path);
+    if (!ctx->device_path) {
+        nhi_set_err(err, errlen, "out of memory creating NHI transport");
+        goto fail;
+    }
+
     ctx->device_fd = open(device_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (ctx->device_fd < 0) {
         if (err && errlen)
             snprintf(err, errlen, "open %s: %s", device_path, strerror(errno));
         goto fail;
     }
+
+    /* Imported TX pool: allocate and import BEFORE ZC_ENABLE. Patch 14
+     * activates rings/paths lazily, and the import must precede ring
+     * construction. The kernel checks the pool length against its
+     * configured ring, requires CAP_SYS_RAWIO and the
+     * zc_diagnostic_dmabuf module parameter. */
+    const int import_requested = nhi_imported_tx_enabled();
+    if (import_requested) {
+        const uint32_t frames = nhi_ring_frames_hint();
+        const uint64_t pool_bytes64 =
+            (uint64_t)frames * TBSTREAM_ZC_FRAME_SIZE;
+        void *pool = NULL;
+        int pool_fd = -1;
+        if (!ds4_gpu_pool_alloc_export(pool_bytes64, &pool, &pool_fd)) {
+            nhi_set_err(err, errlen,
+                        "NHI imported TX pool allocation/export failed "
+                        "(dedicated BO required)");
+            errno = ENOTSUP;
+            goto fail;
+        }
+        struct tbstream_zc_import imp;
+        memset(&imp, 0, sizeof(imp));
+        imp.version = TBSTREAM_ZC_IMPORT_VERSION;
+        imp.tx.fd = pool_fd;
+        imp.tx.offset = 0;
+        imp.tx.length = pool_bytes64;
+        imp.rx.fd = -1;
+        if (ioctl(ctx->device_fd, TBSTREAM_ZC_IMPORT, &imp) != 0) {
+            int saved = errno;
+            if (err && errlen)
+                snprintf(err, errlen,
+                         "%s: TBSTREAM_ZC_IMPORT (%u frames): %s "
+                         "(needs patch-14 module, zc_diagnostic_dmabuf=1, "
+                         "CAP_SYS_RAWIO, matching ring size)",
+                         device_path, frames, strerror(saved));
+            close(pool_fd);
+            (void)ds4_gpu_pool_free_exported(pool);
+            errno = saved;
+            goto fail;
+        }
+        /* The kernel holds its own DMA-BUF reference until close. */
+        close(pool_fd);
+        ctx->import_tx = 1;
+        ctx->tx_import_base = pool;
+        ctx->tx_device_base = pool;
+    }
+
     if (ioctl(ctx->device_fd, TBSTREAM_ZC_ENABLE) != 0) {
         if (err && errlen)
             snprintf(err, errlen, "%s: TBSTREAM_ZC_ENABLE: %s",
@@ -1350,14 +1560,26 @@ static ds4_transport *nhi_create_common(
     const int mapped_requested = nhi_mapped_model_io_enabled();
 #ifdef DS4_ROCM_BUILD
     if (mapped_requested && ds4_gpu_host_mapping_supported()) {
+        /* With an imported TX half its mmap pages are a hole; register only
+         * the page-backed RX half. Otherwise register the whole mapping. */
+        void *reg_ptr = ctx->import_tx ? (void *)ctx->rx_pool : ctx->mapping;
+        uint64_t reg_bytes = ctx->import_tx
+            ? (uint64_t)ctx->pool_bytes : (uint64_t)ctx->mapping_bytes;
         void *gpu_mapping = NULL;
-        if (ds4_gpu_host_register_mapped(
-                ctx->mapping, (uint64_t)ctx->mapping_bytes, &gpu_mapping)) {
+        if (ds4_gpu_host_register_mapped(reg_ptr, reg_bytes, &gpu_mapping)) {
             ctx->gpu_mapping = gpu_mapping;
             ctx->gpu_mapping_registered = 1;
         }
     }
 #endif
+    if (!ctx->import_tx && ctx->gpu_mapping_registered)
+        ctx->tx_device_base =
+            (unsigned char *)ctx->gpu_mapping + info.tx_pool_offset;
+    if (ctx->gpu_mapping_registered)
+        ctx->rx_device_base = ctx->import_tx
+            ? ctx->gpu_mapping /* registration covered the RX half only */
+            : (void *)((unsigned char *)ctx->gpu_mapping +
+                       info.rx_pool_offset);
     ctx->tx_frame_limit = info.ring_size - 1u;
     ctx->tx_pending = calloc(info.ring_size, sizeof(*ctx->tx_pending));
     ctx->rx_events = calloc(info.ring_size, sizeof(*ctx->rx_events));
@@ -1399,9 +1621,15 @@ static ds4_transport *nhi_create_common(
     ctx->owner = t;
     nhi_trace(ctx,
               "created device=%s frame_size=%u ring_size=%u "
-              "mapped_requested=%d mapped=%d",
+              "mapped_requested=%d mapped=%d import_tx=%d",
               device_path, ctx->frame_size, ctx->ring_size,
-              mapped_requested, ctx->gpu_mapping_registered);
+              mapped_requested, ctx->gpu_mapping_registered,
+              ctx->import_tx);
+    if (import_requested)
+        fprintf(stderr,
+                "ds4: NHI imported TX pool active on %s "
+                "(%u frames x %u bytes, dedicated GPU DMA-BUF)\n",
+                device_path, ctx->ring_size, ctx->frame_size);
     rc = pthread_create(&ctx->dispatcher, NULL, nhi_dispatch_main, ctx);
     if (rc != 0) {
         errno = rc;
