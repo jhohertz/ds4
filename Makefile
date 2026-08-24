@@ -386,6 +386,12 @@ tests/test_q8_krow_rocm: tests/test_q8_krow_rocm.o ds4_rocm.o ds4_rocm_compat.o
 
 test-q8-krow-rocm: tests/test_q8_krow_rocm
 	./tests/test_q8_krow_rocm
+
+tests/bench_q8_krow_rocm.o: tests/bench_q8_krow_rocm.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/bench_q8_krow_rocm: tests/bench_q8_krow_rocm.o ds4_rocm.o ds4_rocm_compat.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_compat.cu
 
@@ -541,4 +547,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_rocm_qkv_fusion tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_rocm_qkv_fusion tests/test_q8_krow_rocm tests/bench_q8_krow_rocm tests/bench_mxfp4_rocm tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
