@@ -24,8 +24,14 @@ void *ds4_tp_nhi_tx_slot(ds4_tp_nhi *t, uint64_t seq);
 const void *ds4_tp_nhi_rx_slot(ds4_tp_nhi *t, uint64_t seq);
 int ds4_tp_nhi_submit(ds4_tp_nhi *t, uint64_t seq, char *err, size_t errlen);
 int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen);
-int ds4_tp_nhi_consumed(ds4_tp_nhi *t, char *err, size_t errlen);
+/* Mark one receive message GPU-consumed, in strict sequence order.  Reap
+ * batches POST_RX only after both the RX event and this mark exist. */
+int ds4_tp_nhi_consumed(ds4_tp_nhi *t, uint64_t seq,
+                        char *err, size_t errlen);
 int ds4_tp_nhi_peer_closed(const ds4_tp_nhi *t);
+/* After GPU producers/readers are quiesced, drain TX_DONE and all eligible
+ * RX reposts before ordered device close. */
+int ds4_tp_nhi_quiesce(ds4_tp_nhi *t, char *err, size_t errlen);
 void ds4_tp_nhi_close(ds4_tp_nhi *t);
 
 #endif /* __linux__ */

@@ -548,6 +548,8 @@ static int routed_moe_launch(
         const ds4_gpu_tensor *x,
         uint32_t layer_index,
         uint32_t n_tokens,
+        uint32_t owned_first,
+        uint32_t owned_count,
         bool force_resident) {
     routed_moe_launch_plan plan;
     if (!routed_moe_build_plan(out, gate, up, mid, down, model_map, model_size,
@@ -563,6 +565,12 @@ static int routed_moe_launch(
     const int iq2_gate_path = iq2_path || iq2_iq2_path;
     const int q2k_path = plan.q2k_path;
     const int mxfp4_path = plan.mxfp4_path;
+    if (owned_first > n_total_expert ||
+        owned_count > n_total_expert - owned_first || owned_count == 0)
+        return 0;
+    if ((owned_first != 0 || owned_count != n_total_expert) &&
+        (!mxfp4_path || n_tokens != 1u))
+        return 0;
     const uint64_t gate_bytes = plan.gate_bytes;
     const uint64_t down_bytes = plan.down_bytes;
     uint64_t pair_count64 = 0;
@@ -1529,6 +1537,8 @@ static int routed_moe_launch(
                         xq_blocks,
                         expert_mid_dim,
                         n_expert,
+                        owned_first,
+                        owned_count,
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate) {
@@ -1744,7 +1754,9 @@ static int routed_moe_launch(
                             down_row_bytes,
                             midq_blocks,
                             out_dim,
-                            n_expert);
+                            n_expert,
+                            owned_first,
+                            owned_count);
                     } else {
                         moe_down_mxfp4_sum6_qwarp32_kernel<true><<<mxgrid, 256>>>(
                             (float *)out->ptr,
@@ -1755,7 +1767,9 @@ static int routed_moe_launch(
                             down_row_bytes,
                             midq_blocks,
                             out_dim,
-                            n_expert);
+                            n_expert,
+                            owned_first,
+                            owned_count);
                     }
                 } else {
                     moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
@@ -2656,18 +2670,20 @@ static int routed_moe_launch(
 }
 
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in, uint32_t layer_index, bool force_resident) {
-    if (add_in) {
-        fprintf(stderr, "ds4: routed MoE addend fold is Metal-only\n");
-        return 0;
-    }
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
-                             gate_offset, up_offset, down_offset,
-                             gate_type, down_type,
-                             gate_expert_bytes, gate_row_bytes,
-                             down_expert_bytes, down_row_bytes,
-                             expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, layer_index, 1,
-                             force_resident);
+    uint32_t owned_first = 0, owned_count = n_total_expert;
+    ds4_rocm_tp_expert_range(n_total_expert, &owned_first, &owned_count);
+    int ok = routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                               gate_offset, up_offset, down_offset,
+                               gate_type, down_type,
+                               gate_expert_bytes, gate_row_bytes,
+                               down_expert_bytes, down_row_bytes,
+                               expert_in_dim, expert_mid_dim, out_dim,
+                               selected, weights, n_total_expert, n_expert,
+                               clamp, x, layer_index, 1,
+                               owned_first, owned_count, force_resident);
+    if (ok && add_in)
+        ok = ds4_gpu_add_tensor(out, out, add_in, out_dim) != 0;
+    return ok;
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
     if (mid_is_f16) *mid_is_f16 = false;
@@ -2678,5 +2694,5 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
-                             force_resident);
+                             0, n_total_expert, force_resident);
 }

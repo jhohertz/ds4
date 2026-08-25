@@ -62,6 +62,12 @@ struct ds4_gpu_tensor {
     int owner;
 };
 
+/* Defined by the NHI gate service below; the one-token routed-MoE launcher
+ * uses this without coupling kernel headers to transport globals. */
+static void ds4_rocm_tp_expert_range(uint32_t n_total_expert,
+                                     uint32_t *first_expert,
+                                     uint32_t *n_expert);
+
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
     uint8_t qs[CUDA_QK_K / 4];
@@ -463,20 +469,407 @@ extern "C" int ds4_gpu_tp_spin_combine_wait(int *timed_out) {
     return 1;
 }
 
-/* Tensor-parallel gates are Metal-only; stubs keep shared graph code
- * linkable (TP option validation rejects non-Metal backends). */
-extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
-    (void)layer; (void)gate;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+/* Production ROCm/NHI row gates.  The graph keeps fixed tp_out/tp_in
+ * tensors; this bridge copies each local partial into the rotating TX pool,
+ * publishes a role-tagged stamp, and eagerly enqueues a wait-copy from the
+ * matching RX slot.  A service thread waits only the event recorded before
+ * that spin (never the stream tail), submits one host ioctl, then returns RX
+ * credit after the wait-copy's final-reader event. */
+enum { DS4_ROCM_TP_QUEUE = 512 };
+
+typedef struct {
+    uint32_t layer;
+    uint32_t gate;
+    uint64_t seq;
+    hipEvent_t tx_ready;
+    hipEvent_t rx_consumed;
+    int in_use;
+} ds4_rocm_tp_request;
+
+static ds4_gpu_tensor *g_tp_engine_slab;
+static uint64_t g_tp_engine_out_offset;
+static uint64_t g_tp_engine_in_offset;
+static uint32_t g_tp_engine_slots;
+static uint32_t g_tp_engine_n_embd;
+static uint64_t g_tp_engine_seq;
+static unsigned long long g_tp_engine_max_spins = 800000000ull;
+static int32_t g_tp_split_rank;
+static int32_t g_tp_split_world = 1;
+static int32_t g_tp_attn_head_split;
+static int32_t g_tp_session_batch_mode;
+
+static ds4_gpu_tp_nhi_tx_slot_fn g_tp_nhi_tx_slot_fn;
+static ds4_gpu_tp_nhi_rx_slot_fn g_tp_nhi_rx_slot_fn;
+static ds4_gpu_tp_nhi_seq_fn g_tp_nhi_submit_fn;
+static ds4_gpu_tp_nhi_seq_fn g_tp_nhi_consumed_fn;
+static ds4_gpu_tp_nhi_fail_fn g_tp_nhi_fail_fn;
+static void *g_tp_nhi_ud;
+
+static pthread_t g_tp_engine_thread;
+static int g_tp_engine_thread_running;
+static int g_tp_engine_shutdown;
+static int g_tp_engine_device;
+static uint32_t *g_tp_engine_state_host; /* 0=healthy, 1=failed, 2=shutdown */
+static uint32_t *g_tp_engine_state_dev;
+static int g_tp_engine_failure_reported;
+static pthread_mutex_t g_tp_engine_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_tp_engine_cond = PTHREAD_COND_INITIALIZER;
+static ds4_rocm_tp_request g_tp_engine_requests[DS4_ROCM_TP_QUEUE];
+static uint32_t g_tp_engine_pending[DS4_ROCM_TP_QUEUE];
+static uint32_t g_tp_engine_pending_head;
+static uint32_t g_tp_engine_pending_count;
+static uint32_t g_tp_engine_next_record;
+
+static void ds4_rocm_tp_expert_range(uint32_t n_total_expert,
+                                     uint32_t *first_expert,
+                                     uint32_t *n_expert) {
+    *first_expert = 0;
+    *n_expert = n_total_expert;
+    if (g_tp_split_world != 2) return;
+    const uint32_t low = n_total_expert / 2u;
+    if (g_tp_split_rank == 1) {
+        *first_expert = low;
+        *n_expert = n_total_expert - low;
+    } else {
+        *n_expert = low;
+    }
+}
+
+extern "C" void ds4_gpu_tp_test_set_expert_shard(int rank) {
+    if (rank == 0 || rank == 1) {
+        g_tp_split_rank = rank;
+        g_tp_split_world = 2;
+    } else {
+        g_tp_split_rank = 0;
+        g_tp_split_world = 1;
+    }
+}
+
+static uint32_t ds4_rocm_tp_stamp(uint32_t rank, uint64_t seq) {
+    const uint32_t role_magic = rank == 0 ? 0x5ca16e39u : 0xc35a91e7u;
+    return role_magic ^ (uint32_t)seq;
+}
+
+static void ds4_rocm_tp_fail(const char *what,
+                             const ds4_rocm_tp_request *req) {
+    if (g_tp_engine_state_host &&
+        __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) == 0) {
+        __atomic_store_n(g_tp_engine_state_host, 1u, __ATOMIC_RELEASE);
+    }
+    if (__atomic_exchange_n(&g_tp_engine_failure_reported, 1,
+                            __ATOMIC_ACQ_REL) == 0) {
+        if (req) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "TP gate failed: %s (layer %u gate %u seq %llu)\n",
+                    what, req->layer, req->gate,
+                    (unsigned long long)req->seq);
+        } else {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "TP gate failed: %s\n", what);
+        }
+        if (g_tp_nhi_fail_fn) g_tp_nhi_fail_fn(g_tp_nhi_ud);
+    }
+}
+
+static void *ds4_rocm_tp_service_thread(void *arg) {
+    (void)arg;
+    if (hipSetDevice(g_tp_engine_device) != hipSuccess) {
+        ds4_rocm_tp_fail("service-thread hipSetDevice", NULL);
+        return NULL;
+    }
+    for (;;) {
+        pthread_mutex_lock(&g_tp_engine_mutex);
+        while (g_tp_engine_pending_count == 0 &&
+               !__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE))
+            pthread_cond_wait(&g_tp_engine_cond, &g_tp_engine_mutex);
+        if (g_tp_engine_pending_count == 0 &&
+            __atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE)) {
+            pthread_mutex_unlock(&g_tp_engine_mutex);
+            break;
+        }
+        const uint32_t index = g_tp_engine_pending[g_tp_engine_pending_head];
+        g_tp_engine_pending_head =
+            (g_tp_engine_pending_head + 1u) % DS4_ROCM_TP_QUEUE;
+        g_tp_engine_pending_count--;
+        pthread_mutex_unlock(&g_tp_engine_mutex);
+
+        ds4_rocm_tp_request *req = &g_tp_engine_requests[index];
+        int ok = hipEventSynchronize(req->tx_ready) == hipSuccess;
+        if (!ok) ds4_rocm_tp_fail("TX-ready event synchronize", req);
+
+        const uint32_t state = g_tp_engine_state_host
+            ? __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) : 1u;
+        int submitted = 0;
+        if (ok && state == 0 &&
+            !__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE)) {
+            submitted = g_tp_nhi_submit_fn &&
+                        g_tp_nhi_submit_fn(g_tp_nhi_ud, req->seq);
+            if (!submitted) ds4_rocm_tp_fail("NHI submit", req);
+        }
+
+        /* Always wait the final-reader marker.  On transport failure or
+         * shutdown the mapped state word aborts the spin, so this cannot
+         * leave teardown blocked behind peer traffic. */
+        if (hipEventSynchronize(req->rx_consumed) != hipSuccess)
+            ds4_rocm_tp_fail("RX-consumed event synchronize", req);
+        if (g_tp_engine_state_host &&
+            __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) == 1u)
+            ds4_rocm_tp_fail("RX stamp timeout", req);
+
+        if (submitted &&
+            !__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE) &&
+            __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) == 0 &&
+            (!g_tp_nhi_consumed_fn ||
+             !g_tp_nhi_consumed_fn(g_tp_nhi_ud, req->seq))) {
+            ds4_rocm_tp_fail("NHI RX consume/repost", req);
+        }
+
+        pthread_mutex_lock(&g_tp_engine_mutex);
+        req->in_use = 0;
+        pthread_cond_broadcast(&g_tp_engine_cond);
+        pthread_mutex_unlock(&g_tp_engine_mutex);
+    }
+    return NULL;
+}
+
+extern "C" int ds4_gpu_tp_init(uint32_t rank,
+                               ds4_gpu_tensor *slab,
+                               uint64_t gpu_flags_off,
+                               ds4_gpu_tp_exchange_fn fn,
+                               void *ud) {
+    (void)rank; (void)slab; (void)gpu_flags_off; (void)fn; (void)ud;
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX
+            "ROCm network tensor parallelism requires the NHI gate service\n");
     return 0;
+}
+
+extern "C" int ds4_gpu_tp_nhi_init(
+        uint32_t rank,
+        ds4_gpu_tensor *slab,
+        uint64_t out_offset,
+        uint64_t in_offset,
+        uint32_t n_slots,
+        uint32_t n_embd,
+        ds4_gpu_tp_nhi_tx_slot_fn tx_slot_fn,
+        ds4_gpu_tp_nhi_rx_slot_fn rx_slot_fn,
+        ds4_gpu_tp_nhi_seq_fn submit_fn,
+        ds4_gpu_tp_nhi_seq_fn consumed_fn,
+        ds4_gpu_tp_nhi_fail_fn fail_fn,
+        void *ud) {
+    if (rank > 1 || !slab ||
+        !tx_slot_fn || !rx_slot_fn || !submit_fn || !consumed_fn ||
+        n_slots == 0 || n_embd == 0 ||
+        n_embd > DS4_ROCM_TP_PAYLOAD_FLOATS_MAX ||
+        g_tp_engine_thread_running)
+        return 0;
+    const uint64_t vec_bytes = (uint64_t)n_embd * sizeof(float);
+    if (out_offset > slab->bytes || in_offset > slab->bytes ||
+        (uint64_t)n_slots * vec_bytes > slab->bytes - out_offset ||
+        (uint64_t)n_slots * vec_bytes > slab->bytes - in_offset)
+        return 0;
+
+    memset(g_tp_engine_requests, 0, sizeof(g_tp_engine_requests));
+    g_tp_engine_slab = slab;
+    g_tp_engine_out_offset = out_offset;
+    g_tp_engine_in_offset = in_offset;
+    g_tp_engine_slots = n_slots;
+    g_tp_engine_n_embd = n_embd;
+    g_tp_engine_seq = 0;
+    g_tp_nhi_tx_slot_fn = tx_slot_fn;
+    g_tp_nhi_rx_slot_fn = rx_slot_fn;
+    g_tp_nhi_submit_fn = submit_fn;
+    g_tp_nhi_consumed_fn = consumed_fn;
+    g_tp_nhi_fail_fn = fail_fn;
+    g_tp_nhi_ud = ud;
+    g_tp_split_rank = (int32_t)rank;
+    g_tp_split_world = 2;
+    g_tp_engine_pending_head = 0;
+    g_tp_engine_pending_count = 0;
+    g_tp_engine_next_record = 0;
+    __atomic_store_n(&g_tp_engine_shutdown, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tp_engine_failure_reported, 0, __ATOMIC_RELEASE);
+    const char *spins = getenv("DS4_TP_SPIN_MAX");
+    if (spins && strtoull(spins, NULL, 10) != 0)
+        g_tp_engine_max_spins = strtoull(spins, NULL, 10);
+
+    if (hipGetDevice(&g_tp_engine_device) != hipSuccess ||
+        hipHostMalloc((void **)&g_tp_engine_state_host, sizeof(uint32_t),
+                      hipHostMallocMapped) != hipSuccess ||
+        hipHostGetDevicePointer((void **)&g_tp_engine_state_dev,
+                                g_tp_engine_state_host, 0) != hipSuccess) {
+        ds4_gpu_tp_shutdown();
+        return 0;
+    }
+    __atomic_store_n(g_tp_engine_state_host, 0u, __ATOMIC_RELEASE);
+    for (uint32_t i = 0; i < DS4_ROCM_TP_QUEUE; i++) {
+        if (hipEventCreateWithFlags(&g_tp_engine_requests[i].tx_ready,
+                                    hipEventReleaseToSystem) != hipSuccess ||
+            hipEventCreateWithFlags(&g_tp_engine_requests[i].rx_consumed,
+                                    hipEventDefault) != hipSuccess) {
+            ds4_gpu_tp_shutdown();
+            return 0;
+        }
+    }
+    if (pthread_create(&g_tp_engine_thread, NULL,
+                       ds4_rocm_tp_service_thread, NULL) != 0) {
+        ds4_gpu_tp_shutdown();
+        return 0;
+    }
+    g_tp_engine_thread_running = 1;
+    return 1;
+}
+
+extern "C" void ds4_gpu_tp_shutdown(void) {
+    if (g_tp_engine_state_host) {
+        uint32_t expected = 0;
+        (void)__atomic_compare_exchange_n(g_tp_engine_state_host, &expected,
+                                          2u, 0, __ATOMIC_ACQ_REL,
+                                          __ATOMIC_ACQUIRE);
+    }
+    if (g_tp_engine_thread_running) {
+        pthread_mutex_lock(&g_tp_engine_mutex);
+        __atomic_store_n(&g_tp_engine_shutdown, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&g_tp_engine_cond);
+        pthread_mutex_unlock(&g_tp_engine_mutex);
+        /* The mapped state aborts any in-flight wait-copy. */
+        (void)hipDeviceSynchronize();
+        pthread_join(g_tp_engine_thread, NULL);
+        g_tp_engine_thread_running = 0;
+    }
+    for (uint32_t i = 0; i < DS4_ROCM_TP_QUEUE; i++) {
+        if (g_tp_engine_requests[i].tx_ready)
+            (void)hipEventDestroy(g_tp_engine_requests[i].tx_ready);
+        if (g_tp_engine_requests[i].rx_consumed)
+            (void)hipEventDestroy(g_tp_engine_requests[i].rx_consumed);
+    }
+    memset(g_tp_engine_requests, 0, sizeof(g_tp_engine_requests));
+    if (g_tp_engine_state_host) (void)hipHostFree(g_tp_engine_state_host);
+    g_tp_engine_state_host = NULL;
+    g_tp_engine_state_dev = NULL;
+    g_tp_engine_slab = NULL;
+    g_tp_nhi_tx_slot_fn = NULL;
+    g_tp_nhi_rx_slot_fn = NULL;
+    g_tp_nhi_submit_fn = NULL;
+    g_tp_nhi_consumed_fn = NULL;
+    g_tp_nhi_fail_fn = NULL;
+    g_tp_nhi_ud = NULL;
+    __atomic_store_n(&g_tp_engine_shutdown, 0, __ATOMIC_RELEASE);
+    g_tp_split_rank = 0;
+    g_tp_split_world = 1;
+    g_tp_attn_head_split = 0;
+    g_tp_session_batch_mode = 0;
+}
+
+extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
+    if (!g_tp_engine_thread_running || gate >= 2u) return 0;
+    const uint32_t slot = layer * 2u + gate;
+    if (slot >= g_tp_engine_slots ||
+        __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) != 0)
+        return 0;
+    if (g_tp_engine_seq > UINT32_MAX) {
+        ds4_rocm_tp_fail("32-bit stamp sequence exhausted", NULL);
+        return 0;
+    }
+
+    uint32_t index = UINT32_MAX;
+    pthread_mutex_lock(&g_tp_engine_mutex);
+    for (uint32_t n = 0; n < DS4_ROCM_TP_QUEUE; n++) {
+        const uint32_t candidate =
+            (g_tp_engine_next_record + n) % DS4_ROCM_TP_QUEUE;
+        if (!g_tp_engine_requests[candidate].in_use) {
+            index = candidate;
+            g_tp_engine_next_record = (candidate + 1u) % DS4_ROCM_TP_QUEUE;
+            g_tp_engine_requests[candidate].in_use = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_tp_engine_mutex);
+    if (index == UINT32_MAX) {
+        ds4_rocm_tp_fail("request/event ring exhausted", NULL);
+        return 0;
+    }
+
+    ds4_rocm_tp_request *req = &g_tp_engine_requests[index];
+    req->layer = layer;
+    req->gate = gate;
+    req->seq = g_tp_engine_seq++;
+    void *tx_slot = g_tp_nhi_tx_slot_fn(g_tp_nhi_ud, req->seq);
+    const void *rx_slot = g_tp_nhi_rx_slot_fn(g_tp_nhi_ud, req->seq);
+    const uint64_t vec_bytes =
+        (uint64_t)g_tp_engine_n_embd * sizeof(float);
+    const float *out = (const float *)((const char *)g_tp_engine_slab->ptr +
+                                       g_tp_engine_out_offset +
+                                       (uint64_t)slot * vec_bytes);
+    float *in = (float *)((char *)g_tp_engine_slab->ptr +
+                          g_tp_engine_in_offset +
+                          (uint64_t)slot * vec_bytes);
+    if (!tx_slot || !rx_slot) {
+        pthread_mutex_lock(&g_tp_engine_mutex);
+        req->in_use = 0;
+        pthread_mutex_unlock(&g_tp_engine_mutex);
+        ds4_rocm_tp_fail("null transport slot", req);
+        return 0;
+    }
+
+    const uint32_t block = 256u;
+    const uint32_t grid = (g_tp_engine_n_embd + block - 1u) / block;
+    hipLaunchKernelGGL(dsv4_tp_slot_copy_f32_kernel,
+                       dim3(grid), dim3(block), 0, 0,
+                       (unsigned char *)tx_slot, out, g_tp_engine_n_embd);
+    hipLaunchKernelGGL(dsv4_tp_stamp_release_kernel,
+                       dim3(1), dim3(1), 0, 0,
+                       (unsigned char *)tx_slot,
+                       ds4_rocm_tp_stamp((uint32_t)g_tp_split_rank, req->seq));
+    int ok = hipGetLastError() == hipSuccess &&
+             hipEventRecord(req->tx_ready, 0) == hipSuccess;
+    if (ok) {
+        hipLaunchKernelGGL(dsv4_tp_spin_copy_f32_kernel,
+                           dim3(1), dim3(256), 0, 0,
+                           in, (const unsigned char *)rx_slot,
+                           g_tp_engine_n_embd,
+                           ds4_rocm_tp_stamp((uint32_t)(g_tp_split_rank ^ 1),
+                                             req->seq),
+                           g_tp_engine_max_spins,
+                           g_tp_engine_state_dev);
+        ok = hipGetLastError() == hipSuccess &&
+             hipEventRecord(req->rx_consumed, 0) == hipSuccess;
+    }
+    if (!ok) {
+        pthread_mutex_lock(&g_tp_engine_mutex);
+        req->in_use = 0;
+        pthread_mutex_unlock(&g_tp_engine_mutex);
+        ds4_rocm_tp_fail("gate kernel/event enqueue", req);
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_tp_engine_mutex);
+    if (g_tp_engine_pending_count >= DS4_ROCM_TP_QUEUE) {
+        req->in_use = 0;
+        pthread_mutex_unlock(&g_tp_engine_mutex);
+        ds4_rocm_tp_fail("service queue overflow", req);
+        return 0;
+    }
+    const uint32_t tail =
+        (g_tp_engine_pending_head + g_tp_engine_pending_count) %
+        DS4_ROCM_TP_QUEUE;
+    g_tp_engine_pending[tail] = index;
+    g_tp_engine_pending_count++;
+    pthread_cond_signal(&g_tp_engine_cond);
+    pthread_mutex_unlock(&g_tp_engine_mutex);
+    return 1;
 }
 
 extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
     (void)fn;
 }
 
+extern "C" void ds4_gpu_tp_set_session_batch_mode(int enabled) {
+    g_tp_session_batch_mode = enabled ? 1 : 0;
+}
+
 extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
-    (void)suspend;
+    if (g_tp_engine_thread_running) g_tp_split_world = suspend ? 1 : 2;
 }
 
 extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {
@@ -484,7 +877,13 @@ extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {
 }
 
 extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
-    (void)enabled;
+    g_tp_attn_head_split = enabled ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_tp_failed(void) {
+    return __atomic_load_n(&g_tp_engine_failure_reported, __ATOMIC_ACQUIRE) ||
+           (g_tp_engine_state_host &&
+            __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) == 1u);
 }
 
 extern "C" void ds4_gpu_model_residency_skip(int skip) {
@@ -505,7 +904,9 @@ extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
 
 extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     (void)layer; (void)rows;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX
+            "ROCm/NHI tensor-parallel batch gates are not enabled yet\n");
     return 0;
 }
 
@@ -514,11 +915,30 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
         uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
         uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,
         uint64_t x_elem_off) {
-    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
-    (void)full_in_dim; (void)k_off; (void)k_cnt; (void)out_dim; (void)x;
-    (void)x_elem_off;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
-    return 0;
+    if (!out || !model_map || !x || full_in_dim == 0 || k_cnt == 0 ||
+        out_dim == 0 || (full_in_dim & 31u) != 0 || (k_off & 31u) != 0 ||
+        (k_cnt & 31u) != 0 || k_off > full_in_dim ||
+        k_cnt > full_in_dim - k_off || full_in_dim > UINT32_MAX ||
+        out_dim > UINT32_MAX)
+        return 0;
+    const uint64_t full_blocks = full_in_dim / 32u;
+    const uint64_t slice_blocks = k_cnt / 32u;
+    uint64_t row_bytes = 0, weight_bytes = 0, out_bytes = 0, x_need = 0;
+    if (!cuda_u64_mul_checked(full_blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !cuda_u64_mul_checked(out_dim, sizeof(float), &out_bytes) ||
+        !cuda_u64_mul_checked(x_elem_off + k_cnt, sizeof(float), &x_need) ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        out->bytes < out_bytes || x->bytes < x_need)
+        return 0;
+    const unsigned char *w = (const unsigned char *)cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "q8_0_kslice");
+    if (!w) return 0;
+    matmul_q8_0_f32_kslice_warp8_kernel<<<
+        ((unsigned)out_dim + 7u) / 8u, 256>>>(
+            (float *)out->ptr, w, (const float *)x->ptr,
+            full_blocks, k_off / 32u, slice_blocks, out_dim, x_elem_off);
+    return cuda_ok(cudaGetLastError(), "matmul_q8_0 kslice launch");
 }
 
 extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
@@ -527,12 +947,42 @@ extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
         uint64_t group_dim, uint64_t rank, uint32_t n_groups_total,
         uint32_t group0, uint32_t group_cnt, uint64_t out_dim,
         const ds4_gpu_tensor *heads) {
-    (void)out; (void)low; (void)model_map; (void)model_size;
-    (void)out_a_offset; (void)out_b_offset; (void)group_dim; (void)rank;
-    (void)n_groups_total; (void)group0; (void)group_cnt; (void)out_dim;
-    (void)heads;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
-    return 0;
+    if (!out || !low || !model_map || !heads || group_dim == 0 ||
+        rank == 0 || n_groups_total == 0 || group_cnt == 0 || out_dim == 0 ||
+        group0 > n_groups_total || group_cnt > n_groups_total - group0)
+        return 0;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    uint64_t group_weight_bytes = 0, a_shift = 0, heads_shift = 0;
+    if (!cuda_u64_mul3_checked(rank, blocks_a, 34u, &group_weight_bytes) ||
+        !cuda_u64_mul_checked(group0, group_weight_bytes, &a_shift) ||
+        !cuda_u64_mul3_checked(group0, group_dim, sizeof(float), &heads_shift) ||
+        a_shift > UINT64_MAX - out_a_offset || heads_shift > heads->bytes)
+        return 0;
+    const uint64_t local_low = (uint64_t)group_cnt * rank;
+    if (local_low > UINT64_MAX / sizeof(float) ||
+        low->bytes < local_low * sizeof(float) ||
+        heads->bytes - heads_shift <
+            (uint64_t)group_cnt * group_dim * sizeof(float))
+        return 0;
+    ds4_gpu_tensor heads_slice = {
+        (char *)heads->ptr + heads_shift,
+        (uint64_t)group_cnt * group_dim * sizeof(float),
+        0,
+    };
+    ds4_gpu_tensor low_slice = {
+        low->ptr,
+        local_low * sizeof(float),
+        0,
+    };
+    if (!ds4_gpu_attention_output_low_q8_tensor(
+            &low_slice, model_map, model_size, out_a_offset + a_shift,
+            group_dim, rank, group_cnt, &heads_slice))
+        return 0;
+    return ds4_gpu_matmul_q8_0_kslice_tensor(
+        out, model_map, model_size, out_b_offset,
+        (uint64_t)n_groups_total * rank,
+        (uint64_t)group0 * rank, local_low, out_dim, &low_slice, 0);
+
 }
 
 extern "C" int ds4_gpu_hc_expand_add_tensor(
@@ -540,8 +990,35 @@ extern "C" int ds4_gpu_hc_expand_add_tensor(
         const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb,
         uint32_t n_embd, uint32_t n_hc) {
-    (void)out_hc; (void)block_out; (void)block_add; (void)residual_hc;
-    (void)post; (void)comb; (void)n_embd; (void)n_hc;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
-    return 0;
+    uint64_t n_tokens64 = 0, flat_bytes = 0, hc_bytes = 0;
+    uint64_t post_bytes = 0, comb_bytes = 0, comb_stride = 0;
+    if (!out_hc || !block_out || !block_add || !residual_hc || !post ||
+        !comb || !cuda_hc_hc_token_count(out_hc, n_embd, n_hc,
+                                          &n_tokens64) ||
+        !cuda_u64_mul3_checked(n_tokens64, n_embd, sizeof(float),
+                               &flat_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd,
+                               sizeof(float), &hc_bytes) ||
+        !cuda_u64_mul3_checked(n_tokens64, n_hc, sizeof(float),
+                               &post_bytes) ||
+        !cuda_u64_mul_checked(n_hc, n_hc, &comb_stride) ||
+        comb_stride > UINT32_MAX ||
+        !cuda_u64_mul3_checked(n_tokens64, comb_stride, sizeof(float),
+                               &comb_bytes) ||
+        block_out->bytes < flat_bytes || block_add->bytes < flat_bytes ||
+        residual_hc->bytes < hc_bytes || post->bytes < post_bytes ||
+        comb->bytes < comb_bytes)
+        return 0;
+    const uint32_t n_tokens = (uint32_t)n_tokens64;
+    const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+    hc_expand_kernel<<<(n_elem + 255u) / 256u, 256>>>(
+        (float *)out_hc->ptr,
+        (const float *)block_out->ptr,
+        (const float *)block_add->ptr,
+        (const float *)residual_hc->ptr,
+        (const float *)post->ptr,
+        (const float *)comb->ptr,
+        n_embd, n_hc, n_tokens,
+        n_hc, (uint32_t)comb_stride, 1);
+    return cuda_ok(cudaGetLastError(), "hc_expand_add launch");
 }

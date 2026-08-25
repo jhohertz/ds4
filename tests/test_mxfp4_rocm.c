@@ -41,6 +41,8 @@
 #define N_PATTERN 4u
 #define CLAMP 7.0f
 
+static int tp_partial_mode;
+
 typedef struct {
     uint8_t e;
     uint8_t qs[QK_MXFP4 / 2u];
@@ -463,7 +465,7 @@ static int run_case(uint32_t n_tokens,
     ok = ok && ds4_gpu_tensor_read(
         out_tensor, 0u, out_actual, out_count * sizeof(float));
 
-    if (ok) {
+    if (ok && !tp_partial_mode) {
         /* Gate/up are optional scratch outputs in the optimized ROCm paths;
          * mid is the public, stable result of that fused stage. */
         const int mid_ok = compare_repeated(
@@ -685,6 +687,53 @@ int main(void) {
                     vok ? "bitwise OK" : "MISMATCH");
             if (!vok) ok = 0;
         }
+    }
+    if (ok) {
+        float *full = (float *)malloc(MODEL_DIM * sizeof(float));
+        float *rank0 = (float *)malloc(MODEL_DIM * sizeof(float));
+        float *rank1 = (float *)malloc(MODEL_DIM * sizeof(float));
+        int tp_ok = full && rank0 && rank1 &&
+            run_case(1u, model, model_size,
+                     gate_offset, up_offset, down_offset,
+                     gate_expert_bytes, gate_row_bytes,
+                     down_expert_bytes, down_row_bytes, patterns, 0u,
+                     full, NULL);
+        tp_partial_mode = 1;
+        ds4_gpu_tp_test_set_expert_shard(0);
+        if (tp_ok) {
+            tp_ok = run_case(1u, model, model_size,
+                             gate_offset, up_offset, down_offset,
+                             gate_expert_bytes, gate_row_bytes,
+                             down_expert_bytes, down_row_bytes, patterns, 0u,
+                             rank0, NULL);
+        }
+        ds4_gpu_tp_test_set_expert_shard(1);
+        if (tp_ok) {
+            tp_ok = run_case(1u, model, model_size,
+                             gate_offset, up_offset, down_offset,
+                             gate_expert_bytes, gate_row_bytes,
+                             down_expert_bytes, down_row_bytes, patterns, 0u,
+                             rank1, NULL);
+        }
+        ds4_gpu_tp_test_set_expert_shard(-1);
+        tp_partial_mode = 0;
+        for (uint32_t i = 0; tp_ok && i < MODEL_DIM; i++) {
+            const float combined = rank0[i] + rank1[i];
+            const float tol = 2.0e-4f + 1.0e-4f * fabsf(full[i]);
+            if (fabsf(combined - full[i]) > tol) {
+                fprintf(stderr,
+                        "MXFP4 TP ownership mismatch i=%u full=%g r0=%g r1=%g\n",
+                        i, full[i], rank0[i], rank1[i]);
+                tp_ok = 0;
+            }
+        }
+        fprintf(stderr,
+                "MXFP4 ROCm contiguous-half TP ownership combine: %s\n",
+                tp_ok ? "OK" : "MISMATCH");
+        free(full);
+        free(rank0);
+        free(rank1);
+        if (!tp_ok) ok = 0;
     }
     free(snap128);
     free(snap512);

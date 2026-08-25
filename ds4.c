@@ -43,6 +43,9 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_tp.h"
+#if defined(__linux__) && defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#include "ds4_tp_nhi.h"
+#endif
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
  * struct embeds ds4_gpu_config and the placement table. ds4_layer_pack.h
@@ -36846,6 +36849,9 @@ typedef struct {
     ds4_gpu_tensor **batch_out_views;   /* [layer] verify-block row partials */
     ds4_gpu_tensor **batch_in_views;
     ds4_gpu_tensor *zero_vec;
+#if defined(__linux__) && defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    ds4_tp_nhi *nhi;
+#endif
     uint64_t eval_seq;          /* leader: mirrored eval counter */
     uint64_t next_session_id;   /* leader: stable worker-session handle */
     int rank;
@@ -58499,42 +58505,163 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
 }
 #endif
 
+#if !defined(DS4_NO_GPU) && defined(__linux__) && defined(DS4_ROCM_BUILD)
+static void *ds4_engine_tp_nhi_tx_slot(void *ud, uint64_t seq) {
+    ds4_engine *e = ud;
+    return e && e->tp.nhi ? ds4_tp_nhi_tx_slot(e->tp.nhi, seq) : NULL;
+}
+
+static const void *ds4_engine_tp_nhi_rx_slot(void *ud, uint64_t seq) {
+    ds4_engine *e = ud;
+    return e && e->tp.nhi ? ds4_tp_nhi_rx_slot(e->tp.nhi, seq) : NULL;
+}
+
+static int ds4_engine_tp_nhi_submit(void *ud, uint64_t seq) {
+    ds4_engine *e = ud;
+    char err[256] = "";
+    const int ok = e && e->tp.nhi &&
+        ds4_tp_nhi_submit(e->tp.nhi, seq, err, sizeof(err));
+    if (!ok) {
+        fprintf(stderr, "ds4-tp: NHI submit failed at seq %llu: %s\n",
+                (unsigned long long)seq, err[0] ? err : "transport closed");
+        if (e && e->tp.ctx) ds4_tp_mark_failed(e->tp.ctx);
+    }
+    return ok;
+}
+
+static int ds4_engine_tp_nhi_consumed(void *ud, uint64_t seq) {
+    ds4_engine *e = ud;
+    char err[256] = "";
+    const int ok = e && e->tp.nhi &&
+        ds4_tp_nhi_consumed(e->tp.nhi, seq, err, sizeof(err)) &&
+        !ds4_tp_nhi_peer_closed(e->tp.nhi);
+    if (!ok) {
+        fprintf(stderr, "ds4-tp: NHI RX release failed at seq %llu: %s\n",
+                (unsigned long long)seq, err[0] ? err : "peer closed");
+        if (e && e->tp.ctx) ds4_tp_mark_failed(e->tp.ctx);
+    }
+    return ok;
+}
+
+static void ds4_engine_tp_nhi_failed(void *ud) {
+    ds4_engine *e = ud;
+    if (e && e->tp.ctx) ds4_tp_mark_failed(e->tp.ctx);
+}
+#endif
+
+#ifndef DS4_NO_GPU
+static void ds4_engine_tp_release_resources(ds4_engine *e) {
+    if (!e) return;
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    if (e->tp.active || e->tp.slab) ds4_gpu_tp_shutdown();
+#endif
+#if defined(__linux__) && defined(DS4_ROCM_BUILD)
+    if (e->tp.nhi) {
+        char err[256] = "";
+        if (!ds4_tp_nhi_quiesce(e->tp.nhi, err, sizeof(err))) {
+            fprintf(stderr, "ds4-tp: NHI quiesce failed: %s\n",
+                    err[0] ? err : "unknown error");
+            if (e->tp.ctx) ds4_tp_mark_failed(e->tp.ctx);
+        }
+        ds4_tp_nhi_close(e->tp.nhi);
+    }
+#endif
+    const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
+    for (uint32_t i = 0; i < slots; i++) {
+        if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);
+        if (e->tp.in_views) ds4_gpu_tensor_free(e->tp.in_views[i]);
+    }
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER; i++) {
+        if (e->tp.batch_out_views) ds4_gpu_tensor_free(e->tp.batch_out_views[i]);
+        if (e->tp.batch_in_views) ds4_gpu_tensor_free(e->tp.batch_in_views[i]);
+    }
+    free(e->tp.batch_out_views);
+    free(e->tp.batch_in_views);
+    free(e->tp.out_views);
+    free(e->tp.in_views);
+    ds4_gpu_tensor_free(e->tp.zero_vec);
+    ds4_gpu_tensor_free(e->tp.slab);
+    memset(&e->tp, 0, sizeof(e->tp));
+}
+#endif
+
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
-#if defined(DS4_NO_GPU) || !defined(__APPLE__)
+#ifdef DS4_NO_GPU
     (void)e; (void)tp;
-    snprintf(err, errlen, "tensor parallelism requires the Metal backend");
+    snprintf(err, errlen, "tensor parallelism requires a GPU backend");
     return 0;
 #else
-    if (e->backend != DS4_BACKEND_METAL) {
-        snprintf(err, errlen, "tensor parallelism requires the Metal backend");
+    if (!e || !tp) {
+        snprintf(err, errlen, "invalid tensor-parallel bind");
         return 0;
     }
-    if (e->tp.active) {
+    bool metal = false;
+    bool rocm_nhi = false;
+#ifdef __APPLE__
+    metal = e->backend == DS4_BACKEND_METAL && !ds4_tp_is_nhi(tp);
+#endif
+#if defined(__linux__) && defined(DS4_ROCM_BUILD)
+    rocm_nhi = e->backend == DS4_BACKEND_CUDA && ds4_tp_is_nhi(tp);
+#endif
+    if (!metal && !rocm_nhi) {
+        snprintf(err, errlen, "unsupported tensor-parallel backend/transport");
+        return 0;
+    }
+    if (rocm_nhi && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        snprintf(err, errlen, "ROCm/NHI tensor parallelism initially supports DS4 decode only");
+        return 0;
+    }
+    if (e->tp.active || e->tp.slab) {
         snprintf(err, errlen, "tensor parallelism already bound");
         return 0;
     }
+
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
+    const uint64_t slab_bytes =
+        ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
+    e->tp.ctx = tp;
+    e->tp.rank = ds4_tp_rank(tp);
     e->tp.slab = ds4_gpu_tensor_alloc(slab_bytes);
     e->tp.zero_vec = ds4_gpu_tensor_alloc(vec_bytes);
     e->tp.out_views = calloc(slots, sizeof(*e->tp.out_views));
     e->tp.in_views = calloc(slots, sizeof(*e->tp.in_views));
-    e->tp.batch_out_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_out_views));
-    e->tp.batch_in_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_in_views));
-    if (!e->tp.batch_out_views || !e->tp.batch_in_views) {
-        snprintf(err, errlen, "tp: batch view table allocation failed");
-        return 0;
-    }
-    if (!e->tp.slab || !e->tp.zero_vec || !e->tp.out_views || !e->tp.in_views) {
+    e->tp.batch_out_views =
+        calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_out_views));
+    e->tp.batch_in_views =
+        calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_in_views));
+    if (!e->tp.slab || !e->tp.zero_vec || !e->tp.out_views ||
+        !e->tp.in_views || !e->tp.batch_out_views ||
+        !e->tp.batch_in_views) {
         snprintf(err, errlen, "tp: slab allocation failed (%llu bytes)",
                  (unsigned long long)slab_bytes);
-        return 0;
+        goto fail;
     }
-    memset(ds4_gpu_tensor_contents(e->tp.slab), 0, slab_bytes);
-    memset(ds4_gpu_tensor_contents(e->tp.zero_vec), 0, vec_bytes);
-    if (!ds4_tp_attach_slab(tp, ds4_gpu_tensor_contents(e->tp.slab), err, errlen))
-        return 0;
+
+#ifdef __APPLE__
+    if (metal) {
+        memset(ds4_gpu_tensor_contents(e->tp.slab), 0, slab_bytes);
+        memset(ds4_gpu_tensor_contents(e->tp.zero_vec), 0, vec_bytes);
+        if (!ds4_tp_attach_slab(tp, ds4_gpu_tensor_contents(e->tp.slab),
+                                err, errlen))
+            goto fail;
+    }
+#endif
+#if defined(__linux__) && defined(DS4_ROCM_BUILD)
+    if (rocm_nhi) {
+        if (!ds4_gpu_tensor_fill_f32(e->tp.slab, 0.0f, slab_bytes / sizeof(float)) ||
+            !ds4_gpu_tensor_fill_f32(e->tp.zero_vec, 0.0f,
+                                     vec_bytes / sizeof(float)) ||
+            !ds4_gpu_synchronize()) {
+            snprintf(err, errlen, "tp: failed to zero ROCm gate slab");
+            goto fail;
+        }
+        if (!ds4_tp_nhi_open(&e->tp.nhi, ds4_tp_nhi_device(tp),
+                             ds4_tp_nhi_ring_frames(tp), err, errlen))
+            goto fail;
+    }
+#endif
+
     for (uint32_t l = 0; l < (uint32_t)DS4_N_LAYER; l++) {
         for (uint32_t gate = 0; gate < DS4_TP_GATES_PER_LAYER; gate++) {
             const uint32_t slot = l * DS4_TP_GATES_PER_LAYER + gate;
@@ -58544,7 +58671,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                     e->tp.slab, ds4_tp_slab_in_offset(tp, l, gate), vec_bytes);
             if (!e->tp.out_views[slot] || !e->tp.in_views[slot]) {
                 snprintf(err, errlen, "tp: slab view creation failed");
-                return 0;
+                goto fail;
             }
         }
         e->tp.batch_out_views[l] = ds4_gpu_tensor_view(
@@ -58555,28 +58682,65 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                 (uint64_t)DS4_TP_BATCH_MAX_ROWS * vec_bytes);
         if (!e->tp.batch_out_views[l] || !e->tp.batch_in_views[l]) {
             snprintf(err, errlen, "tp: batch slab view creation failed");
-            return 0;
+            goto fail;
         }
     }
-    if (!ds4_gpu_tp_init((uint32_t)ds4_tp_rank(tp),
-                         e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),
-                         ds4_engine_tp_exchange, tp)) {
-        snprintf(err, errlen, "tp: gate service init failed");
-        return 0;
+
+#ifdef __APPLE__
+    if (metal) {
+        if (!ds4_gpu_tp_init((uint32_t)e->tp.rank,
+                             e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),
+                             ds4_engine_tp_exchange, tp)) {
+            snprintf(err, errlen, "tp: Metal gate service init failed");
+            goto fail;
+        }
+        ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
+        ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     }
-    ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
-    ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
-    /* GLM keeps its replicated output head unsplit in v0: the
-     * leader computes full logits and nothing crosses the wire. */
-    e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
-    e->tp.ctx = tp;
-    e->tp.rank = ds4_tp_rank(tp);
+#endif
+#if defined(__linux__) && defined(DS4_ROCM_BUILD)
+    if (rocm_nhi &&
+        !ds4_gpu_tp_nhi_init((uint32_t)e->tp.rank,
+                             e->tp.slab,
+                             ds4_tp_slab_out_offset(tp, 0, 0),
+                             ds4_tp_slab_in_offset(tp, 0, 0),
+                             slots, (uint32_t)DS4_N_EMBD,
+                             ds4_engine_tp_nhi_tx_slot,
+                             ds4_engine_tp_nhi_rx_slot,
+                             ds4_engine_tp_nhi_submit,
+                             ds4_engine_tp_nhi_consumed,
+                             ds4_engine_tp_nhi_failed,
+                             e)) {
+        snprintf(err, errlen, "tp: ROCm/NHI gate service init failed");
+        goto fail;
+    }
+    if (rocm_nhi && !ds4_tp_nhi_ready_barrier(tp, err, errlen))
+        goto fail;
+#endif
+
+    /* The Stage-3 ROCm spike keeps the output head replicated; the
+     * established Metal path retains its DS4 vocab split. */
+    e->tp.vocab_split = metal && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
     e->tp.eval_seq = 0;
     e->tp.active = true;
     ds4_log(stderr, DS4_LOG_OK,
             "tensor parallelism bound: rank %d, 50/50 expert split, %s transport",
-            e->tp.rank, ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
+            e->tp.rank,
+            rocm_nhi ? "nhi" : (ds4_tp_is_rdma(tp) ? "rdma" : "tcp"));
     return 1;
+
+fail:
+    ds4_engine_tp_release_resources(e);
+    return 0;
+#endif
+}
+
+void ds4_engine_tp_unbind(ds4_engine *e) {
+#ifndef DS4_NO_GPU
+    if (e && (e->tp.active || e->tp.slab))
+        ds4_engine_tp_release_resources(e);
+#else
+    (void)e;
 #endif
 }
 
@@ -58587,27 +58751,7 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
-    if (e->tp.active) {
-        ds4_gpu_tp_shutdown();
-        const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
-        for (uint32_t i = 0; i < slots; i++) {
-            if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);
-            if (e->tp.in_views) ds4_gpu_tensor_free(e->tp.in_views[i]);
-        }
-        for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER; i++) {
-            if (e->tp.batch_out_views) ds4_gpu_tensor_free(e->tp.batch_out_views[i]);
-            if (e->tp.batch_in_views) ds4_gpu_tensor_free(e->tp.batch_in_views[i]);
-        }
-        free(e->tp.batch_out_views);
-        free(e->tp.batch_in_views);
-        free(e->tp.out_views);
-        free(e->tp.in_views);
-        ds4_gpu_tensor_free(e->tp.zero_vec);
-        ds4_gpu_tensor_free(e->tp.slab);
-        memset(&e->tp, 0, sizeof(e->tp));
-    }
-#endif
+    ds4_engine_tp_unbind(e);
     ds4_expert_profile_close();
     weights_free(&e->weights);
     vocab_free(&e->vocab);
@@ -58961,15 +59105,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->graph.tp_batch_out = e->tp.batch_out_views;
         s->graph.tp_batch_in = e->tp.batch_in_views;
         s->graph.tp_zero = e->tp.zero_vec;
-        const uint64_t half = (uint64_t)DS4_N_VOCAB / 2u;
-        s->graph.tp_logits_half = ds4_gpu_tensor_view(
-                metal_graph_logits(&s->graph),
-                (uint64_t)e->tp.rank * half * sizeof(float),
-                half * sizeof(float));
-        if (!s->graph.tp_logits_half) {
-            metal_graph_free(&s->graph);
-            free(s);
-            return 1;
+        if (e->tp.vocab_split) {
+            const uint64_t half = (uint64_t)DS4_N_VOCAB / 2u;
+            s->graph.tp_logits_half = ds4_gpu_tensor_view(
+                    metal_graph_logits(&s->graph),
+                    (uint64_t)e->tp.rank * half * sizeof(float),
+                    half * sizeof(float));
+            if (!s->graph.tp_logits_half) {
+                metal_graph_free(&s->graph);
+                free(s);
+                return 1;
+            }
         }
     }
     s->graph.power_percent = (uint32_t)e->power_percent;
@@ -60802,7 +60948,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         s->mtp_draft_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
-        if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+        if (suffix > 0 && (uint32_t)suffix >= resume_min &&
+            !(e->tp.active && ds4_tp_is_nhi(e->tp.ctx))) {
             bool cancelled = false;
             ds4_sync_progress progress = {
                 .session = s,
@@ -60876,7 +61023,29 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
-    if (s->prefill_cap < (uint32_t)prompt->len) {
+    if (e->tp.active && ds4_tp_is_nhi(e->tp.ctx)) {
+        /* Stage-3 NHI bring-up keeps prefill on the proven one-row gate
+         * path.  Large batch/big gates remain disabled until they have
+         * their own transport acceptance run. */
+        ok = true;
+        for (int i = 0; ok && i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            ok = metal_graph_eval_token_raw_swa(
+                    &s->graph, &e->model, &e->weights,
+                    (uint32_t)prompt->v[i], (uint32_t)s->checkpoint.len,
+                    s->logits);
+            if (ok) {
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+                s->checkpoint_valid = true;
+                if (s->progress)
+                    s->progress(s->progress_ud, "prefill_chunk", i + 1,
+                                prompt->len);
+            }
+        }
+    } else if (s->prefill_cap < (uint32_t)prompt->len) {
         bool cancelled = false;
         ds4_sync_progress progress = {
             .session = s,
@@ -61955,7 +62124,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         ds4_session_invalidate(s);
         return rc;
     }
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_BUILD))
     if (rc == 0 && s->engine && s->engine->tp.active && ds4_gpu_tp_failed()) {
         snprintf(err, errlen, "tp: gate transport failed");
         if (ds4_session_tp_leader(s)) ds4_session_invalidate(s);

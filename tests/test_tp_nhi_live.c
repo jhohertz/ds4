@@ -51,6 +51,10 @@ static float partial_value(int rank, uint64_t seq, uint32_t i) {
                           ((uint32_t)rank << 16)) & 0x3ffu) - 512) * 0.03125f;
 }
 
+static uint32_t role_stamp(int rank, uint64_t seq0) {
+    return (rank == 0 ? 0x5ca16e39u : 0xc35a91e7u) ^ (uint32_t)seq0;
+}
+
 static int control_barrier(int fd, uint32_t tag) {
     uint32_t mine = htonl(tag), theirs = 0;
     if (write(fd, &mine, sizeof(mine)) != (ssize_t)sizeof(mine)) return 0;
@@ -188,19 +192,21 @@ int main(int argc, char **argv) {
     const double t0 = now_sec();
     uint64_t done = 0;
     for (uint64_t seq = 1; pass && seq <= iters; seq++) {
-        const uint32_t stamp = (uint32_t)seq;
+        const uint64_t seq0 = seq - 1;
+        const uint32_t local_stamp = role_stamp(rank, seq0);
+        const uint32_t peer_stamp = role_stamp(rank ^ 1, seq0);
         if (!ds4_gpu_tp_spin_combine_start(acc_dev,
-                                           ds4_tp_nhi_rx_slot(nhi, seq - 1),
-                                           hidden, stamp, 800000000ull)) {
+                                           ds4_tp_nhi_rx_slot(nhi, seq0),
+                                           hidden, peer_stamp, 800000000ull)) {
             fprintf(stderr, "spin start failed at seq %llu\n",
                     (unsigned long long)seq);
             pass = 0;
             break;
         }
-        if (!ds4_gpu_tp_fill_release(ds4_tp_nhi_tx_slot(nhi, seq - 1),
-                                     src_all + (size_t)(seq - 1) * hidden,
-                                     hidden, stamp) ||
-            !ds4_tp_nhi_submit(nhi, seq - 1, err, sizeof(err))) {
+        if (!ds4_gpu_tp_fill_release(ds4_tp_nhi_tx_slot(nhi, seq0),
+                                     src_all + (size_t)seq0 * hidden,
+                                     hidden, local_stamp) ||
+            !ds4_tp_nhi_submit(nhi, seq0, err, sizeof(err))) {
             fprintf(stderr, "fill/submit failed at seq %llu: %s\n",
                     (unsigned long long)seq, err);
             pass = 0;
@@ -214,7 +220,7 @@ int main(int argc, char **argv) {
             pass = 0;
             break;
         }
-        if (!ds4_tp_nhi_consumed(nhi, err, sizeof(err))) {
+        if (!ds4_tp_nhi_consumed(nhi, seq0, err, sizeof(err))) {
             fprintf(stderr, "repost failed at seq %llu: %s\n",
                     (unsigned long long)seq, err);
             pass = 0;

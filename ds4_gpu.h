@@ -348,21 +348,38 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
 #endif
 void ds4_gpu_print_memory_report(const char *label);
 
-/* Tensor-parallel per-layer gates (Metal only).  The encoder calls
- * ds4_gpu_tp_gate_encode() right after the kernels that produce a partial
- * block output in the TP slab: it closes the current encoder, makes the GPU
- * signal a shared event, queues the exchange on a service thread, and makes
- * the GPU wait for the CPU-signaled release before the combine kernel runs.
- * Sequence values are assigned internally and increase monotonically; both
- * ranks encode the identical gate sequence so values pair up by
- * construction.  The exchange callback runs on the service thread and must
- * return nonzero on success. */
+/* Tensor-parallel per-layer gates.  The graph calls gate_encode immediately
+ * after producing a partial block output.  Metal bridges a shared-event wait
+ * through its CPU transport callback; ROCm/NHI copies fixed graph views into
+ * rotating UC slots and eagerly waits on the peer's in-band stamp.  Sequence
+ * values are internal and monotonic, and both ranks encode the identical gate
+ * order by construction. */
 typedef int (*ds4_gpu_tp_exchange_fn)(void *ud, uint32_t layer, uint32_t gate, uint64_t seq);
 /* Bind one rank of the two-way split. slab is the transport slab tensor and
  * gpu_flags_off is the offset of its GPU-written gate-ready flag words. */
 int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
+/* ROCm/NHI gate service.  Graph partials remain in fixed slab views while
+ * each gate copies to/from the globally rotating transport slots.  The
+ * service thread waits the TX-ready event before submit and calls consumed
+ * only after the RX wait-copy's final-reader event. */
+typedef void *(*ds4_gpu_tp_nhi_tx_slot_fn)(void *ud, uint64_t seq);
+typedef const void *(*ds4_gpu_tp_nhi_rx_slot_fn)(void *ud, uint64_t seq);
+typedef int (*ds4_gpu_tp_nhi_seq_fn)(void *ud, uint64_t seq);
+typedef void (*ds4_gpu_tp_nhi_fail_fn)(void *ud);
+int ds4_gpu_tp_nhi_init(uint32_t rank,
+                        ds4_gpu_tensor *slab,
+                        uint64_t out_offset,
+                        uint64_t in_offset,
+                        uint32_t n_slots,
+                        uint32_t n_embd,
+                        ds4_gpu_tp_nhi_tx_slot_fn tx_slot_fn,
+                        ds4_gpu_tp_nhi_rx_slot_fn rx_slot_fn,
+                        ds4_gpu_tp_nhi_seq_fn submit_fn,
+                        ds4_gpu_tp_nhi_seq_fn consumed_fn,
+                        ds4_gpu_tp_nhi_fail_fn fail_fn,
+                        void *ud);
 void ds4_gpu_tp_shutdown(void);
 /* Multi-session TP reuses slab slots across several encoded graph tapes.
  * Shared-event arrival is required in that mode to make each partial vector
@@ -380,6 +397,9 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
 int ds4_gpu_tp_test_combine(uint32_t n, uint32_t iterations);
 int ds4_gpu_tp_test_spin_exchange(int uncached_pool, int host_stamp,
                                   uint32_t n, uint32_t seqs);
+/* Test-only ownership selector: rank 0/1 enables its contiguous expert half;
+ * any other value restores the unsharded production default. */
+void ds4_gpu_tp_test_set_expert_shard(int rank);
 /* Stage-2 GPU helpers for the NHI TP transport (ds4_tp_nhi.c): uncached
  * dedicated pool allocation with DMA-BUF export, and stream-based
  * fill-and-release / spin-combine wrappers for the exchange loop. */
