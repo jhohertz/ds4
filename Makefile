@@ -225,6 +225,7 @@ test-rocm:
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
 	./tests/test_tp_combine_rocm
+	DS4_TEST_TP_PREQUANT=1 ./tests/test_tp_combine_rocm
 	DS4_TEST_ROCM=1 ./tests/test_gpu_args_cli.sh
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
@@ -603,6 +604,7 @@ tests/test_tp_combine_rocm: tests/test_tp_combine_rocm.o ds4_rocm.o ds4_rocm_una
 
 test-tp-combine-rocm: tests/test_tp_combine_rocm
 	./tests/test_tp_combine_rocm
+	DS4_TEST_TP_PREQUANT=1 ./tests/test_tp_combine_rocm
 
 ds4_tp_nhi.o: ds4_tp_nhi.c ds4_tp_nhi.h ds4_tbstream_uapi.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_tp_nhi.c

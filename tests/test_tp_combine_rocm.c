@@ -12,6 +12,7 @@
  */
 
 #include "ds4_gpu.h"
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -142,8 +143,10 @@ static int test_shared_slice(void) {
             q[1] = 0x24u; /* fp16 1/64 */
         }
     }
-    for (uint32_t i = 0; i < N_EMBD; i++)
-        x[i] = (float)((int)(i % 17u) - 8) * (1.0f / 32.0f);
+    for (uint32_t i = 0; i < N_EMBD; i++) {
+        x[i] = (float)((int)((i * 37u) % 257u) - 128) * (1.0f / 127.0f) +
+               (float)((int)(i % 13u) - 6) * 0.00031f;
+    }
 
     model_file = tmpfile();
     const uint64_t offsets[3] = {0, up_off, down_off};
@@ -211,11 +214,23 @@ static int test_shared_slice(void) {
         ok = memcmp(mid_full, mid0, HALF * sizeof(float)) == 0 &&
              memcmp(mid_full + HALF, mid1, HALF * sizeof(float)) == 0;
     }
-    for (uint32_t i = 0; ok && i < N_EMBD; i++) {
-        const float d = out_full[i] - out_sum[i];
-        const float ad = d < 0.0f ? -d : d;
-        const float av = out_full[i] < 0.0f ? -out_full[i] : out_full[i];
-        if (ad > 1.0e-3f * (1.0f + av)) ok = 0;
+    if (ok) {
+        float max_abs = 0.0f;
+        double sum_sq = 0.0;
+        int parity_ok = 1;
+        for (uint32_t i = 0; i < N_EMBD; i++) {
+            const float d = out_full[i] - out_sum[i];
+            const float ad = d < 0.0f ? -d : d;
+            const float av = out_full[i] < 0.0f ? -out_full[i] : out_full[i];
+            if (ad > max_abs) max_abs = ad;
+            sum_sq += (double)d * d;
+            if (ad > 1.0e-3f * (1.0f + av)) parity_ok = 0;
+        }
+        fprintf(stderr,
+                "ROCm TP shared-half parity max_abs=%g rmse=%g prequant=%s\n",
+                max_abs, sqrt(sum_sq / N_EMBD),
+                getenv("DS4_TEST_TP_PREQUANT") ? "on" : "off");
+        ok = parity_ok;
     }
 
 done:
@@ -322,10 +337,25 @@ static int test_attention_slice(void) {
 
 int main(void) {
     srand(20260825);
-    setenv("DS4_ROCM_DSV4_PREQUANT_DECODE", "0", 1);
+    const char *prequant_env = getenv("DS4_TEST_TP_PREQUANT");
+    const int production_prequant =
+        prequant_env && prequant_env[0] && strcmp(prequant_env, "0") != 0;
+    if (production_prequant)
+        unsetenv("DS4_ROCM_DSV4_PREQUANT_DECODE");
+    else
+        setenv("DS4_ROCM_DSV4_PREQUANT_DECODE", "0", 1);
     if (!ds4_gpu_init()) {
         fprintf(stderr, "test_tp_combine_rocm: no ROCm device available\n");
         return 1;
+    }
+
+    if (production_prequant) {
+        check(test_shared_slice(),
+              "production-prequant shared halves recombine");
+        ds4_gpu_cleanup();
+        printf("test_tp_combine_rocm: %d/%d checks passed (%d failed)\n",
+               g_checks - g_failures, g_checks, g_failures);
+        return g_failures ? 1 : 0;
     }
 
     /* Bit-exact combine at DS4's hidden size, an odd size, and a small one. */
