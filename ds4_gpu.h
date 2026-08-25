@@ -373,6 +373,13 @@ void ds4_gpu_tp_set_session_batch_mode(int enabled);
  * split across both ranks. */
 void ds4_gpu_tp_suspend_expert_sharding(int suspend);
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
+/* Stage-1 loopback tests for the ROCm TP combine kernels
+ * (tests/test_tp_combine_rocm): bit-exact world-of-two combine, and
+ * spin-combine gated by an in-band stamp written by a second-stream
+ * kernel or the host. */
+int ds4_gpu_tp_test_combine(uint32_t n, uint32_t iterations);
+int ds4_gpu_tp_test_spin_exchange(int uncached_pool, int host_stamp,
+                                  uint32_t n, uint32_t seqs);
 /* Verify-block batch gates: one exchange per layer moving `rows` partial
  * rows at once (speculative verify).  The callback runs on the gate service
  * thread with the same ud as the row-gate exchange fn. */

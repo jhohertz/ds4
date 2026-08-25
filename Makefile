@@ -575,3 +575,12 @@ tests/test_dist_v3: tests/test_dist_v3.o ds4_dist_v3.o ds4_transport.o
 
 test-dist-v3: tests/test_dist_v3
 	./tests/test_dist_v3
+
+tests/test_tp_combine_rocm.o: tests/test_tp_combine_rocm.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_tp_combine_rocm: tests/test_tp_combine_rocm.o ds4_rocm.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-tp-combine-rocm: tests/test_tp_combine_rocm
+	./tests/test_tp_combine_rocm

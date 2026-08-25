@@ -146,6 +146,175 @@ __device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
 
 #include "rocm/ds4_rocm_current_api_compat.cuh"
 
+#include "rocm/ds4_rocm_tp.cuh"
+
+/* Stage-1 test entries for the TP combine kernels (tests/test_tp_combine_rocm).
+ * Loopback only: a writer kernel or the host plays the peer; the NHI pool
+ * import path arrives with the transport backend stage. */
+extern "C" int ds4_gpu_tp_test_combine(uint32_t n, uint32_t iterations) {
+    if (n == 0 || n > DS4_ROCM_TP_PAYLOAD_FLOATS_MAX) return 0;
+    const size_t bytes = (size_t)n * sizeof(float);
+    float *h_acc = (float *)malloc(bytes);
+    float *h_remote = (float *)malloc(bytes);
+    float *h_ref = (float *)malloc(bytes);
+    float *h_out = (float *)malloc(bytes);
+    float *d_acc = NULL, *d_remote = NULL;
+    int pass = 1;
+    if (!h_acc || !h_remote || !h_ref || !h_out ||
+        hipMalloc(&d_acc, bytes) != hipSuccess ||
+        hipMalloc(&d_remote, bytes) != hipSuccess) {
+        pass = 0;
+        goto done;
+    }
+    for (uint32_t it = 0; pass && it < iterations; it++) {
+        for (uint32_t i = 0; i < n; i++) {
+            h_acc[i] = ((float)rand() / (float)RAND_MAX) * 4.0f - 2.0f;
+            h_remote[i] = ((float)rand() / (float)RAND_MAX) * 4.0f - 2.0f;
+            h_ref[i] = h_acc[i] + h_remote[i];
+        }
+        if (hipMemcpy(d_acc, h_acc, bytes, hipMemcpyHostToDevice) != hipSuccess ||
+            hipMemcpy(d_remote, h_remote, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+            pass = 0;
+            break;
+        }
+        const uint32_t block = 256;
+        const uint32_t grid = (n + block - 1) / block;
+        hipLaunchKernelGGL(dsv4_tp_combine_f32_kernel, dim3(grid), dim3(block),
+                           0, 0, d_acc, d_remote, n);
+        if (hipDeviceSynchronize() != hipSuccess ||
+            hipMemcpy(h_out, d_acc, bytes, hipMemcpyDeviceToHost) != hipSuccess ||
+            memcmp(h_out, h_ref, bytes) != 0) {
+            pass = 0;
+            break;
+        }
+    }
+done:
+    free(h_acc); free(h_remote); free(h_ref); free(h_out);
+    if (d_acc) (void)hipFree(d_acc);
+    if (d_remote) (void)hipFree(d_remote);
+    return pass;
+}
+
+extern "C" int ds4_gpu_tp_test_spin_exchange(int uncached_pool,
+                                             int host_stamp,
+                                             uint32_t n,
+                                             uint32_t seqs) {
+    if (n == 0 || n > DS4_ROCM_TP_PAYLOAD_FLOATS_MAX || seqs == 0) return 0;
+    const size_t payload_bytes = (size_t)n * sizeof(float);
+    const size_t pool_bytes = (size_t)seqs * DS4_ROCM_TP_SLOT_BYTES;
+    unsigned char *d_pool = NULL;
+    float *d_acc = NULL, *d_src = NULL;
+    uint32_t *h_stamp = NULL, *d_stamp_view = NULL;
+    int *d_timeout = NULL;
+    float *h_acc = (float *)malloc(payload_bytes);
+    float *h_src = (float *)malloc(payload_bytes);
+    float *h_ref = (float *)malloc(payload_bytes);
+    float *h_out = (float *)malloc(payload_bytes);
+    hipStream_t spin_stream = NULL, fill_stream = NULL;
+    int pass = 1;
+    int h_timeout = 0;
+
+    if (!h_acc || !h_src || !h_ref || !h_out) { pass = 0; goto done; }
+    if (uncached_pool) {
+        if (hipExtMallocWithFlags((void **)&d_pool, pool_bytes,
+                                  hipDeviceMallocUncached) != hipSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "TP test: uncached pool allocation unsupported\n");
+            pass = 0;
+            goto done;
+        }
+    } else if (hipMalloc(&d_pool, pool_bytes) != hipSuccess) {
+        pass = 0;
+        goto done;
+    }
+    if (hipMalloc(&d_acc, payload_bytes) != hipSuccess ||
+        hipMalloc(&d_src, payload_bytes) != hipSuccess ||
+        hipMalloc(&d_timeout, sizeof(int)) != hipSuccess ||
+        hipMemset(d_pool, 0, pool_bytes) != hipSuccess ||
+        hipStreamCreate(&spin_stream) != hipSuccess ||
+        hipStreamCreate(&fill_stream) != hipSuccess) {
+        pass = 0;
+        goto done;
+    }
+    if (host_stamp) {
+        if (hipHostMalloc((void **)&h_stamp, sizeof(uint32_t), 0) != hipSuccess ||
+            hipHostGetDevicePointer((void **)&d_stamp_view, h_stamp, 0) != hipSuccess) {
+            pass = 0;
+            goto done;
+        }
+        *h_stamp = 0;
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        h_acc[i] = ((float)rand() / (float)RAND_MAX) * 4.0f - 2.0f;
+        h_ref[i] = h_acc[i];
+    }
+    if (hipMemcpy(d_acc, h_acc, payload_bytes, hipMemcpyHostToDevice) != hipSuccess) {
+        pass = 0;
+        goto done;
+    }
+
+    for (uint32_t seq = 1; pass && seq <= seqs; seq++) {
+        unsigned char *slot = d_pool + (size_t)(seq - 1) * DS4_ROCM_TP_SLOT_BYTES;
+        for (uint32_t i = 0; i < n; i++) {
+            h_src[i] = ((float)(rand() % 1000) - 500.0f) * 0.03125f + (float)seq;
+            h_ref[i] += h_src[i];
+        }
+        if (hipMemcpy(d_src, h_src, payload_bytes, hipMemcpyHostToDevice) != hipSuccess ||
+            hipMemset(d_timeout, 0, sizeof(int)) != hipSuccess) {
+            pass = 0;
+            break;
+        }
+        /* The spin kernel launches FIRST and must wait; the payload arrives
+         * behind it, proving the stamp actually gates the combine. */
+        hipLaunchKernelGGL(dsv4_tp_spin_combine_f32_kernel, dim3(1), dim3(256),
+                           0, spin_stream, d_acc, slot, n, seq,
+                           (unsigned long long)400000000ull,
+                           host_stamp ? d_stamp_view : NULL, d_timeout);
+        if (host_stamp) {
+            if (hipMemcpyAsync(slot, h_src, payload_bytes, hipMemcpyHostToDevice,
+                               fill_stream) != hipSuccess ||
+                hipStreamSynchronize(fill_stream) != hipSuccess) {
+                pass = 0;
+            } else {
+                __atomic_store_n(h_stamp, seq, __ATOMIC_RELEASE);
+            }
+        } else {
+            hipLaunchKernelGGL(dsv4_tp_slot_fill_kernel, dim3(1), dim3(256),
+                               0, fill_stream, slot, d_src, n, seq);
+        }
+        if (!pass) break;
+        if (hipStreamSynchronize(spin_stream) != hipSuccess ||
+            hipStreamSynchronize(fill_stream) != hipSuccess) {
+            pass = 0;
+            break;
+        }
+        if (hipMemcpy(&h_timeout, d_timeout, sizeof(int),
+                      hipMemcpyDeviceToHost) != hipSuccess || h_timeout != 0) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "TP test: spin timeout at seq %u\n", seq);
+            pass = 0;
+            break;
+        }
+    }
+    if (pass &&
+        (hipMemcpy(h_out, d_acc, payload_bytes, hipMemcpyDeviceToHost) != hipSuccess ||
+         memcmp(h_out, h_ref, payload_bytes) != 0)) {
+        pass = 0;
+    }
+
+done:
+    free(h_acc); free(h_src); free(h_ref); free(h_out);
+    if (h_stamp) (void)hipHostFree(h_stamp);
+    if (d_pool) (void)hipFree(d_pool);
+    if (d_acc) (void)hipFree(d_acc);
+    if (d_src) (void)hipFree(d_src);
+    if (d_timeout) (void)hipFree(d_timeout);
+    if (spin_stream) (void)hipStreamDestroy(spin_stream);
+    if (fill_stream) (void)hipStreamDestroy(fill_stream);
+    return pass;
+}
+
 /* Tensor-parallel gates are Metal-only; stubs keep shared graph code
  * linkable (TP option validation rejects non-Metal backends). */
 extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
