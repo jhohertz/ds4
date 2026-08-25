@@ -315,6 +315,154 @@ done:
     return pass;
 }
 
+/* Stage-2 GPU helpers for the NHI TP transport (ds4_tp_nhi.c and the
+ * two-node live test): uncached pool allocation for wave-resident polling
+ * (contract rules 1 and 6), and stream-based fill/spin-combine wrappers
+ * whose fill-side stream synchronize is the dispatch-per-send NHI release
+ * (rule 8). */
+static hipStream_t g_tp_fill_stream;
+static hipStream_t g_tp_spin_stream;
+static float *g_tp_fill_scratch;
+static size_t g_tp_fill_scratch_bytes;
+static int *g_tp_spin_timeout_flag;
+
+static int cuda_tp_streams_ready(void) {
+    if (!g_tp_fill_stream &&
+        hipStreamCreate(&g_tp_fill_stream) != hipSuccess) return 0;
+    if (!g_tp_spin_stream &&
+        hipStreamCreate(&g_tp_spin_stream) != hipSuccess) return 0;
+    if (!g_tp_spin_timeout_flag &&
+        hipMalloc(&g_tp_spin_timeout_flag, sizeof(int)) != hipSuccess) return 0;
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp_pool_alloc_export_uc(uint64_t bytes,
+                                               void **dev_ptr,
+                                               int *dmabuf_fd) {
+    if (dev_ptr) *dev_ptr = NULL;
+    if (dmabuf_fd) *dmabuf_fd = -1;
+    if (!dev_ptr || !dmabuf_fd || bytes == 0 ||
+        (uint64_t)(size_t)bytes != bytes)
+        return 0;
+    void *ptr = NULL;
+    if (!cuda_ok(hipExtMallocWithFlags(&ptr, (size_t)bytes,
+                                       hipDeviceMallocUncached),
+                 "uncached TP pool allocation"))
+        return 0;
+    hipDeviceptr_t base = NULL;
+    size_t range = 0;
+    hipError_t err = hipMemGetAddressRange(&base, &range, (hipDeviceptr_t)ptr);
+    if (err != hipSuccess || base != (hipDeviceptr_t)ptr ||
+        range != (size_t)bytes) {
+        if (err != hipSuccess) (void)cuda_ok(err, "TP pool address range");
+        else
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "TP pool is not a dedicated allocation "
+                    "(base=%p self=%p range=%zu bytes=%llu)\n",
+                    (void *)base, ptr, range, (unsigned long long)bytes);
+        (void)hipFree(ptr);
+        return 0;
+    }
+    int fd = -1;
+    err = hipMemGetHandleForAddressRange(&fd, (hipDeviceptr_t)ptr,
+                                         (size_t)bytes,
+                                         hipMemRangeHandleTypeDmaBufFd, 0);
+    if (err != hipSuccess || fd < 0) {
+        if (err != hipSuccess) (void)cuda_ok(err, "TP pool DMA-BUF export");
+        (void)hipFree(ptr);
+        return 0;
+    }
+    *dev_ptr = ptr;
+    *dmabuf_fd = fd;
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp_dev_buf_create(const float *init_host, uint32_t n,
+                                         void **dev_ptr) {
+    if (dev_ptr) *dev_ptr = NULL;
+    if (!dev_ptr || n == 0) return 0;
+    float *d = NULL;
+    const size_t bytes = (size_t)n * sizeof(float);
+    if (hipMalloc(&d, bytes) != hipSuccess) return 0;
+    if (init_host && hipMemcpy(d, init_host, bytes,
+                               hipMemcpyHostToDevice) != hipSuccess) {
+        (void)hipFree(d);
+        return 0;
+    }
+    *dev_ptr = d;
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp_dev_buf_read(const void *dev_ptr, float *out_host,
+                                       uint32_t n) {
+    if (!dev_ptr || !out_host || n == 0) return 0;
+    return hipMemcpy(out_host, dev_ptr, (size_t)n * sizeof(float),
+                     hipMemcpyDeviceToHost) == hipSuccess;
+}
+
+extern "C" void ds4_gpu_tp_dev_buf_free(void *dev_ptr) {
+    if (dev_ptr) (void)hipFree(dev_ptr);
+}
+
+extern "C" int ds4_gpu_tp_fill_release(void *slot_dev, const float *src_host,
+                                       uint32_t n, uint32_t stamp) {
+    if (!slot_dev || !src_host || n == 0 ||
+        n > DS4_ROCM_TP_PAYLOAD_FLOATS_MAX)
+        return 0;
+    if (!cuda_tp_streams_ready()) return 0;
+    const size_t bytes = (size_t)n * sizeof(float);
+    if (g_tp_fill_scratch_bytes < bytes) {
+        if (g_tp_fill_scratch) (void)hipFree(g_tp_fill_scratch);
+        g_tp_fill_scratch = NULL;
+        g_tp_fill_scratch_bytes = 0;
+        if (hipMalloc(&g_tp_fill_scratch, bytes) != hipSuccess) return 0;
+        g_tp_fill_scratch_bytes = bytes;
+    }
+    if (hipMemcpyAsync(g_tp_fill_scratch, src_host, bytes,
+                       hipMemcpyHostToDevice, g_tp_fill_stream) != hipSuccess)
+        return 0;
+    hipLaunchKernelGGL(dsv4_tp_slot_fill_kernel, dim3(1), dim3(256), 0,
+                       g_tp_fill_stream, (unsigned char *)slot_dev,
+                       g_tp_fill_scratch, n, stamp);
+    /* Dispatch-per-send design: the stream synchronize is the NHI
+     * visibility release (contract rule 8). */
+    return cuda_ok(hipStreamSynchronize(g_tp_fill_stream),
+                   "TP fill release synchronize");
+}
+
+extern "C" int ds4_gpu_tp_spin_combine_start(void *acc_dev,
+                                             const void *slot_dev,
+                                             uint32_t n,
+                                             uint32_t expect_stamp,
+                                             unsigned long long max_spins) {
+    if (!acc_dev || !slot_dev || n == 0 ||
+        n > DS4_ROCM_TP_PAYLOAD_FLOATS_MAX)
+        return 0;
+    if (!cuda_tp_streams_ready()) return 0;
+    if (hipMemsetAsync(g_tp_spin_timeout_flag, 0, sizeof(int),
+                       g_tp_spin_stream) != hipSuccess)
+        return 0;
+    hipLaunchKernelGGL(dsv4_tp_spin_combine_f32_kernel, dim3(1), dim3(256), 0,
+                       g_tp_spin_stream, (float *)acc_dev,
+                       (const unsigned char *)slot_dev, n, expect_stamp,
+                       max_spins, (const uint32_t *)NULL,
+                       g_tp_spin_timeout_flag);
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp_spin_combine_wait(int *timed_out) {
+    if (timed_out) *timed_out = 1;
+    if (!g_tp_spin_stream || !g_tp_spin_timeout_flag) return 0;
+    if (hipStreamSynchronize(g_tp_spin_stream) != hipSuccess) return 0;
+    int flag = 0;
+    if (hipMemcpy(&flag, g_tp_spin_timeout_flag, sizeof(int),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+        return 0;
+    if (timed_out) *timed_out = flag;
+    return 1;
+}
+
 /* Tensor-parallel gates are Metal-only; stubs keep shared graph code
  * linkable (TP option validation rejects non-Metal backends). */
 extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {

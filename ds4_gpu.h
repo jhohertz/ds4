@@ -380,6 +380,21 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
 int ds4_gpu_tp_test_combine(uint32_t n, uint32_t iterations);
 int ds4_gpu_tp_test_spin_exchange(int uncached_pool, int host_stamp,
                                   uint32_t n, uint32_t seqs);
+/* Stage-2 GPU helpers for the NHI TP transport (ds4_tp_nhi.c): uncached
+ * dedicated pool allocation with DMA-BUF export, and stream-based
+ * fill-and-release / spin-combine wrappers for the exchange loop. */
+int ds4_gpu_tp_pool_alloc_export_uc(uint64_t bytes, void **dev_ptr,
+                                    int *dmabuf_fd);
+int ds4_gpu_tp_dev_buf_create(const float *init_host, uint32_t n,
+                              void **dev_ptr);
+int ds4_gpu_tp_dev_buf_read(const void *dev_ptr, float *out_host, uint32_t n);
+void ds4_gpu_tp_dev_buf_free(void *dev_ptr);
+int ds4_gpu_tp_fill_release(void *slot_dev, const float *src_host,
+                            uint32_t n, uint32_t stamp);
+int ds4_gpu_tp_spin_combine_start(void *acc_dev, const void *slot_dev,
+                                  uint32_t n, uint32_t expect_stamp,
+                                  unsigned long long max_spins);
+int ds4_gpu_tp_spin_combine_wait(int *timed_out);
 /* Verify-block batch gates: one exchange per layer moving `rows` partial
  * rows at once (speculative verify).  The callback runs on the gate service
  * thread with the same ud as the row-gate exchange fn. */

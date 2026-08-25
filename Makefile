@@ -584,3 +584,12 @@ tests/test_tp_combine_rocm: tests/test_tp_combine_rocm.o ds4_rocm.o
 
 test-tp-combine-rocm: tests/test_tp_combine_rocm
 	./tests/test_tp_combine_rocm
+
+ds4_tp_nhi.o: ds4_tp_nhi.c ds4_tp_nhi.h ds4_tbstream_uapi.h ds4_gpu.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_tp_nhi.c
+
+tests/test_tp_nhi_live.o: tests/test_tp_nhi_live.c ds4_tp_nhi.h ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_tp_nhi_live: tests/test_tp_nhi_live.o ds4_tp_nhi.o ds4_rocm.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
