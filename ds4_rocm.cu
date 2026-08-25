@@ -980,20 +980,20 @@ extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
         group0 > n_groups_total || group_cnt > n_groups_total - group0)
         return 0;
     const uint64_t blocks_a = (group_dim + 31u) / 32u;
-    uint64_t group_weight_bytes = 0, a_shift = 0, heads_shift = 0;
+    uint64_t group_weight_bytes = 0, a_shift = 0;
     if (!cuda_u64_mul3_checked(rank, blocks_a, 34u, &group_weight_bytes) ||
         !cuda_u64_mul_checked(group0, group_weight_bytes, &a_shift) ||
-        !cuda_u64_mul3_checked(group0, group_dim, sizeof(float), &heads_shift) ||
-        a_shift > UINT64_MAX - out_a_offset || heads_shift > heads->bytes)
+        a_shift > UINT64_MAX - out_a_offset)
         return 0;
     const uint64_t local_low = (uint64_t)group_cnt * rank;
     if (local_low > UINT64_MAX / sizeof(float) ||
         low->bytes < local_low * sizeof(float) ||
-        heads->bytes - heads_shift <
-            (uint64_t)group_cnt * group_dim * sizeof(float))
+        heads->bytes < (uint64_t)group_cnt * group_dim * sizeof(float))
         return 0;
+    /* The upstream head-split path packs this rank's owned groups at the
+     * buffer base. group0 shifts weights/B-k only, never the heads pointer. */
     ds4_gpu_tensor heads_slice = {
-        (char *)heads->ptr + heads_shift,
+        heads->ptr,
         (uint64_t)group_cnt * group_dim * sizeof(float),
         0,
     };
