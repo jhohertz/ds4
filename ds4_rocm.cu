@@ -520,6 +520,7 @@ static uint32_t g_tp_engine_pending[DS4_ROCM_TP_QUEUE];
 static uint32_t g_tp_engine_pending_head;
 static uint32_t g_tp_engine_pending_count;
 static uint32_t g_tp_engine_next_record;
+static uint32_t g_tp_engine_building;
 
 static void ds4_rocm_tp_expert_range(uint32_t n_total_expert,
                                      uint32_t *first_expert,
@@ -572,6 +573,14 @@ static void ds4_rocm_tp_fail(const char *what,
     }
 }
 
+static void ds4_rocm_tp_cancel_build(ds4_rocm_tp_request *req) {
+    pthread_mutex_lock(&g_tp_engine_mutex);
+    if (req) req->in_use = 0;
+    if (g_tp_engine_building != 0) g_tp_engine_building--;
+    pthread_cond_broadcast(&g_tp_engine_cond);
+    pthread_mutex_unlock(&g_tp_engine_mutex);
+}
+
 static void *ds4_rocm_tp_service_thread(void *arg) {
     (void)arg;
     if (hipSetDevice(g_tp_engine_device) != hipSuccess) {
@@ -581,9 +590,10 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
     for (;;) {
         pthread_mutex_lock(&g_tp_engine_mutex);
         while (g_tp_engine_pending_count == 0 &&
-               !__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE))
+               (!__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE) ||
+                g_tp_engine_building != 0))
             pthread_cond_wait(&g_tp_engine_cond, &g_tp_engine_mutex);
-        if (g_tp_engine_pending_count == 0 &&
+        if (g_tp_engine_pending_count == 0 && g_tp_engine_building == 0 &&
             __atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE)) {
             pthread_mutex_unlock(&g_tp_engine_mutex);
             break;
@@ -689,6 +699,7 @@ extern "C" int ds4_gpu_tp_nhi_init(
     g_tp_engine_pending_head = 0;
     g_tp_engine_pending_count = 0;
     g_tp_engine_next_record = 0;
+    g_tp_engine_building = 0;
     __atomic_store_n(&g_tp_engine_shutdown, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_tp_engine_failure_reported, 0, __ATOMIC_RELEASE);
     const char *spins = getenv("DS4_TP_SPIN_MAX");
@@ -760,6 +771,7 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
     g_tp_nhi_fail_fn = NULL;
     g_tp_nhi_ud = NULL;
     __atomic_store_n(&g_tp_engine_shutdown, 0, __ATOMIC_RELEASE);
+    g_tp_engine_building = 0;
     g_tp_split_rank = 0;
     g_tp_split_world = 1;
     g_tp_attn_head_split = 0;
@@ -774,13 +786,17 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     if (slot >= g_tp_engine_slots ||
         __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) != 0)
         return 0;
+    uint32_t index = UINT32_MAX;
+    pthread_mutex_lock(&g_tp_engine_mutex);
+    if (__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_unlock(&g_tp_engine_mutex);
+        return 0;
+    }
     if (g_tp_engine_seq > UINT32_MAX) {
+        pthread_mutex_unlock(&g_tp_engine_mutex);
         ds4_rocm_tp_fail("32-bit stamp sequence exhausted", NULL);
         return 0;
     }
-
-    uint32_t index = UINT32_MAX;
-    pthread_mutex_lock(&g_tp_engine_mutex);
     for (uint32_t n = 0; n < DS4_ROCM_TP_QUEUE; n++) {
         const uint32_t candidate =
             (g_tp_engine_next_record + n) % DS4_ROCM_TP_QUEUE;
@@ -791,20 +807,19 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
             break;
         }
     }
-    pthread_mutex_unlock(&g_tp_engine_mutex);
     if (index == UINT32_MAX) {
+        pthread_mutex_unlock(&g_tp_engine_mutex);
         ds4_rocm_tp_fail("request/event ring exhausted", NULL);
         return 0;
     }
-
     ds4_rocm_tp_request *req = &g_tp_engine_requests[index];
     req->layer = layer;
     req->gate = gate;
     req->seq = g_tp_engine_seq++;
+    g_tp_engine_building++;
+    pthread_mutex_unlock(&g_tp_engine_mutex);
     if (!g_tp_nhi_acquire_tx_fn(g_tp_nhi_ud, req->seq)) {
-        pthread_mutex_lock(&g_tp_engine_mutex);
-        req->in_use = 0;
-        pthread_mutex_unlock(&g_tp_engine_mutex);
+        ds4_rocm_tp_cancel_build(req);
         ds4_rocm_tp_fail("NHI TX slot acquire", req);
         return 0;
     }
@@ -819,9 +834,7 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
                           g_tp_engine_in_offset +
                           (uint64_t)slot * vec_bytes);
     if (!tx_slot || !rx_slot) {
-        pthread_mutex_lock(&g_tp_engine_mutex);
-        req->in_use = 0;
-        pthread_mutex_unlock(&g_tp_engine_mutex);
+        ds4_rocm_tp_cancel_build(req);
         ds4_rocm_tp_fail("null transport slot", req);
         return 0;
     }
@@ -850,9 +863,7 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
              hipEventRecord(req->rx_consumed, 0) == hipSuccess;
     }
     if (!ok) {
-        pthread_mutex_lock(&g_tp_engine_mutex);
-        req->in_use = 0;
-        pthread_mutex_unlock(&g_tp_engine_mutex);
+        ds4_rocm_tp_cancel_build(req);
         ds4_rocm_tp_fail("gate kernel/event enqueue", req);
         return 0;
     }
@@ -860,6 +871,8 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     pthread_mutex_lock(&g_tp_engine_mutex);
     if (g_tp_engine_pending_count >= DS4_ROCM_TP_QUEUE) {
         req->in_use = 0;
+        if (g_tp_engine_building != 0) g_tp_engine_building--;
+        pthread_cond_broadcast(&g_tp_engine_cond);
         pthread_mutex_unlock(&g_tp_engine_mutex);
         ds4_rocm_tp_fail("service queue overflow", req);
         return 0;
@@ -869,7 +882,8 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         DS4_ROCM_TP_QUEUE;
     g_tp_engine_pending[tail] = index;
     g_tp_engine_pending_count++;
-    pthread_cond_signal(&g_tp_engine_cond);
+    if (g_tp_engine_building != 0) g_tp_engine_building--;
+    pthread_cond_broadcast(&g_tp_engine_cond);
     pthread_mutex_unlock(&g_tp_engine_mutex);
     return 1;
 }

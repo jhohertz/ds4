@@ -257,6 +257,10 @@ int main(int argc, char **argv) {
                            (unsigned long long)done);
     }
 
+    if (pass && !ds4_tp_nhi_quiesce(nhi, err, sizeof(err))) {
+        fprintf(stderr, "quiesce failed: %s\n", err);
+        pass = 0;
+    }
     /* Teardown barrier: nobody closes while peer traffic may be in flight. */
     (void)control_barrier(ctl, 0x444eu); /* 'DN' */
     ds4_tp_nhi_close(nhi);

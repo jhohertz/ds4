@@ -360,6 +360,10 @@ int ds4_tp_nhi_acquire_tx(ds4_tp_nhi *t, uint64_t seq,
             available = seq < t->msgs ||
                 t->tx_done_seen > seq - t->msgs;
         }
+        if (ok) {
+            ok = !atomic_load_explicit(&t->peer_closed,
+                                       memory_order_acquire);
+        }
         if (ok && available) {
             t->tx_acquired++;
             pthread_mutex_unlock(&t->mutex);
