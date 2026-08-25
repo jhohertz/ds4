@@ -62,6 +62,22 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
+# CPU-hook tests replace ds4.o but still need the complete control/transport
+# dependency chain used by ds4_distributed.o. A ROCm build additionally links
+# ds4_rocm.o because DS4_ROCM_BUILD turns the optional mapped/imported NHI
+# helpers from inline unsupported stubs into external symbols. Do not link the
+# multi-GPU compatibility object: ds4_cpu_test_hooks.o owns those globals.
+TEST_HOOK_SUPPORT_OBJS = ds4_distributed.o ds4_dist_v3.o ds4_transport.o \
+	ds4_transport_nhi.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o \
+	$(TEST_HOOK_GPU_OBJS)
+ifeq ($(UNAME_S),Darwin)
+TEST_HOOK_LINK = $(CC) $(CFLAGS)
+TEST_HOOK_LDLIBS = $(METAL_LDLIBS)
+else
+TEST_HOOK_LINK = $(DS4_LINK)
+TEST_HOOK_LDLIBS = $(DS4_LINK_LIBS)
+endif
+
 .PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-rocm-qkv-fusion test-q8-krow-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
@@ -191,22 +207,24 @@ rocm: strix-halo
 # Core regression suite for ROCm-only hosts: the CUDA-specific binaries
 # (tests/test_sampling, the CUDA session/mixed-batch oracles) are not part
 # of this target; run them through `make test` / `make cuda-regression` on
-# CUDA hosts.  Everything else mirrors `make test`.
+# CUDA hosts. The generic ds4_test runner is limited to its model-independent
+# server group; ROCm model/kernel suites have dedicated targets.
 test-rocm:
 	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 		ds4 ds4-server ds4-bench ds4-agent \
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
+		TEST_HOOK_GPU_OBJS="ds4_rocm.o" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
-	./ds4_test
+	./ds4_test --server
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
-	./tests/test_gpu_args_cli.sh
+	DS4_TEST_ROCM=1 ./tests/test_gpu_args_cli.sh
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -428,14 +446,14 @@ ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o $(TEST_HOOK_SUPPORT_OBJS)
+	$(TEST_HOOK_LINK) -o $@ $^ $(TEST_HOOK_LDLIBS)
 
 tests/test_sampling.o: tests/test_sampling.c ds4.h
 	$(CC) $(CFLAGS) -fno-finite-math-only -DDS4_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o $(TEST_HOOK_SUPPORT_OBJS)
+	$(TEST_HOOK_LINK) -o $@ $^ $(TEST_HOOK_LDLIBS)
 
 ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h

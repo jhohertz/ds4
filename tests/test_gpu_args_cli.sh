@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 PASS=0
 FAIL=0
 LOG=$(mktemp)
+ROCM_ONLY=${DS4_TEST_ROCM:-0}
 
 ok()   { PASS=$((PASS+1)); echo "ok $1"; }
 fail() { FAIL=$((FAIL+1)); echo "FAIL $1"; }
@@ -42,9 +43,13 @@ for i in "${!BINS[@]}"; do
         continue
     fi
     "$bin" --help > "$LOG" 2>&1 || true
-    assert_grep "$name --help mentions --gpu-vram" "gpu-vram" "$LOG"
-    assert_grep "$name --help mentions --gpu-devices" "gpu-devices" "$LOG"
-    assert_grep "$name --help mentions --cuda-tensor-parallel" "cuda-tensor-parallel" "$LOG"
+    if [ "$ROCM_ONLY" = "1" ]; then
+        assert_grep "$name --help advertises the ROCm backend" "--rocm" "$LOG"
+    else
+        assert_grep "$name --help mentions --gpu-vram" "gpu-vram" "$LOG"
+        assert_grep "$name --help mentions --gpu-devices" "gpu-devices" "$LOG"
+        assert_grep "$name --help mentions --cuda-tensor-parallel" "cuda-tensor-parallel" "$LOG"
+    fi
     if [ "$name" != "ds4-bench" ]; then
         "$bin" --help runtime > "$LOG" 2>&1 || true
         assert_grep "$name --help runtime mentions --mtp-exact-sampling" \
@@ -55,6 +60,12 @@ for i in "${!BINS[@]}"; do
         assert_grep "$name --help distributed mentions --tensor-parallel-token-prefill" \
             "tensor-parallel-token-prefill" "$LOG"
         assert_not_grep "$name --help distributed omits old --tp spellings" "--tp-" "$LOG"
+        if [ "$ROCM_ONLY" = "1" ]; then
+            assert_grep "$name --help distributed mentions --transport" \
+                "--transport" "$LOG"
+            assert_grep "$name --help distributed mentions --nhi-device" \
+                "--nhi-device" "$LOG"
+        fi
     fi
 done
 
