@@ -170,6 +170,21 @@ int main(int argc, char **argv) {
     }
     if (pass) pass = ds4_gpu_tp_dev_buf_create(acc_init, hidden, &acc_dev);
 
+    /* Pre-generate every iteration's partial and the final reference
+     * OUTSIDE the timed loop: the harness's hash math and reference
+     * accumulation are not part of the exchange path being measured.
+     * (The per-iteration host upload of src stays inside: stage-3 removes
+     * it entirely by producing partials on the GPU.) */
+    float *src_all = malloc((size_t)iters * hidden * sizeof(float));
+    if (!src_all) pass = 0;
+    for (uint64_t seq = 1; pass && seq <= iters; seq++) {
+        float *src_seq = src_all + (size_t)(seq - 1) * hidden;
+        for (uint32_t i = 0; i < hidden; i++) {
+            src_seq[i] = partial_value(rank, seq, i);
+            acc_ref[i] += partial_value(rank ^ 1, seq, i);
+        }
+    }
+
     const double t0 = now_sec();
     uint64_t done = 0;
     for (uint64_t seq = 1; pass && seq <= iters; seq++) {
@@ -182,11 +197,8 @@ int main(int argc, char **argv) {
             pass = 0;
             break;
         }
-        for (uint32_t i = 0; i < hidden; i++) {
-            src[i] = partial_value(rank, seq, i);
-            acc_ref[i] += partial_value(rank ^ 1, seq, i);
-        }
-        if (!ds4_gpu_tp_fill_release(ds4_tp_nhi_tx_slot(nhi, seq - 1), src,
+        if (!ds4_gpu_tp_fill_release(ds4_tp_nhi_tx_slot(nhi, seq - 1),
+                                     src_all + (size_t)(seq - 1) * hidden,
                                      hidden, stamp) ||
             !ds4_tp_nhi_submit(nhi, seq - 1, err, sizeof(err))) {
             fprintf(stderr, "fill/submit failed at seq %llu: %s\n",
@@ -202,22 +214,29 @@ int main(int argc, char **argv) {
             pass = 0;
             break;
         }
-        if (!ds4_tp_nhi_consumed(nhi, err, sizeof(err)) ||
-            !ds4_tp_nhi_reap(nhi, err, sizeof(err))) {
-            fprintf(stderr, "ring maintenance failed at seq %llu: %s\n",
+        if (!ds4_tp_nhi_consumed(nhi, err, sizeof(err))) {
+            fprintf(stderr, "repost failed at seq %llu: %s\n",
                     (unsigned long long)seq, err);
             pass = 0;
             break;
         }
-        if (ds4_tp_nhi_peer_closed(nhi)) {
-            fprintf(stderr, "peer closed at seq %llu\n",
-                    (unsigned long long)seq);
+        /* Ring bookkeeping off the critical cadence (contract rule 11). */
+        if ((seq & 15u) == 0 &&
+            (!ds4_tp_nhi_reap(nhi, err, sizeof(err)) ||
+             ds4_tp_nhi_peer_closed(nhi))) {
+            fprintf(stderr, "ring maintenance failed at seq %llu: %s\n",
+                    (unsigned long long)seq, err);
             pass = 0;
             break;
         }
         done = seq;
     }
     const double t1 = now_sec();
+    if (pass && !ds4_tp_nhi_reap(nhi, err, sizeof(err))) {
+        fprintf(stderr, "final reap failed: %s\n", err);
+        pass = 0;
+    }
+    free(src_all);
 
     if (pass) {
         pass = ds4_gpu_tp_dev_buf_read(acc_dev, acc_out, hidden) &&

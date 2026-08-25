@@ -208,7 +208,7 @@ int ds4_tp_nhi_submit(ds4_tp_nhi *t, uint64_t seq, char *err, size_t errlen) {
 
 /* Drain driver events without blocking (rule 11).  Detection happens via
  * in-band stamps; this bookkeeping keeps the rings healthy and notices a
- * peer CLOSE. */
+ * peer CLOSE.  The ioctl RETURNS the event count (negative on error). */
 int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen) {
     if (!t) return 0;
     struct tbstream_zc_event events[DS4_TP_NHI_REAP_BATCH];
@@ -218,15 +218,21 @@ int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen) {
         reap.max = DS4_TP_NHI_REAP_BATCH;
         reap.flags = TBSTREAM_ZC_REAP_NONBLOCK;
         reap.events = (uint64_t)(uintptr_t)events;
-        if (ioctl(t->device_fd, TBSTREAM_ZC_REAP, &reap) != 0) {
+        const int count = ioctl(t->device_fd, TBSTREAM_ZC_REAP, &reap);
+        if (count < 0) {
+            if (errno == EINTR) continue;
             if (errno == EAGAIN) return 1;
             tp_nhi_set_err(err, errlen, "%s: TBSTREAM_ZC_REAP: %s",
                            t->device_path, strerror(errno));
             return 0;
         }
-        const uint32_t count = reap.max;
         if (count == 0) return 1;
-        for (uint32_t i = 0; i < count; i++) {
+        if (count > (int)DS4_TP_NHI_REAP_BATCH) {
+            tp_nhi_set_err(err, errlen, "%s: TBSTREAM_ZC_REAP: %s",
+                           t->device_path, "event count out of range");
+            return 0;
+        }
+        for (int i = 0; i < count; i++) {
             switch (events[i].type) {
             case TBSTREAM_ZC_EV_RX:
                 t->rx_events_seen++;
@@ -241,7 +247,7 @@ int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen) {
                 break;
             }
         }
-        if (count < DS4_TP_NHI_REAP_BATCH) return 1;
+        if (count < (int)DS4_TP_NHI_REAP_BATCH) return 1;
     }
 }
 
