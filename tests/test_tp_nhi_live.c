@@ -195,6 +195,12 @@ int main(int argc, char **argv) {
         const uint64_t seq0 = seq - 1;
         const uint32_t local_stamp = role_stamp(rank, seq0);
         const uint32_t peer_stamp = role_stamp(rank ^ 1, seq0);
+        if (!ds4_tp_nhi_acquire_tx(nhi, seq0, err, sizeof(err))) {
+            fprintf(stderr, "TX slot acquire failed at seq %llu: %s\n",
+                    (unsigned long long)seq, err);
+            pass = 0;
+            break;
+        }
         if (!ds4_gpu_tp_spin_combine_start(acc_dev,
                                            ds4_tp_nhi_rx_slot(nhi, seq0),
                                            hidden, peer_stamp, 800000000ull)) {

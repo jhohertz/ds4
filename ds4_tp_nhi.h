@@ -22,6 +22,9 @@ uint32_t ds4_tp_nhi_msg_frames(const ds4_tp_nhi *t);
 uint32_t ds4_tp_nhi_msgs(const ds4_tp_nhi *t);
 void *ds4_tp_nhi_tx_slot(ds4_tp_nhi *t, uint64_t seq);
 const void *ds4_tp_nhi_rx_slot(ds4_tp_nhi *t, uint64_t seq);
+/* Reserve seq%msgs after seq-msgs TX_DONE, before any GPU overwrite. */
+int ds4_tp_nhi_acquire_tx(ds4_tp_nhi *t, uint64_t seq,
+                          char *err, size_t errlen);
 int ds4_tp_nhi_submit(ds4_tp_nhi *t, uint64_t seq, char *err, size_t errlen);
 int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen);
 /* Mark one receive message GPU-consumed, in strict sequence order.  Reap

@@ -28,7 +28,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,12 +56,15 @@ struct ds4_tp_nhi {
     uint64_t pool_bytes;      /* per direction */
     void *tx_pool;            /* uncached GPU allocation, imported as TX */
     void *rx_pool;            /* uncached GPU allocation, imported as RX */
+    pthread_mutex_t mutex;     /* serializes UAPI and ownership counters */
+    int mutex_ready;
+    uint64_t tx_acquired;      /* next producer-side TX-slot reservation */
     uint64_t tx_submitted;     /* next global TX sequence */
     uint64_t tx_done_seen;     /* validated TX_DONE events, strict FIFO */
     uint64_t rx_events_seen;   /* validated complete RX messages */
     uint64_t rx_consumed_seen; /* GPU final-reader completions, strict FIFO */
     uint64_t rx_reposted;      /* messages returned to the RX FIFO */
-    int peer_closed;
+    atomic_int peer_closed;
 };
 
 static void tp_nhi_set_err(char *err, size_t errlen, const char *fmt, ...) {
@@ -88,6 +93,13 @@ int ds4_tp_nhi_open(ds4_tp_nhi **out,
         return 0;
     }
     t->device_fd = -1;
+    if (pthread_mutex_init(&t->mutex, NULL) != 0) {
+        free(t);
+        tp_nhi_set_err(err, errlen, "TP NHI mutex init failed");
+        return 0;
+    }
+    t->mutex_ready = 1;
+    atomic_init(&t->peer_closed, 0);
     t->msg_frames = DS4_TP_NHI_MSG_FRAMES;
     t->pool_bytes = (uint64_t)ring_frames * TBSTREAM_ZC_FRAME_SIZE;
     t->device_path = strdup(device_path);
@@ -207,7 +219,8 @@ static uint64_t tp_nhi_now_ns(void) {
 /* POST_RX is legal only after the complete RX event and the GPU's final
  * slot reader have both advanced past a message.  Batch every contiguous
  * ready prefix; repost order is the receive-ring address mapping (rule 11). */
-static int tp_nhi_repost_ready(ds4_tp_nhi *t, char *err, size_t errlen) {
+static int tp_nhi_repost_ready_locked(ds4_tp_nhi *t,
+                                      char *err, size_t errlen) {
     const uint64_t ready_through = t->rx_events_seen < t->rx_consumed_seen
         ? t->rx_events_seen : t->rx_consumed_seen;
     if (ready_through < t->rx_reposted) {
@@ -240,7 +253,7 @@ static int tp_nhi_repost_ready(ds4_tp_nhi *t, char *err, size_t errlen) {
 /* Drain driver events without blocking (rule 11).  Every RX and TX_DONE
  * record is checked against strict global FIFO sequence; a geometry drift
  * would otherwise make a later stamp appear in the wrong GPU slot. */
-int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen) {
+static int tp_nhi_reap_locked(ds4_tp_nhi *t, char *err, size_t errlen) {
     if (!t) return 0;
     struct tbstream_zc_event events[DS4_TP_NHI_REAP_BATCH];
     for (;;) {
@@ -253,12 +266,13 @@ int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen) {
         if (count < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN)
-                return tp_nhi_repost_ready(t, err, errlen);
+                return tp_nhi_repost_ready_locked(t, err, errlen);
             tp_nhi_set_err(err, errlen, "%s: TBSTREAM_ZC_REAP: %s",
                            t->device_path, strerror(errno));
             return 0;
         }
-        if (count == 0) return tp_nhi_repost_ready(t, err, errlen);
+        if (count == 0)
+            return tp_nhi_repost_ready_locked(t, err, errlen);
         if (count > (int)DS4_TP_NHI_REAP_BATCH) {
             tp_nhi_set_err(err, errlen, "%s: TBSTREAM_ZC_REAP: %s",
                            t->device_path, "event count out of range");
@@ -286,8 +300,7 @@ int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen) {
                 seq = t->tx_done_seen;
                 if (seq >= t->tx_submitted ||
                     ev->first != tp_nhi_frame_first(t, seq) ||
-                    ev->nframes != t->msg_frames ||
-                    ev->bytes != t->msg_frames * t->frame_size) {
+                    ev->nframes != t->msg_frames || ev->bytes != 0) {
                     tp_nhi_set_err(err, errlen,
                                    "%s: TX_DONE event %llu geometry "
                                    "first=%u frames=%u bytes=%u",
@@ -298,7 +311,8 @@ int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen) {
                 t->tx_done_seen++;
                 break;
             case TBSTREAM_ZC_EV_CLOSE:
-                t->peer_closed = 1;
+                atomic_store_explicit(&t->peer_closed, 1,
+                                      memory_order_release);
                 break;
             default:
                 tp_nhi_set_err(err, errlen,
@@ -308,7 +322,59 @@ int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen) {
             }
         }
         if (count < (int)DS4_TP_NHI_REAP_BATCH)
-            return tp_nhi_repost_ready(t, err, errlen);
+            return tp_nhi_repost_ready_locked(t, err, errlen);
+    }
+}
+
+int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen) {
+    if (!t) return 0;
+    pthread_mutex_lock(&t->mutex);
+    const int ok = tp_nhi_reap_locked(t, err, errlen);
+    pthread_mutex_unlock(&t->mutex);
+    return ok;
+}
+
+/* Reserve producer ownership before the GPU touches seq%msgs.  This is a
+ * separate phase from SUBMIT_TX: waiting for seq-msgs TX_DONE after the copy
+ * would already have overwritten a descriptor still owned by NHI. */
+int ds4_tp_nhi_acquire_tx(ds4_tp_nhi *t, uint64_t seq,
+                          char *err, size_t errlen) {
+    if (!t) return 0;
+    const uint64_t deadline = tp_nhi_now_ns() + 30000000000ull;
+    for (;;) {
+        pthread_mutex_lock(&t->mutex);
+        if (seq != t->tx_acquired) {
+            tp_nhi_set_err(err, errlen,
+                           "%s: out-of-order TP NHI TX acquire %llu (want %llu)",
+                           t->device_path, (unsigned long long)seq,
+                           (unsigned long long)t->tx_acquired);
+            pthread_mutex_unlock(&t->mutex);
+            return 0;
+        }
+        int ok = !atomic_load_explicit(&t->peer_closed,
+                                       memory_order_acquire);
+        int available = seq < t->msgs ||
+            t->tx_done_seen > seq - t->msgs;
+        if (ok && !available) {
+            ok = tp_nhi_reap_locked(t, err, errlen);
+            available = seq < t->msgs ||
+                t->tx_done_seen > seq - t->msgs;
+        }
+        if (ok && available) {
+            t->tx_acquired++;
+            pthread_mutex_unlock(&t->mutex);
+            return 1;
+        }
+        pthread_mutex_unlock(&t->mutex);
+        if (!ok) return 0;
+        if (tp_nhi_now_ns() >= deadline) {
+            tp_nhi_set_err(err, errlen,
+                           "%s: timed out acquiring TX slot %u",
+                           t->device_path, tp_nhi_frame_first(t, seq));
+            return 0;
+        }
+        const struct timespec pause = {0, 50000};
+        nanosleep(&pause, NULL);
     }
 }
 
@@ -316,29 +382,24 @@ int ds4_tp_nhi_reap(ds4_tp_nhi *t, char *err, size_t errlen) {
  * address request: validating it proves that the driver's ring head still
  * matches the global gate sequence (rules 9 and 12). */
 int ds4_tp_nhi_submit(ds4_tp_nhi *t, uint64_t seq, char *err, size_t errlen) {
-    if (!t || t->peer_closed) return 0;
-    if (seq != t->tx_submitted) {
-        tp_nhi_set_err(err, errlen,
-                       "%s: out-of-order TP NHI submit %llu (want %llu)",
-                       t->device_path, (unsigned long long)seq,
-                       (unsigned long long)t->tx_submitted);
-        return 0;
-    }
-
+    if (!t) return 0;
     const uint64_t deadline = tp_nhi_now_ns() + 30000000000ull;
-    while (seq >= t->msgs && t->tx_done_seen <= seq - t->msgs) {
-        if (!ds4_tp_nhi_reap(t, err, errlen) || t->peer_closed) return 0;
-        if (tp_nhi_now_ns() >= deadline) {
+    for (;;) {
+        pthread_mutex_lock(&t->mutex);
+        if (seq != t->tx_submitted || seq >= t->tx_acquired) {
             tp_nhi_set_err(err, errlen,
-                           "%s: timed out waiting for TX slot %u credit",
-                           t->device_path, tp_nhi_frame_first(t, seq));
+                           "%s: unreserved/out-of-order TP NHI submit %llu "
+                           "(submitted=%llu acquired=%llu)",
+                           t->device_path, (unsigned long long)seq,
+                           (unsigned long long)t->tx_submitted,
+                           (unsigned long long)t->tx_acquired);
+            pthread_mutex_unlock(&t->mutex);
             return 0;
         }
-        const struct timespec pause = {0, 50000};
-        nanosleep(&pause, NULL);
-    }
-
-    for (;;) {
+        if (atomic_load_explicit(&t->peer_closed, memory_order_acquire)) {
+            pthread_mutex_unlock(&t->mutex);
+            return 0;
+        }
         struct tbstream_zc_tx tx;
         memset(&tx, 0, sizeof(tx));
         tx.nframes = t->msg_frames;
@@ -350,17 +411,24 @@ int ds4_tp_nhi_submit(ds4_tp_nhi *t, uint64_t seq, char *err, size_t errlen) {
                                "%s: TX submit %llu returned first=%u (want %u)",
                                t->device_path, (unsigned long long)seq,
                                tx.first, expected);
+                pthread_mutex_unlock(&t->mutex);
                 return 0;
             }
             t->tx_submitted++;
+            pthread_mutex_unlock(&t->mutex);
             return 1;
         }
-        if (errno != ENOBUFS && errno != EAGAIN && errno != EINTR) {
+        const int saved_errno = errno;
+        int ok = (saved_errno == ENOBUFS || saved_errno == EAGAIN ||
+                  saved_errno == EINTR) &&
+                 tp_nhi_reap_locked(t, err, errlen);
+        if (!ok && saved_errno != ENOBUFS && saved_errno != EAGAIN &&
+            saved_errno != EINTR) {
             tp_nhi_set_err(err, errlen, "%s: TBSTREAM_ZC_SUBMIT_TX: %s",
-                           t->device_path, strerror(errno));
-            return 0;
+                           t->device_path, strerror(saved_errno));
         }
-        if (!ds4_tp_nhi_reap(t, err, errlen) || t->peer_closed) return 0;
+        pthread_mutex_unlock(&t->mutex);
+        if (!ok) return 0;
         if (tp_nhi_now_ns() >= deadline) {
             tp_nhi_set_err(err, errlen,
                            "%s: TBSTREAM_ZC_SUBMIT_TX credit timeout",
@@ -377,17 +445,29 @@ int ds4_tp_nhi_submit(ds4_tp_nhi *t, uint64_t seq, char *err, size_t errlen) {
 int ds4_tp_nhi_consumed(ds4_tp_nhi *t, uint64_t seq,
                         char *err, size_t errlen) {
     if (!t) return 0;
-    if (seq != t->rx_consumed_seen) {
-        tp_nhi_set_err(err, errlen,
-                       "%s: out-of-order TP NHI consume %llu (want %llu)",
-                       t->device_path, (unsigned long long)seq,
-                       (unsigned long long)t->rx_consumed_seen);
-        return 0;
-    }
-    t->rx_consumed_seen++;
     const uint64_t deadline = tp_nhi_now_ns() + 30000000000ull;
-    while (t->rx_reposted <= seq) {
-        if (!ds4_tp_nhi_reap(t, err, errlen) || t->peer_closed) return 0;
+    int noted = 0;
+    for (;;) {
+        pthread_mutex_lock(&t->mutex);
+        if (!noted) {
+            if (seq != t->rx_consumed_seen) {
+                tp_nhi_set_err(err, errlen,
+                               "%s: out-of-order TP NHI consume %llu (want %llu)",
+                               t->device_path, (unsigned long long)seq,
+                               (unsigned long long)t->rx_consumed_seen);
+                pthread_mutex_unlock(&t->mutex);
+                return 0;
+            }
+            t->rx_consumed_seen++;
+            noted = 1;
+        }
+        const int ok = tp_nhi_reap_locked(t, err, errlen);
+        const int reposted = t->rx_reposted > seq;
+        const int closed = atomic_load_explicit(&t->peer_closed,
+                                                memory_order_acquire);
+        pthread_mutex_unlock(&t->mutex);
+        if (!ok || (closed && !reposted)) return 0;
+        if (reposted) return 1;
         if (tp_nhi_now_ns() >= deadline) {
             tp_nhi_set_err(err, errlen,
                            "%s: timed out waiting for RX event %llu",
@@ -397,42 +477,41 @@ int ds4_tp_nhi_consumed(ds4_tp_nhi *t, uint64_t seq,
         const struct timespec pause = {0, 50000};
         nanosleep(&pause, NULL);
     }
-    return 1;
 }
 
 int ds4_tp_nhi_peer_closed(const ds4_tp_nhi *t) {
-    return t ? t->peer_closed : 1;
+    return t ? atomic_load_explicit(&t->peer_closed,
+                                    memory_order_acquire) : 1;
 }
 
 int ds4_tp_nhi_quiesce(ds4_tp_nhi *t, char *err, size_t errlen) {
     if (!t) return 0;
     const uint64_t deadline = tp_nhi_now_ns() + 30000000000ull;
-    while (t->tx_done_seen < t->tx_submitted ||
-           t->rx_reposted < t->rx_consumed_seen) {
-        if (!ds4_tp_nhi_reap(t, err, errlen)) return 0;
-        if (t->peer_closed &&
-            (t->tx_done_seen < t->tx_submitted ||
-             t->rx_reposted < t->rx_consumed_seen)) {
+    for (;;) {
+        pthread_mutex_lock(&t->mutex);
+        const int ok = tp_nhi_reap_locked(t, err, errlen);
+        const int done = t->tx_acquired == t->tx_submitted &&
+                         t->tx_done_seen == t->tx_submitted &&
+                         t->rx_events_seen == t->rx_consumed_seen &&
+                         t->rx_consumed_seen == t->rx_reposted;
+        const int closed = atomic_load_explicit(&t->peer_closed,
+                                                memory_order_acquire);
+        if (ok && !done && closed) {
             tp_nhi_set_err(err, errlen,
                            "%s: peer closed with TP NHI ownership outstanding",
                            t->device_path);
-            return 0;
         }
+        pthread_mutex_unlock(&t->mutex);
+        if (!ok || (!done && closed)) return 0;
+        if (done) return 1;
         if (tp_nhi_now_ns() >= deadline) {
-            tp_nhi_set_err(err, errlen,
-                           "%s: TP NHI quiesce timeout "
-                           "tx=%llu/%llu rx=%llu/%llu",
-                           t->device_path,
-                           (unsigned long long)t->tx_done_seen,
-                           (unsigned long long)t->tx_submitted,
-                           (unsigned long long)t->rx_reposted,
-                           (unsigned long long)t->rx_consumed_seen);
+            tp_nhi_set_err(err, errlen, "%s: TP NHI quiesce timeout",
+                           t->device_path);
             return 0;
         }
         const struct timespec pause = {0, 50000};
         nanosleep(&pause, NULL);
     }
-    return 1;
 }
 
 /* Stats first (with a flush so a unit stop cannot eat the line), then the
@@ -476,6 +555,7 @@ void ds4_tp_nhi_close(ds4_tp_nhi *t) {
         (void)ds4_gpu_pool_free_exported(t->rx_pool);
         t->rx_pool = NULL;
     }
+    if (t->mutex_ready) pthread_mutex_destroy(&t->mutex);
     free(t->device_path);
     free(t);
 }

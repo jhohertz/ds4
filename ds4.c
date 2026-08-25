@@ -58516,6 +58516,19 @@ static const void *ds4_engine_tp_nhi_rx_slot(void *ud, uint64_t seq) {
     return e && e->tp.nhi ? ds4_tp_nhi_rx_slot(e->tp.nhi, seq) : NULL;
 }
 
+static int ds4_engine_tp_nhi_acquire_tx(void *ud, uint64_t seq) {
+    ds4_engine *e = ud;
+    char err[256] = "";
+    const int ok = e && e->tp.nhi &&
+        ds4_tp_nhi_acquire_tx(e->tp.nhi, seq, err, sizeof(err));
+    if (!ok) {
+        fprintf(stderr, "ds4-tp: NHI TX acquire failed at seq %llu: %s\n",
+                (unsigned long long)seq, err[0] ? err : "transport closed");
+        if (e && e->tp.ctx) ds4_tp_mark_failed(e->tp.ctx);
+    }
+    return ok;
+}
+
 static int ds4_engine_tp_nhi_submit(void *ud, uint64_t seq) {
     ds4_engine *e = ud;
     char err[256] = "";
@@ -58707,6 +58720,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                              slots, (uint32_t)DS4_N_EMBD,
                              ds4_engine_tp_nhi_tx_slot,
                              ds4_engine_tp_nhi_rx_slot,
+                             ds4_engine_tp_nhi_acquire_tx,
                              ds4_engine_tp_nhi_submit,
                              ds4_engine_tp_nhi_consumed,
                              ds4_engine_tp_nhi_failed,

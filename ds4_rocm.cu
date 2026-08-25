@@ -500,6 +500,7 @@ static int32_t g_tp_session_batch_mode;
 
 static ds4_gpu_tp_nhi_tx_slot_fn g_tp_nhi_tx_slot_fn;
 static ds4_gpu_tp_nhi_rx_slot_fn g_tp_nhi_rx_slot_fn;
+static ds4_gpu_tp_nhi_seq_fn g_tp_nhi_acquire_tx_fn;
 static ds4_gpu_tp_nhi_seq_fn g_tp_nhi_submit_fn;
 static ds4_gpu_tp_nhi_seq_fn g_tp_nhi_consumed_fn;
 static ds4_gpu_tp_nhi_fail_fn g_tp_nhi_fail_fn;
@@ -600,8 +601,7 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
         const uint32_t state = g_tp_engine_state_host
             ? __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) : 1u;
         int submitted = 0;
-        if (ok && state == 0 &&
-            !__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE)) {
+        if (ok && state == 0) {
             submitted = g_tp_nhi_submit_fn &&
                         g_tp_nhi_submit_fn(g_tp_nhi_ud, req->seq);
             if (!submitted) ds4_rocm_tp_fail("NHI submit", req);
@@ -617,7 +617,6 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
             ds4_rocm_tp_fail("RX stamp timeout", req);
 
         if (submitted &&
-            !__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE) &&
             __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) == 0 &&
             (!g_tp_nhi_consumed_fn ||
              !g_tp_nhi_consumed_fn(g_tp_nhi_ud, req->seq))) {
@@ -653,12 +652,14 @@ extern "C" int ds4_gpu_tp_nhi_init(
         uint32_t n_embd,
         ds4_gpu_tp_nhi_tx_slot_fn tx_slot_fn,
         ds4_gpu_tp_nhi_rx_slot_fn rx_slot_fn,
+        ds4_gpu_tp_nhi_seq_fn acquire_tx_fn,
         ds4_gpu_tp_nhi_seq_fn submit_fn,
         ds4_gpu_tp_nhi_seq_fn consumed_fn,
         ds4_gpu_tp_nhi_fail_fn fail_fn,
         void *ud) {
     if (rank > 1 || !slab ||
-        !tx_slot_fn || !rx_slot_fn || !submit_fn || !consumed_fn ||
+        !tx_slot_fn || !rx_slot_fn || !acquire_tx_fn || !submit_fn ||
+        !consumed_fn ||
         n_slots == 0 || n_embd == 0 ||
         n_embd > DS4_ROCM_TP_PAYLOAD_FLOATS_MAX ||
         g_tp_engine_thread_running)
@@ -678,6 +679,7 @@ extern "C" int ds4_gpu_tp_nhi_init(
     g_tp_engine_seq = 0;
     g_tp_nhi_tx_slot_fn = tx_slot_fn;
     g_tp_nhi_rx_slot_fn = rx_slot_fn;
+    g_tp_nhi_acquire_tx_fn = acquire_tx_fn;
     g_tp_nhi_submit_fn = submit_fn;
     g_tp_nhi_consumed_fn = consumed_fn;
     g_tp_nhi_fail_fn = fail_fn;
@@ -721,21 +723,23 @@ extern "C" int ds4_gpu_tp_nhi_init(
 }
 
 extern "C" void ds4_gpu_tp_shutdown(void) {
+    if (g_tp_engine_thread_running) {
+        pthread_mutex_lock(&g_tp_engine_mutex);
+        /* Healthy shutdown rejects new gates but drains every queued
+         * submit/final-reader/repost.  A previously latched failure already
+         * set state=1, which is the only path that aborts RX spins. */
+        __atomic_store_n(&g_tp_engine_shutdown, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&g_tp_engine_cond);
+        pthread_mutex_unlock(&g_tp_engine_mutex);
+        pthread_join(g_tp_engine_thread, NULL);
+        g_tp_engine_thread_running = 0;
+        (void)hipDeviceSynchronize();
+    }
     if (g_tp_engine_state_host) {
         uint32_t expected = 0;
         (void)__atomic_compare_exchange_n(g_tp_engine_state_host, &expected,
                                           2u, 0, __ATOMIC_ACQ_REL,
                                           __ATOMIC_ACQUIRE);
-    }
-    if (g_tp_engine_thread_running) {
-        pthread_mutex_lock(&g_tp_engine_mutex);
-        __atomic_store_n(&g_tp_engine_shutdown, 1, __ATOMIC_RELEASE);
-        pthread_cond_broadcast(&g_tp_engine_cond);
-        pthread_mutex_unlock(&g_tp_engine_mutex);
-        /* The mapped state aborts any in-flight wait-copy. */
-        (void)hipDeviceSynchronize();
-        pthread_join(g_tp_engine_thread, NULL);
-        g_tp_engine_thread_running = 0;
     }
     for (uint32_t i = 0; i < DS4_ROCM_TP_QUEUE; i++) {
         if (g_tp_engine_requests[i].tx_ready)
@@ -750,6 +754,7 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
     g_tp_engine_slab = NULL;
     g_tp_nhi_tx_slot_fn = NULL;
     g_tp_nhi_rx_slot_fn = NULL;
+    g_tp_nhi_acquire_tx_fn = NULL;
     g_tp_nhi_submit_fn = NULL;
     g_tp_nhi_consumed_fn = NULL;
     g_tp_nhi_fail_fn = NULL;
@@ -762,7 +767,9 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
 }
 
 extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
-    if (!g_tp_engine_thread_running || gate >= 2u) return 0;
+    if (!g_tp_engine_thread_running ||
+        __atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE) ||
+        gate >= 2u) return 0;
     const uint32_t slot = layer * 2u + gate;
     if (slot >= g_tp_engine_slots ||
         __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) != 0)
@@ -794,6 +801,13 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     req->layer = layer;
     req->gate = gate;
     req->seq = g_tp_engine_seq++;
+    if (!g_tp_nhi_acquire_tx_fn(g_tp_nhi_ud, req->seq)) {
+        pthread_mutex_lock(&g_tp_engine_mutex);
+        req->in_use = 0;
+        pthread_mutex_unlock(&g_tp_engine_mutex);
+        ds4_rocm_tp_fail("NHI TX slot acquire", req);
+        return 0;
+    }
     void *tx_slot = g_tp_nhi_tx_slot_fn(g_tp_nhi_ud, req->seq);
     const void *rx_slot = g_tp_nhi_rx_slot_fn(g_tp_nhi_ud, req->seq);
     const uint64_t vec_bytes =
