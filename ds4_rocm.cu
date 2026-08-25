@@ -969,6 +969,19 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 kslice launch");
 }
 
+extern "C" int ds4_gpu_matmul_quant_kslice_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t weight_type,
+        uint64_t full_in_dim, uint64_t k_off, uint64_t k_cnt,
+        uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t x_elem_off) {
+    /* The Stage-3 ROCm surface currently supports only the Q8_0 shared
+     * expert down projection. Keep every other dense type fail-closed. */
+    if (weight_type != 8u) return 0;
+    return ds4_gpu_matmul_q8_0_kslice_tensor(
+        out, model_map, model_size, weight_offset,
+        full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off);
+}
+
 extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map,
         uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,

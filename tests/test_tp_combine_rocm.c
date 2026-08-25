@@ -187,12 +187,12 @@ static int test_shared_slice(void) {
          ds4_gpu_matmul_q8_0_tensor(out_full_t, model, model_bytes,
                                     down_off, SHARED, N_EMBD,
                                     mid_full_t, 1) &&
-         ds4_gpu_matmul_q8_0_kslice_tensor(out0_t, model, model_bytes,
-                                           down_off, SHARED, 0, HALF,
-                                           N_EMBD, mid0_t, 0) &&
-         ds4_gpu_matmul_q8_0_kslice_tensor(out1_t, model, model_bytes,
-                                           down_off, SHARED, HALF, HALF,
-                                           N_EMBD, mid1_t, 0) &&
+         ds4_gpu_matmul_quant_kslice_tensor(out0_t, model, model_bytes,
+                                             down_off, 8u, SHARED, 0, HALF,
+                                             N_EMBD, mid0_t, 0) &&
+         ds4_gpu_matmul_quant_kslice_tensor(out1_t, model, model_bytes,
+                                             down_off, 8u, SHARED, HALF, HALF,
+                                             N_EMBD, mid1_t, 0) &&
          ds4_gpu_add_tensor(out_sum_t, out0_t, out1_t, N_EMBD) &&
          ds4_gpu_tensor_read(mid_full_t, 0, mid_full,
                              SHARED * sizeof(float)) &&
@@ -202,6 +202,11 @@ static int test_shared_slice(void) {
                              N_EMBD * sizeof(float)) &&
          ds4_gpu_tensor_read(out_sum_t, 0, out_sum,
                              N_EMBD * sizeof(float));
+    if (ok && ds4_gpu_matmul_quant_kslice_tensor(
+            out0_t, model, model_bytes, down_off, 39u,
+            SHARED, 0, HALF, N_EMBD, mid0_t, 0)) {
+        ok = 0; /* Unsupported typed dispatch must remain fail-closed. */
+    }
     if (ok) {
         ok = memcmp(mid_full, mid0, HALF * sizeof(float)) == 0 &&
              memcmp(mid_full + HALF, mid1, HALF * sizeof(float)) == 0;
