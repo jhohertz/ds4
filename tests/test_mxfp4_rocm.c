@@ -735,6 +735,85 @@ int main(void) {
         free(rank1);
         if (!tp_ok) ok = 0;
     }
+    /* Engine TP caches only this rank's contiguous expert-table half.  The
+     * decode launcher must resolve that local span rather than demanding the
+     * full 256-expert range before its ownership predicates run. */
+    if (ok) {
+        float *shard_full = (float *)malloc(MODEL_DIM * sizeof(float));
+        float *shard_parts =
+            (float *)malloc(2u * MODEL_DIM * sizeof(float));
+        int shard_cache_ok = shard_full && shard_parts &&
+            run_case(1u, model, model_size,
+                     gate_offset, up_offset, down_offset,
+                     gate_expert_bytes, gate_row_bytes,
+                     down_expert_bytes, down_row_bytes,
+                     patterns, 0u, shard_full, NULL);
+        tp_partial_mode = 1;
+        for (uint32_t rank = 0; rank < 2u && shard_cache_ok; rank++) {
+            if (initialized) {
+                ds4_gpu_cleanup();
+                initialized = 0;
+            }
+            ds4_gpu_model_residency_skip(1);
+            shard_cache_ok = ds4_gpu_init();
+            initialized = shard_cache_ok;
+            if (!shard_cache_ok) break;
+            ds4_gpu_set_quality(false);
+            /* Strict cached-range mode: streaming refuses any uncached full
+             * table fallback, so this isolates rank-local resolver behavior. */
+            ds4_gpu_set_ssd_streaming(true);
+            const uint32_t local_experts = N_TOTAL_EXPERT / 2u;
+            const uint64_t local_gate_bytes =
+                (uint64_t)local_experts * gate_expert_bytes;
+            const uint64_t local_down_bytes =
+                (uint64_t)local_experts * down_expert_bytes;
+            const uint64_t shard_offsets[3] = {
+                gate_offset + (uint64_t)rank * local_gate_bytes,
+                up_offset + (uint64_t)rank * local_gate_bytes,
+                down_offset + (uint64_t)rank * local_down_bytes,
+            };
+            const uint64_t shard_sizes[3] = {
+                local_gate_bytes, local_gate_bytes, local_down_bytes,
+            };
+            shard_cache_ok =
+                ds4_gpu_set_model_map(model, model_size) &&
+                ds4_gpu_set_model_fd_for_map(fileno(model_file), model) &&
+                ds4_gpu_set_model_map_spans(
+                    model, model_size, shard_offsets, shard_sizes, 3,
+                    local_gate_bytes > local_down_bytes ?
+                        local_gate_bytes : local_down_bytes);
+            ds4_gpu_tp_test_set_expert_shard((int)rank);
+            if (shard_cache_ok) {
+                shard_cache_ok = run_case(
+                    1u, model, model_size,
+                    gate_offset, up_offset, down_offset,
+                    gate_expert_bytes, gate_row_bytes,
+                    down_expert_bytes, down_row_bytes,
+                    patterns, 0u,
+                    shard_parts + (uint64_t)rank * MODEL_DIM, NULL);
+            }
+            ds4_gpu_tp_test_set_expert_shard(-1);
+        }
+        tp_partial_mode = 0;
+        ds4_gpu_set_ssd_streaming(false);
+        ds4_gpu_model_residency_skip(0);
+        for (uint32_t i = 0; shard_cache_ok && i < MODEL_DIM; i++) {
+            const float combined = shard_parts[i] + shard_parts[MODEL_DIM + i];
+            const float tol = 2.0e-4f + 1.0e-4f * fabsf(shard_full[i]);
+            if (fabsf(combined - shard_full[i]) > tol) {
+                fprintf(stderr,
+                        "MXFP4 cached-shard mismatch i=%u full=%g combined=%g\n",
+                        i, shard_full[i], combined);
+                shard_cache_ok = 0;
+            }
+        }
+        fprintf(stderr,
+                "MXFP4 ROCm rank-local cached expert halves: %s\n",
+                shard_cache_ok ? "OK" : "FAILED");
+        free(shard_parts);
+        free(shard_full);
+        if (!shard_cache_ok) ok = 0;
+    }
     free(snap128);
     free(snap512);
 

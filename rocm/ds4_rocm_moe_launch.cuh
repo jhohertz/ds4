@@ -583,6 +583,60 @@ static int routed_moe_launch(
     const char *gate_w = NULL;
     const char *up_w = NULL;
     const char *down_w = NULL;
+    uint32_t weight_first = 0;
+    int owned_shard_cached = 0;
+    const int owned_shard_requested =
+        owned_first != 0 || owned_count != n_total_expert;
+    /* Resident engine TP caches one contiguous expert-table half, not a
+     * synthetic full-table image. Resolve that exact range and let the
+     * ownership-aware MXFP4 kernels translate global expert IDs to local
+     * weight rows. This must precede streaming/compact-selected fallbacks:
+     * the rank-local spans are already the authoritative resident source. */
+    if (owned_shard_requested && mxfp4_path && n_tokens == 1u) {
+        uint64_t local_gate_bytes = 0, local_down_bytes = 0;
+        uint64_t gate_delta = 0, down_delta = 0;
+        uint64_t local_gate_offset = 0, local_up_offset = 0;
+        uint64_t local_down_offset = 0;
+        if (!cuda_u64_mul_checked(owned_count, gate_expert_bytes,
+                                  &local_gate_bytes) ||
+            !cuda_u64_mul_checked(owned_count, down_expert_bytes,
+                                  &local_down_bytes) ||
+            !cuda_u64_mul_checked(owned_first, gate_expert_bytes,
+                                  &gate_delta) ||
+            !cuda_u64_mul_checked(owned_first, down_expert_bytes,
+                                  &down_delta) ||
+            !routed_moe_u64_add_checked(gate_offset, gate_delta,
+                                        &local_gate_offset) ||
+            !routed_moe_u64_add_checked(up_offset, gate_delta,
+                                        &local_up_offset) ||
+            !routed_moe_u64_add_checked(down_offset, down_delta,
+                                        &local_down_offset)) {
+            return 0;
+        }
+        if (cuda_model_range_is_cached(model_map, local_gate_offset,
+                                       local_gate_bytes) &&
+            cuda_model_range_is_cached(model_map, local_up_offset,
+                                       local_gate_bytes) &&
+            cuda_model_range_is_cached(model_map, local_down_offset,
+                                       local_down_bytes)) {
+            gate_w = cuda_model_range_ptr(model_map, local_gate_offset,
+                                          local_gate_bytes, "moe_gate_shard");
+            up_w = cuda_model_range_ptr(model_map, local_up_offset,
+                                        local_gate_bytes, "moe_up_shard");
+            down_w = cuda_model_range_ptr(model_map, local_down_offset,
+                                          local_down_bytes, "moe_down_shard");
+            if (!gate_w || !up_w || !down_w) return 0;
+            weight_first = owned_first;
+            owned_shard_cached = 1;
+        }
+    }
+    if (owned_shard_requested && !owned_shard_cached) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "TP routed MoE expert shard is not fully "
+                "resident (layer=%u first=%u count=%u)\n",
+                layer_index, owned_first, owned_count);
+        return 0;
+    }
     const char **gate_slot_ptrs = NULL;
     const char **up_slot_ptrs = NULL;
     const char **down_slot_ptrs = NULL;
@@ -597,6 +651,7 @@ static int routed_moe_launch(
     uint32_t stream_batch_resident_count = 0;
     uint32_t stream_batch_missing_count = 0;
     const int stream_full_layer =
+        !owned_shard_cached &&
         (n_tokens > 1u || force_resident) &&
         cuda_stream_layer_expert_cache_apply(model_map,
                                              layer_index,
@@ -610,6 +665,7 @@ static int routed_moe_launch(
                                              &up_w,
                                              &down_w);
     const int full_table_cached =
+        !owned_shard_cached &&
         !stream_full_layer &&
         routed_moe_full_table_is_cached(model_map,
                                         gate_offset,
@@ -618,6 +674,7 @@ static int routed_moe_launch(
                                         gate_bytes,
                                         down_bytes);
     const int batch_stream_split_selected =
+        !owned_shard_cached &&
         !stream_full_layer &&
         !full_table_cached &&
         n_tokens > 1u &&
@@ -644,6 +701,7 @@ static int routed_moe_launch(
                                                &stream_batch_missing_count,
                                                &stream_batch_unique);
     const int batch_stream_selected =
+        !owned_shard_cached &&
         !stream_full_layer &&
         !full_table_cached &&
         !batch_stream_split_selected &&
@@ -668,6 +726,7 @@ static int routed_moe_launch(
                                            &down_slot_ptrs,
                                            &stream_batch_unique);
     const int split_selected =
+        !owned_shard_cached &&
         !stream_full_layer &&
         n_tokens == 1u &&
         getenv("DS4_ROCM_DISABLE_STREAMING_SPLIT_SELECTED") == NULL &&
@@ -688,7 +747,8 @@ static int routed_moe_launch(
                                          &stream_missing_mask);
     const int compact_selected =
         split_selected ||
-        (!stream_full_layer &&
+        (!owned_shard_cached &&
+        !stream_full_layer &&
         n_tokens == 1u &&
         cuda_stream_selected_apply(model_map,
                                    layer_index,
@@ -700,7 +760,8 @@ static int routed_moe_launch(
                                    &gate_w,
                                    &up_w,
                                    &down_w));
-    if (!compact_selected && !batch_stream_selected && !batch_stream_split_selected) {
+    if (!owned_shard_cached && !compact_selected &&
+        !batch_stream_selected && !batch_stream_split_selected) {
         if (g_ssd_streaming_mode &&
             n_total_expert > n_expert &&
             !stream_full_layer &&
@@ -1537,6 +1598,7 @@ static int routed_moe_launch(
                         xq_blocks,
                         expert_mid_dim,
                         n_expert,
+                        weight_first,
                         owned_first,
                         owned_count,
                         write_gate_up,
@@ -1755,6 +1817,7 @@ static int routed_moe_launch(
                             midq_blocks,
                             out_dim,
                             n_expert,
+                            weight_first,
                             owned_first,
                             owned_count);
                     } else {
@@ -1768,6 +1831,7 @@ static int routed_moe_launch(
                             midq_blocks,
                             out_dim,
                             n_expert,
+                            weight_first,
                             owned_first,
                             owned_count);
                     }

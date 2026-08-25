@@ -29,12 +29,214 @@ static void check(int ok, const char *what) {
     }
 }
 
+static int test_hc_expand_add(void) {
+    enum { N_EMBD = 4096, N_HC = 4, HC_VALUES = N_EMBD * N_HC };
+    float *a = (float *)malloc(N_EMBD * sizeof(float));
+    float *b = (float *)malloc(N_EMBD * sizeof(float));
+    float *residual = (float *)malloc(HC_VALUES * sizeof(float));
+    float *got = (float *)malloc(HC_VALUES * sizeof(float));
+    float *ref = (float *)malloc(HC_VALUES * sizeof(float));
+    const float post[N_HC] = {1.0f, 0.5f, -1.0f, 0.25f};
+    float comb[N_HC * N_HC] = {0};
+    ds4_gpu_tensor *a_t = NULL, *b_t = NULL, *sum_t = NULL;
+    ds4_gpu_tensor *residual_t = NULL, *post_t = NULL, *comb_t = NULL;
+    ds4_gpu_tensor *got_t = NULL, *ref_t = NULL;
+    int ok = a && b && residual && got && ref;
+    for (uint32_t h = 0; ok && h < N_HC; h++) comb[h * N_HC + h] = 1.0f;
+    for (uint32_t d = 0; ok && d < N_EMBD; d++) {
+        a[d] = (float)((int)(d % 7u) - 3);
+        b[d] = (float)((int)(d % 5u) - 2);
+        for (uint32_t h = 0; h < N_HC; h++)
+            residual[(uint64_t)h * N_EMBD + d] =
+                (float)((int)((d + h * 3u) % 11u) - 5);
+    }
+    if (ok) a_t = ds4_gpu_tensor_alloc(N_EMBD * sizeof(float));
+    if (ok) b_t = ds4_gpu_tensor_alloc(N_EMBD * sizeof(float));
+    if (ok) sum_t = ds4_gpu_tensor_alloc(N_EMBD * sizeof(float));
+    if (ok) residual_t = ds4_gpu_tensor_alloc(HC_VALUES * sizeof(float));
+    if (ok) post_t = ds4_gpu_tensor_alloc(sizeof(post));
+    if (ok) comb_t = ds4_gpu_tensor_alloc(sizeof(comb));
+    if (ok) got_t = ds4_gpu_tensor_alloc(HC_VALUES * sizeof(float));
+    if (ok) ref_t = ds4_gpu_tensor_alloc(HC_VALUES * sizeof(float));
+    ok = ok && a_t && b_t && sum_t && residual_t && post_t && comb_t &&
+         got_t && ref_t &&
+         ds4_gpu_tensor_write(a_t, 0, a, N_EMBD * sizeof(float)) &&
+         ds4_gpu_tensor_write(b_t, 0, b, N_EMBD * sizeof(float)) &&
+         ds4_gpu_tensor_write(residual_t, 0, residual,
+                              HC_VALUES * sizeof(float)) &&
+         ds4_gpu_tensor_write(post_t, 0, post, sizeof(post)) &&
+         ds4_gpu_tensor_write(comb_t, 0, comb, sizeof(comb)) &&
+         ds4_gpu_hc_expand_add_tensor(got_t, a_t, b_t, residual_t,
+                                      post_t, comb_t, N_EMBD, N_HC) &&
+         ds4_gpu_add_tensor(sum_t, a_t, b_t, N_EMBD) &&
+         ds4_gpu_hc_expand_tensor(ref_t, sum_t, residual_t,
+                                  post_t, comb_t, N_EMBD, N_HC) &&
+         ds4_gpu_tensor_read(got_t, 0, got, HC_VALUES * sizeof(float)) &&
+         ds4_gpu_tensor_read(ref_t, 0, ref, HC_VALUES * sizeof(float));
+    if (ok) ok = memcmp(got, ref, HC_VALUES * sizeof(float)) == 0;
+
+    ds4_gpu_tensor_free(ref_t);
+    ds4_gpu_tensor_free(got_t);
+    ds4_gpu_tensor_free(comb_t);
+    ds4_gpu_tensor_free(post_t);
+    ds4_gpu_tensor_free(residual_t);
+    ds4_gpu_tensor_free(sum_t);
+    ds4_gpu_tensor_free(b_t);
+    ds4_gpu_tensor_free(a_t);
+    free(ref);
+    free(got);
+    free(residual);
+    free(b);
+    free(a);
+    return ok;
+}
+
 static void fill_q8_block(unsigned char *block, uint32_t seed) {
     block[0] = 0x00u;
     block[1] = 0x3cu; /* IEEE fp16 1.0 */
     int8_t *q = (int8_t *)(block + 2u);
     for (uint32_t i = 0; i < 32u; i++)
         q[i] = (int8_t)((int)((seed + i * 3u) % 7u) - 3);
+}
+
+/* Exercise the exact Flash shared-expert geometry used between the ATTN and
+ * FFN gates: each rank writes a compact 1024-lane gate/up/SwiGLU half, then
+ * expands the matching K slice of the 2048x4096 Q8 down projection. */
+static int test_shared_slice(void) {
+    enum { N_EMBD = 4096, SHARED = 2048, HALF = 1024 };
+    const uint64_t gu_row = (N_EMBD / 32u) * 34u;
+    const uint64_t down_row = (SHARED / 32u) * 34u;
+    const uint64_t gate_bytes = (uint64_t)SHARED * gu_row;
+    const uint64_t up_off = (gate_bytes + 4095u) & ~4095ull;
+    const uint64_t up_bytes = gate_bytes;
+    const uint64_t down_off = (up_off + up_bytes + 4095u) & ~4095ull;
+    const uint64_t down_bytes = (uint64_t)N_EMBD * down_row;
+    const uint64_t model_bytes = (down_off + down_bytes + 4095u) & ~4095ull;
+    unsigned char *model = (unsigned char *)malloc((size_t)model_bytes);
+    FILE *model_file = NULL;
+    float *x = (float *)malloc(N_EMBD * sizeof(float));
+    float *mid_full = (float *)malloc(SHARED * sizeof(float));
+    float *mid0 = (float *)malloc(HALF * sizeof(float));
+    float *mid1 = (float *)malloc(HALF * sizeof(float));
+    float *out_full = (float *)malloc(N_EMBD * sizeof(float));
+    float *out_sum = (float *)malloc(N_EMBD * sizeof(float));
+    ds4_gpu_tensor *x_t = NULL;
+    ds4_gpu_tensor *gate_full_t = NULL, *up_full_t = NULL, *mid_full_t = NULL;
+    ds4_gpu_tensor *gate0_t = NULL, *up0_t = NULL, *mid0_t = NULL;
+    ds4_gpu_tensor *gate1_t = NULL, *up1_t = NULL, *mid1_t = NULL;
+    ds4_gpu_tensor *out_full_t = NULL, *out0_t = NULL, *out1_t = NULL;
+    ds4_gpu_tensor *out_sum_t = NULL;
+    int ok = model && x && mid_full && mid0 && mid1 && out_full && out_sum;
+    if (!ok) goto done;
+    memset(model, 0, (size_t)model_bytes);
+    const struct { uint64_t off, bytes; uint32_t seed; } ranges[3] = {
+        {0, gate_bytes, 17u}, {up_off, up_bytes, 101u},
+        {down_off, down_bytes, 211u},
+    };
+    for (uint32_t r = 0; r < 3; r++) {
+        for (uint64_t off = 0, block = 0; off < ranges[r].bytes;
+             off += 34u, block++) {
+            unsigned char *q = model + ranges[r].off + off;
+            fill_q8_block(q, ranges[r].seed + (uint32_t)(block * 7u));
+            q[0] = 0x00u;
+            q[1] = 0x24u; /* fp16 1/64 */
+        }
+    }
+    for (uint32_t i = 0; i < N_EMBD; i++)
+        x[i] = (float)((int)(i % 17u) - 8) * (1.0f / 32.0f);
+
+    model_file = tmpfile();
+    const uint64_t offsets[3] = {0, up_off, down_off};
+    const uint64_t sizes[3] = {gate_bytes, up_bytes, down_bytes};
+    ok = model_file != NULL &&
+         fwrite(model, 1, (size_t)model_bytes, model_file) == model_bytes &&
+         fflush(model_file) == 0 &&
+         ds4_gpu_set_model_map(model, model_bytes) &&
+         ds4_gpu_set_model_fd_for_map(fileno(model_file), model) &&
+         ds4_gpu_set_model_map_spans(model, model_bytes, offsets, sizes, 3,
+                                     down_bytes);
+    if (ok) x_t = ds4_gpu_tensor_alloc(N_EMBD * sizeof(float));
+    if (ok) gate_full_t = ds4_gpu_tensor_alloc(SHARED * sizeof(float));
+    if (ok) up_full_t = ds4_gpu_tensor_alloc(SHARED * sizeof(float));
+    if (ok) mid_full_t = ds4_gpu_tensor_alloc(SHARED * sizeof(float));
+    if (ok) gate0_t = ds4_gpu_tensor_alloc(SHARED * sizeof(float));
+    if (ok) up0_t = ds4_gpu_tensor_alloc(SHARED * sizeof(float));
+    if (ok) mid0_t = ds4_gpu_tensor_alloc(SHARED * sizeof(float));
+    if (ok) gate1_t = ds4_gpu_tensor_alloc(SHARED * sizeof(float));
+    if (ok) up1_t = ds4_gpu_tensor_alloc(SHARED * sizeof(float));
+    if (ok) mid1_t = ds4_gpu_tensor_alloc(SHARED * sizeof(float));
+    if (ok) out_full_t = ds4_gpu_tensor_alloc(N_EMBD * sizeof(float));
+    if (ok) out0_t = ds4_gpu_tensor_alloc(N_EMBD * sizeof(float));
+    if (ok) out1_t = ds4_gpu_tensor_alloc(N_EMBD * sizeof(float));
+    if (ok) out_sum_t = ds4_gpu_tensor_alloc(N_EMBD * sizeof(float));
+    ok = ok && x_t && gate_full_t && up_full_t && mid_full_t &&
+         gate0_t && up0_t && mid0_t && gate1_t && up1_t && mid1_t &&
+         out_full_t && out0_t && out1_t && out_sum_t &&
+         ds4_gpu_tensor_write(x_t, 0, x, N_EMBD * sizeof(float)) &&
+         ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+             gate_full_t, up_full_t, mid_full_t, model, model_bytes,
+             0, up_off, N_EMBD, SHARED, x_t, 10.0f) &&
+         ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+             gate0_t, up0_t, mid0_t, model, model_bytes,
+             0, up_off, N_EMBD, HALF, x_t, 10.0f) &&
+         ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+             gate1_t, up1_t, mid1_t, model, model_bytes,
+             (uint64_t)HALF * gu_row,
+             up_off + (uint64_t)HALF * gu_row,
+             N_EMBD, HALF, x_t, 10.0f) &&
+         ds4_gpu_matmul_q8_0_tensor(out_full_t, model, model_bytes,
+                                    down_off, SHARED, N_EMBD,
+                                    mid_full_t, 1) &&
+         ds4_gpu_matmul_q8_0_kslice_tensor(out0_t, model, model_bytes,
+                                           down_off, SHARED, 0, HALF,
+                                           N_EMBD, mid0_t, 0) &&
+         ds4_gpu_matmul_q8_0_kslice_tensor(out1_t, model, model_bytes,
+                                           down_off, SHARED, HALF, HALF,
+                                           N_EMBD, mid1_t, 0) &&
+         ds4_gpu_add_tensor(out_sum_t, out0_t, out1_t, N_EMBD) &&
+         ds4_gpu_tensor_read(mid_full_t, 0, mid_full,
+                             SHARED * sizeof(float)) &&
+         ds4_gpu_tensor_read(mid0_t, 0, mid0, HALF * sizeof(float)) &&
+         ds4_gpu_tensor_read(mid1_t, 0, mid1, HALF * sizeof(float)) &&
+         ds4_gpu_tensor_read(out_full_t, 0, out_full,
+                             N_EMBD * sizeof(float)) &&
+         ds4_gpu_tensor_read(out_sum_t, 0, out_sum,
+                             N_EMBD * sizeof(float));
+    if (ok) {
+        ok = memcmp(mid_full, mid0, HALF * sizeof(float)) == 0 &&
+             memcmp(mid_full + HALF, mid1, HALF * sizeof(float)) == 0;
+    }
+    for (uint32_t i = 0; ok && i < N_EMBD; i++) {
+        const float d = out_full[i] - out_sum[i];
+        const float ad = d < 0.0f ? -d : d;
+        const float av = out_full[i] < 0.0f ? -out_full[i] : out_full[i];
+        if (ad > 1.0e-3f * (1.0f + av)) ok = 0;
+    }
+
+done:
+    ds4_gpu_tensor_free(out_sum_t);
+    ds4_gpu_tensor_free(out1_t);
+    ds4_gpu_tensor_free(out0_t);
+    ds4_gpu_tensor_free(out_full_t);
+    ds4_gpu_tensor_free(mid1_t);
+    ds4_gpu_tensor_free(up1_t);
+    ds4_gpu_tensor_free(gate1_t);
+    ds4_gpu_tensor_free(mid0_t);
+    ds4_gpu_tensor_free(up0_t);
+    ds4_gpu_tensor_free(gate0_t);
+    ds4_gpu_tensor_free(mid_full_t);
+    ds4_gpu_tensor_free(up_full_t);
+    ds4_gpu_tensor_free(gate_full_t);
+    ds4_gpu_tensor_free(x_t);
+    if (model_file) fclose(model_file);
+    free(out_sum);
+    free(out_full);
+    free(mid1);
+    free(mid0);
+    free(mid_full);
+    free(x);
+    free(model);
+    return ok;
 }
 
 /* Rank 1's output groups are compact at heads[0], even though their A/B
@@ -115,6 +317,7 @@ static int test_attention_slice(void) {
 
 int main(void) {
     srand(20260825);
+    setenv("DS4_ROCM_DSV4_PREQUANT_DECODE", "0", 1);
     if (!ds4_gpu_init()) {
         fprintf(stderr, "test_tp_combine_rocm: no ROCm device available\n");
         return 1;
@@ -139,6 +342,12 @@ int main(void) {
      * arriving by copy engine while the wave spins. */
     check(ds4_gpu_tp_test_spin_exchange(1, 1, 7168, 8),
           "spin-combine host-stamp uncached pool");
+
+    check(test_hc_expand_add(),
+          "TP folded HC expand-add matches explicit combine");
+
+    check(test_shared_slice(),
+          "Flash shared-expert halves recombine");
 
     check(test_attention_slice(),
           "rank1 compact-head Q8 attention/K-slice");
