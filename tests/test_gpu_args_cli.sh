@@ -245,6 +245,35 @@ if [ -x ./ds4 ]; then
     fi
 fi
 
+# 8: the singleton lock must never follow or truncate a pathname-selected
+# target. Both probes fail before model loading and preserve the sentinel.
+if [ -x ./ds4 ]; then
+    LOCK_DIR=$(mktemp -d)
+    LOCK_TARGET="$LOCK_DIR/target"
+    LOCK_PATH="$LOCK_DIR/ds4.lock"
+    printf 'lock-sentinel\n' > "$LOCK_TARGET"
+
+    ln -s "$LOCK_TARGET" "$LOCK_PATH"
+    DS4_LOCK_FILE="$LOCK_PATH" ./ds4 -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && [ "$(cat "$LOCK_TARGET")" = "lock-sentinel" ]; then
+        ok "ds4 lock rejects a symlink without truncating its target"
+    else
+        fail "ds4 lock followed or modified a symlink target"
+    fi
+
+    rm -f "$LOCK_PATH"
+    ln "$LOCK_TARGET" "$LOCK_PATH"
+    DS4_LOCK_FILE="$LOCK_PATH" ./ds4 -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && [ "$(cat "$LOCK_TARGET")" = "lock-sentinel" ]; then
+        ok "ds4 lock rejects a multiply-linked file without truncation"
+    else
+        fail "ds4 lock accepted or modified a multiply-linked file"
+    fi
+    rm -rf "$LOCK_DIR"
+fi
+
 rm -f "$LOG"
 
 echo ""

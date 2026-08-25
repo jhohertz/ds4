@@ -49434,18 +49434,53 @@ static void ds4_release_instance_lock(void) {
     }
 }
 
-/* Open an existing lock without O_CREAT first.  Linux protected_regular can
- * reject O_CREAT in sticky /tmp when an otherwise-accessible lock belongs to
- * another uid (for example a root diagnostic run after the normal service).
- * Retrying an O_EXCL creation only after ENOENT preserves the single inode and
- * therefore the global flock across service/diagnostic uid transitions. */
+/* Root diagnostics launched through sudo may intentionally reuse the normal
+ * service user's lock. Other cross-uid files are rejected: accepting them in
+ * sticky /tmp would let an unrelated user choose or replace the lock inode. */
+static int ds4_instance_lock_owner_allowed(uid_t owner) {
+    const uid_t euid = geteuid();
+    if (owner == euid) return 1;
+    if (euid != 0) return 0;
+
+    const char *text = getenv("SUDO_UID");
+    if (!text || !text[0]) return 0;
+    errno = 0;
+    char *end = NULL;
+    const unsigned long value = strtoul(text, &end, 10);
+    const uid_t sudo_uid = (uid_t)value;
+    return errno == 0 && end != text && *end == '\0' &&
+           (unsigned long)sudo_uid == value && owner == sudo_uid;
+}
+
+static int ds4_instance_lock_stat_safe(const struct stat *st) {
+    if (!S_ISREG(st->st_mode)) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (st->st_nlink != 1) {
+        errno = EMLINK;
+        return 0;
+    }
+    if ((st->st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        !ds4_instance_lock_owner_allowed(st->st_uid)) {
+        errno = EACCES;
+        return 0;
+    }
+    return 1;
+}
+
+/* Open an existing lock without O_CREAT first. Linux protected_regular can
+ * reject O_CREAT in sticky /tmp when a safe lock belongs to the sudo caller.
+ * O_NOFOLLOW plus the post-flock inode check ensure ftruncate never follows a
+ * pathname-selected symlink or a pre-open replacement. */
 static int ds4_open_instance_lock(const char *path) {
+    const int flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC;
     for (unsigned attempt = 0; attempt < 4; attempt++) {
-        int fd = open(path, O_RDWR);
+        int fd = open(path, flags);
         if (fd >= 0) return fd;
         if (errno != ENOENT) return -1;
 
-        fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+        fd = open(path, flags | O_CREAT | O_EXCL, 0600);
         if (fd >= 0) return fd;
         if (errno != EEXIST) return -1;
     }
@@ -49464,7 +49499,13 @@ static void ds4_acquire_instance_lock(void) {
         fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(errno));
         exit(2);
     }
-    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    struct stat fd_st;
+    if (fstat(fd, &fd_st) != 0 || !ds4_instance_lock_stat_safe(&fd_st)) {
+        const int saved = errno;
+        fprintf(stderr, "ds4: unsafe lock file %s: %s\n", path, strerror(saved));
+        close(fd);
+        exit(2);
+    }
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {
@@ -49489,6 +49530,19 @@ static void ds4_acquire_instance_lock(void) {
         exit(2);
     }
 
+    struct stat path_st;
+    errno = 0;
+    if (fstat(fd, &fd_st) != 0 || !ds4_instance_lock_stat_safe(&fd_st) ||
+        fstatat(AT_FDCWD, path, &path_st, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(path_st.st_mode) || path_st.st_dev != fd_st.st_dev ||
+        path_st.st_ino != fd_st.st_ino) {
+        int saved = errno;
+        if (saved == 0) saved = ESTALE;
+        fprintf(stderr, "ds4: lock file changed while opening %s: %s\n",
+                path, strerror(saved));
+        close(fd);
+        exit(2);
+    }
     if (ftruncate(fd, 0) != 0) {
         fprintf(stderr, "ds4: failed to truncate lock file %s: %s\n", path, strerror(errno));
         close(fd);

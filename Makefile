@@ -212,7 +212,7 @@ rocm: strix-halo
 test-rocm:
 	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-		ds4 ds4-server ds4-bench ds4-agent \
+		tests/test_tp_combine_rocm ds4 ds4-server ds4-bench ds4-agent \
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
 		TEST_HOOK_GPU_OBJS="ds4_rocm.o" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
@@ -224,6 +224,7 @@ test-rocm:
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
+	./tests/test_tp_combine_rocm
 	DS4_TEST_ROCM=1 ./tests/test_gpu_args_cli.sh
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
