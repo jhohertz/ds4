@@ -217,8 +217,14 @@ static int test_shared_slice(void) {
     if (ok) {
         float max_abs = 0.0f;
         double sum_sq = 0.0;
+        uint32_t finite_count = 0;
         int parity_ok = 1;
         for (uint32_t i = 0; i < N_EMBD; i++) {
+            if (!isfinite(out_full[i]) || !isfinite(out_sum[i])) {
+                parity_ok = 0;
+                continue;
+            }
+            finite_count++;
             const float d = out_full[i] - out_sum[i];
             const float ad = d < 0.0f ? -d : d;
             const float av = out_full[i] < 0.0f ? -out_full[i] : out_full[i];
@@ -226,10 +232,15 @@ static int test_shared_slice(void) {
             sum_sq += (double)d * d;
             if (ad > 1.0e-3f * (1.0f + av)) parity_ok = 0;
         }
+        const char *prequant = getenv("DS4_TEST_TP_PREQUANT");
         fprintf(stderr,
-                "ROCm TP shared-half parity max_abs=%g rmse=%g prequant=%s\n",
-                max_abs, sqrt(sum_sq / N_EMBD),
-                getenv("DS4_TEST_TP_PREQUANT") ? "on" : "off");
+                "ROCm TP shared-half parity max_abs=%g rmse=%g "
+                "finite=%u/%u prequant=%s\n",
+                max_abs,
+                finite_count ? sqrt(sum_sq / finite_count) : INFINITY,
+                finite_count, (uint32_t)N_EMBD,
+                prequant && prequant[0] && strcmp(prequant, "0") != 0 ?
+                    "on" : "off");
         ok = parity_ok;
     }
 
