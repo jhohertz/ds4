@@ -49434,13 +49434,32 @@ static void ds4_release_instance_lock(void) {
     }
 }
 
+/* Open an existing lock without O_CREAT first.  Linux protected_regular can
+ * reject O_CREAT in sticky /tmp when an otherwise-accessible lock belongs to
+ * another uid (for example a root diagnostic run after the normal service).
+ * Retrying an O_EXCL creation only after ENOENT preserves the single inode and
+ * therefore the global flock across service/diagnostic uid transitions. */
+static int ds4_open_instance_lock(const char *path) {
+    for (unsigned attempt = 0; attempt < 4; attempt++) {
+        int fd = open(path, O_RDWR);
+        if (fd >= 0) return fd;
+        if (errno != ENOENT) return -1;
+
+        fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) return fd;
+        if (errno != EEXIST) return -1;
+    }
+    errno = EAGAIN;
+    return -1;
+}
+
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
  * stale accidental second run is more dangerous than a normal CLI error. */
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
     if (!path || !path[0]) path = "/tmp/ds4.lock";
 
-    const int fd = open(path, O_RDWR | O_CREAT, 0600);
+    const int fd = ds4_open_instance_lock(path);
     if (fd < 0) {
         fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(errno));
         exit(2);
