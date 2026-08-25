@@ -78,6 +78,8 @@ next sections.
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
   guide for contributors. **Read this before sending a pull request**.
+- [DEBUGGING.md](DEBUGGING.md): GPU graph dump hooks and deferred one-token
+  layer-state capture.
 - [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md): the complete release test
   matrix, including the remote Metal, CUDA, and ROCm machines.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,

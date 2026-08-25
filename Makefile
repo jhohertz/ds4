@@ -78,7 +78,7 @@ TEST_HOOK_LINK = $(DS4_LINK)
 TEST_HOOK_LDLIBS = $(DS4_LINK_LIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-rocm-qkv-fusion test-q8-krow-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-rocm-qkv-fusion test-q8-krow-rocm test-tp-combine-rocm test-graph-deferred-dump-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -212,7 +212,8 @@ rocm: strix-halo
 test-rocm:
 	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-		tests/test_tp_combine_rocm ds4 ds4-server ds4-bench ds4-agent \
+		tests/test_tp_combine_rocm tests/test_graph_deferred_dump_rocm \
+		ds4 ds4-server ds4-bench ds4-agent \
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
 		TEST_HOOK_GPU_OBJS="ds4_rocm.o" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
@@ -226,6 +227,7 @@ test-rocm:
 	./tests/test_gpu_args
 	./tests/test_tp_combine_rocm
 	DS4_TEST_TP_PREQUANT=1 ./tests/test_tp_combine_rocm
+	./tests/test_graph_deferred_dump_rocm
 	DS4_TEST_ROCM=1 ./tests/test_gpu_args_cli.sh
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
@@ -576,7 +578,7 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_tp_combine_rocm tests/test_rocm_qkv_fusion tests/test_q8_krow_rocm tests/bench_q8_krow_rocm tests/bench_mxfp4_rocm tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_tp_combine_rocm tests/test_graph_deferred_dump_rocm tests/test_rocm_qkv_fusion tests/test_q8_krow_rocm tests/bench_q8_krow_rocm tests/bench_mxfp4_rocm tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 
 tests/test_transport.o: tests/test_transport.c ds4_transport.h ds4_transport_internal.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -605,6 +607,24 @@ tests/test_tp_combine_rocm: tests/test_tp_combine_rocm.o ds4_rocm.o ds4_rocm_una
 test-tp-combine-rocm: tests/test_tp_combine_rocm
 	./tests/test_tp_combine_rocm
 	DS4_TEST_TP_PREQUANT=1 ./tests/test_tp_combine_rocm
+
+ds4_rocm_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) \
+		-DDS4_ROCM_BUILD -DDS4_TEST_HOOKS -Wno-unused-function -I. -c -o $@ ds4.c
+
+tests/test_graph_deferred_dump_rocm.o: tests/test_graph_deferred_dump_rocm.c ds4.h ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) \
+		-DDS4_ROCM_BUILD -DDS4_TEST_HOOKS -I. -c -o $@ $<
+
+tests/test_graph_deferred_dump_rocm: tests/test_graph_deferred_dump_rocm.o \
+		ds4_rocm_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o \
+		ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o \
+		ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o \
+		ds4_rocm_unavailable.o ds4_layer_pack.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-graph-deferred-dump-rocm: tests/test_graph_deferred_dump_rocm
+	./tests/test_graph_deferred_dump_rocm
 
 ds4_tp_nhi.o: ds4_tp_nhi.c ds4_tp_nhi.h ds4_tbstream_uapi.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_tp_nhi.c
