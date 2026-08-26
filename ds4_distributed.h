@@ -116,6 +116,12 @@ int ds4_dist_session_mtp_spec_cycle(
         char *err,
         size_t errlen);
 
+/* Print the dist speculative-decode telemetry counters accumulated by
+ * ds4_dist_session_mtp_spec_cycle.  Gated by DS4_DSPARK_STATS like the
+ * single-node DSpark stats line, so an external validator can enable both
+ * with the same env knob.  Emits nothing when no speculative cycle ran. */
+void ds4_dist_session_print_spec_stats(const ds4_dist_session *d);
+
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.
  */

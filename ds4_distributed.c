@@ -307,6 +307,7 @@ typedef struct {
     const char *nhi_device;
     pthread_mutex_t mu;
     ds4_dist_worker_session *sessions;
+    bool spec_warned;
 } ds4_dist_worker_state;
 
 typedef struct ds4_dist_worker_upstream ds4_dist_worker_upstream;
@@ -471,6 +472,12 @@ struct ds4_dist_session {
     int spec_pending_token;
     uint32_t spec_pending_pos;
     bool spec_cap_warned;
+    /* Aggregate counters for the dist speculative-decode telemetry line.
+     * Emitted with the same gate as the single-node DSpark stats so an
+     * external validator can turn the counters on with one env knob. */
+    uint64_t spec_cycles;
+    uint64_t spec_proposed;
+    uint64_t spec_accepted;
 };
 
 typedef struct {
@@ -6779,6 +6786,27 @@ static bool dist_route_plan_supports_spec(const ds4_dist_route_plan *plan) {
     }
     return true;
 }
+
+void ds4_dist_session_print_spec_stats(const ds4_dist_session *d) {
+    if (!d || d->spec_cycles == 0) return;
+    /* Same gate as the single-node DSpark stats line: enabled only when
+     * DS4_DSPARK_STATS is set to a non-empty value other than "0". */
+    const char *env = getenv("DS4_DSPARK_STATS");
+    if (!env || !env[0] || strcmp(env, "0") == 0) return;
+    const double accept_rate =
+        d->spec_proposed != 0
+            ? (100.0 * (double)d->spec_accepted /
+               (double)d->spec_proposed)
+            : 0.0;
+    fprintf(stderr,
+            "ds4: dist spec stats cycles=%llu proposed=%llu "
+            "accepted_draft=%llu accept_rate=%.2f%%\n",
+            (unsigned long long)d->spec_cycles,
+            (unsigned long long)d->spec_proposed,
+            (unsigned long long)d->spec_accepted,
+            accept_rate);
+}
+
 int ds4_dist_session_mtp_spec_cycle(
         ds4_dist_session *d,
         ds4_session *owner,
@@ -6812,6 +6840,7 @@ int ds4_dist_session_mtp_spec_cycle(
         return 1;
     }
     if (draft_cap > 16) draft_cap = 16;
+    d->spec_cycles++;
     const int vocab = ds4_engine_vocab_size(e);
     const ds4_tokens *timeline = ds4_session_tokens(owner);
     if (!timeline || timeline->len < 0) {
@@ -6889,6 +6918,7 @@ int ds4_dist_session_mtp_spec_cycle(
     }
     if (first_token == eos_token) fused_k = 0;
     if (fused_k >= min_verify) {
+        d->spec_proposed += (uint64_t)fused_k;
         ds4_dist_mtp_frontier fused_frontier;
         if (!ds4_session_dist_frontier_snapshot(owner, &fused_frontier)) {
             if (errlen) snprintf(err, errlen, "coordinator speculative frontier snapshot failed");
@@ -6954,6 +6984,7 @@ int ds4_dist_session_mtp_spec_cycle(
             }
             accept_n++;
         }
+        d->spec_accepted += (uint64_t)accept_n;
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr,
                     "ds4: dist mtp spec fused drafted=%d accepted=%d cont=%d span=%.1fms\n",
@@ -7137,6 +7168,7 @@ int ds4_dist_session_mtp_spec_cycle(
         return n_accept;
     }
     free(logits0);
+    d->spec_proposed += (uint64_t)draft_n;
 
     /* 2. Speculative verify span: decode the draft rows in one multi-token
      * span per machine.  Both sides snapshot their frontier first so a
@@ -7216,6 +7248,7 @@ int ds4_dist_session_mtp_spec_cycle(
             }
         }
     }
+    d->spec_accepted += (uint64_t)accept_n;
     if (getenv("DS4_MTP_SPEC_LOG")) {
         fprintf(stderr,
                 "ds4: dist mtp spec verify drafted=%d accepted=%d decode2=%d base=%.1fms verify=%.1fms\n",
@@ -9763,6 +9796,13 @@ static int dist_worker_process_work_message(
     int drafts_max = output_drafts ? ds4_engine_mtp_draft_tokens(state->engine) : 0;
     if (drafts_max < 0) drafts_max = 0;
     if (drafts_max > 16) drafts_max = 16;
+    if (output_drafts && drafts_max == 0 && !state->spec_warned) {
+        state->spec_warned = true;
+        fprintf(stderr,
+                "ds4: dist worker: speculative drafts requested but no "
+                "enabled support model (--mtp/--dspark) is available; "
+                "falling back to per-token decode\n");
+    }
     const bool decode2_span =
         output_all_logits && work.n_tokens == 2u && !spec_rollback &&
         !output_drafts;

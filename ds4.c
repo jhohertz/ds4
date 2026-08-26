@@ -58846,6 +58846,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         "output may differ from one-token decode due "
                         "to batched floating-point operation order\n");
             }
+            if (e->dspark &&
+                e->distributed.role != DS4_DISTRIBUTED_NONE &&
+                dspark.block_size <= 1) {
+                /* Distributed speculative decode is driven by the DSpark
+                 * block size; a degenerate block cannot propose a suffix, so
+                 * the dist route would otherwise silently fall back to
+                 * per-token decode.  Say so explicitly. */
+                fprintf(stderr,
+                        "ds4: warning: --dspark cannot drive distributed "
+                        "speculative decode (block_size=%u); falling back to "
+                        "per-token decode\n",
+                        dspark.block_size);
+            }
         } else {
             fprintf(stderr,
                     "ds4: unsupported --mtp support model %s (detected=%s); "
@@ -60208,6 +60221,7 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     ds4_session_print_dspark_stats(s);
 #endif
+    ds4_dist_session_print_spec_stats(s->distributed);
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
@@ -60620,6 +60634,7 @@ static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, c
     ds4_session_dspark_capture_note_checkpoint(s);
 }
 
+#ifndef DS4_NO_GPU
 /* Forward declaration for the multi-token slice body (defined below). */
 static int ds4_session_eval_layer_slice_span(
         ds4_session *s,
@@ -60635,6 +60650,7 @@ static int ds4_session_eval_layer_slice_span(
         bool output_all_logits,
         char *err,
         size_t errlen);
+#endif
 int ds4_session_eval_layer_slice(ds4_session *s,
                                  const int *tokens,
                                  uint32_t n_tokens,
@@ -61062,6 +61078,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 }
 
 
+#ifndef DS4_NO_GPU
 /* Shared multi-token layer-slice body (n_tokens >= 2).  output_logits emits
  * the final row only; output_all_logits runs the output head once per row
  * and emits n_tokens vocab rows, used by the distributed MTP speculative
@@ -61315,6 +61332,7 @@ static int ds4_session_eval_layer_slice_span(
     ds4_session_slice_commit_timeline(s, tokens, n_tokens);
     return 0;
 }
+#endif /* DS4_NO_GPU */
 
 int ds4_session_eval_layer_slice_logits_all(ds4_session *s,
                                             const int *tokens,
