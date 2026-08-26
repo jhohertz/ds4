@@ -164,3 +164,23 @@ tests/test_dist_v3.c: negotiation coverage for the new capability bit.
 6. `--mtp-draft N` only governs the legacy MTP head; DSpark block size comes
    from model metadata (`deepseek4.dspark.block_size`), so DSpark ignores the
    numeric value of `--mtp-draft N` beyond acting as a load trigger.
+
+## Review-fix commit (H1/H2/L3)
+
+- H2 (exactness-of-feature): `ds4_distributed.c:10127` — worker base-decode
+  drafts now call `ds4_session_dist_support_draft` with
+  `draft_pos = work.pos0` (the position of the input token), matching the
+  single-node `checkpoint.len - 1` convention instead of `work.pos0 + 1`.
+  The fused continuation branch (`work.pos0 + work.n_tokens`) is unchanged.
+- H1 (perf-guard): `ds4_distributed.c:6783` —
+  `dist_route_plan_supports_spec` now requires `plan->count == 1u` plus the
+  single entry's `DS4_DIST_ROUTE_F_OUTPUT_LOGITS` capability in addition to
+  `DS4_DIST_V3_CAP_SPEC_DECODE_V1`, mirroring the worker-side
+  "final logits span" validation.  The one-shot coordinator warning at
+  `ds4_distributed.c:6830` now names the reason (multi-hop topology, missing
+  output ownership, or missing capability) instead of only the capability
+  case.
+- L3 (hardening): `ds4_distributed.c:9833` — `result_bytes` is now computed
+  in `size_t` arithmetic and rejected (worker error) when it exceeds
+  `UINT32_MAX`, preventing the 32-bit `n_tokens*vocab*4 + drafts` products
+  from wrapping.

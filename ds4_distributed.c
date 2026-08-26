@@ -6775,15 +6775,16 @@ static int dist_coordinator_spec_commit_prefix(
 }
 
 /* The speculative WORK/RESULT extensions ride on negotiated v3 capability
- * bits: a coordinator must only emit them when every hop of the route
- * selected DS4_DIST_V3_CAP_SPEC_DECODE_V1 (an older peer rejects unknown
- * WORK flag bits, which would otherwise fail the whole request). */
+ * bits and a specific topology: a coordinator must only emit them when the
+ * route is a single worker that owns the output head (final logits) and that
+ * worker selected DS4_DIST_V3_CAP_SPEC_DECODE_V1.  A multi-hop route cannot
+ * carry spec flags (intermediate hops reject them), and an older peer
+ * rejects unknown WORK flag bits, which would otherwise fail the request. */
 static bool dist_route_plan_supports_spec(const ds4_dist_route_plan *plan) {
-    if (!plan || plan->count == 0) return false;
-    for (uint32_t i = 0; i < plan->count; i++) {
-        if ((plan->entry[i].caps & DS4_DIST_V3_CAP_SPEC_DECODE_V1) == 0)
-            return false;
-    }
+    if (!plan || plan->count != 1u) return false;
+    const ds4_dist_route_entry *only = &plan->entry[0];
+    if ((only->caps & DS4_DIST_V3_CAP_SPEC_DECODE_V1) == 0) return false;
+    if ((only->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) == 0) return false;
     return true;
 }
 
@@ -6827,10 +6828,22 @@ int ds4_dist_session_mtp_spec_cycle(
     if (draft_cap >= 2 && !dist_route_plan_supports_spec(&d->plan)) {
         if (!d->spec_cap_warned) {
             d->spec_cap_warned = true;
+            const char *why;
+            if (d->plan.count != 1u) {
+                why = "distributed speculation requires a single "
+                      "output-owning route worker";
+            } else if ((d->plan.entry[0].flags &
+                        DS4_DIST_ROUTE_F_OUTPUT_LOGITS) == 0) {
+                why = "the distributed route worker does not own the "
+                      "output logits";
+            } else {
+                why = "a route worker did not negotiate "
+                      "DS4_DIST_V3_CAP_SPEC_DECODE_V1";
+            }
             fprintf(stderr,
-                    "ds4: distributed speculative decode disabled: a route "
-                    "worker did not negotiate DS4_DIST_V3_CAP_SPEC_DECODE_V1; "
-                    "falling back to per-token decode\n");
+                    "ds4: distributed speculative decode disabled: %s; "
+                    "falling back to per-token decode\n",
+                    why);
         }
         draft_cap = 0;
     }
@@ -9817,19 +9830,31 @@ static int dist_worker_process_work_message(
                 : output_all_logits
                     ? DS4_DIST_RESULT_LOGITS_NROWS
                     : (local_output_logits ? DS4_DIST_RESULT_LOGITS : DS4_DIST_RESULT_HIDDEN_STATE);
-    const uint32_t result_bytes = final_ack_only || spec_commit
-        ? 0u
-        : output_drafts && output_all_logits
-            ? work.n_tokens * vocab * 4u + 4u + 4u * (uint32_t)drafts_max
-        : output_drafts
-            ? vocab * 4u + 4u + 4u * (uint32_t)drafts_max
-            : decode2_span
-                ? 4u + vocab * 4u
-                : output_all_logits
-                    ? work.n_tokens * vocab * 4u
-                    : (local_output_logits
-                        ? vocab * 4u
-                        : expected_hc_bytes);
+    size_t result_bytes = 0;
+    if (!(final_ack_only || spec_commit)) {
+        if (output_drafts && output_all_logits) {
+            result_bytes = (size_t)work.n_tokens * vocab * 4u +
+                           4u + 4u * (size_t)drafts_max;
+        } else if (output_drafts) {
+            result_bytes = (size_t)vocab * 4u + 4u +
+                           4u * (size_t)drafts_max;
+        } else if (decode2_span) {
+            result_bytes = 4u + (size_t)vocab * 4u;
+        } else if (output_all_logits) {
+            result_bytes = (size_t)work.n_tokens * vocab * 4u;
+        } else {
+            result_bytes = local_output_logits
+                ? (size_t)vocab * 4u
+                : (size_t)expected_hc_bytes;
+        }
+        if (result_bytes > UINT32_MAX) {
+            free(route_blob);
+            free(tokens);
+            return dist_worker_upstream_send_work_error(
+                upstream, request_id,
+                "distributed result payload exceeds 32-bit size");
+        }
+    }
     float *result = result_bytes ? malloc(result_bytes) : NULL;
     ds4_dist_tx_bulk_plan result_tx_plan;
     memset(&result_tx_plan, 0, sizeof(result_tx_plan));
@@ -9887,7 +9912,7 @@ static int dist_worker_process_work_message(
             result_kind == DS4_DIST_RESULT_HIDDEN_STATE
                 ? DS4_TRANSPORT_BULK_RESULT_HIDDEN
                 : DS4_TRANSPORT_BULK_RESULT_LOGITS,
-            0, request_id, result_bytes, result_payload_bits,
+            0, request_id, (uint32_t)result_bytes, result_payload_bits,
             &result_tx_plan, err, sizeof(err));
         if (tx_plan_rc < 0) {
             if (!input_hc_uses_wire) free(input_hc);
@@ -10099,7 +10124,7 @@ static int dist_worker_process_work_message(
         if (drafts_max > 0) {
             char draft_err[128];
             int draft_token = tokens[0];
-            uint32_t draft_pos = work.pos0 + 1u;
+            uint32_t draft_pos = work.pos0;
             if (output_all_logits) {
                 /* Continuation drafts for a fused verify span: propose from
                  * the last verified row, whose greedy token becomes the next
@@ -10131,7 +10156,7 @@ static int dist_worker_process_work_message(
         }
     }
 
-    uint32_t payload_bytes = result_bytes;
+    uint32_t payload_bytes = (uint32_t)result_bytes;
     if (output_drafts) {
         /* Always write the draft count: a zero-draft cycle (scheduler or
          * confidence skip, or a failed drafter) must ship count=0, not an
@@ -10188,7 +10213,7 @@ static int dist_worker_process_work_message(
                                             &work,
                                             tokens,
                                             result,
-                                            result_bytes,
+                                            (uint32_t)result_bytes,
                                             &telemetry,
                                             route_blob);
     } else {
