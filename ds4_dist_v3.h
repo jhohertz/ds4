@@ -22,6 +22,12 @@
 #define DS4_DIST_V3_CAP_BULK_DESC_V1    0x00000001u
 #define DS4_DIST_V3_CAP_NHI_CPU_COPY_V1 0x00000002u
 #define DS4_DIST_V3_CAP_NHI_TAGGED_V1   0x00000004u
+/* Speculative-decode WORK/RESULT extensions (F_SPEC_VERIFY, F_SPEC_ROLLBACK,
+ * F_OUTPUT_DRAFTS, F_OUTPUT_ALL_LOGITS, F_SPEC_COMMIT and the LOGITS_NROWS
+ * result kind).  Additive: unknown advertised bits are ignored by older
+ * peers, and a coordinator must not set the speculative WORK flags unless
+ * this bit was selected for every hop of the route. */
+#define DS4_DIST_V3_CAP_SPEC_DECODE_V1  0x00000008u
 #define DS4_DIST_V3_CAP_NHI_V1 \
     (DS4_DIST_V3_CAP_BULK_DESC_V1 | \
      DS4_DIST_V3_CAP_NHI_CPU_COPY_V1 | \

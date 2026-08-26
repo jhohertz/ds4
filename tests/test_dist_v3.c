@@ -221,6 +221,22 @@ static void test_negotiation(void) {
     CHECK(ds4_dist_v3_hello_ack_validate(&ack, &worker,
                                          err, sizeof(err)) == 0);
 
+    /* Speculative-decode extensions are opt-in per link: selected only
+     * when both peers advertise them. */
+    worker.capabilities |= DS4_DIST_V3_CAP_SPEC_DECODE_V1;
+    CHECK(ds4_dist_v3_negotiate(&worker, &coordinator, generation,
+                                &ack, err, sizeof(err)) == 0);
+    CHECK((ack.selected_caps & DS4_DIST_V3_CAP_SPEC_DECODE_V1) == 0);
+    coordinator.capabilities |= DS4_DIST_V3_CAP_SPEC_DECODE_V1;
+    CHECK(ds4_dist_v3_negotiate(&worker, &coordinator, generation,
+                                &ack, err, sizeof(err)) == 0);
+    CHECK((ack.selected_caps & DS4_DIST_V3_CAP_SPEC_DECODE_V1) ==
+          DS4_DIST_V3_CAP_SPEC_DECODE_V1);
+    CHECK(ds4_dist_v3_hello_ack_validate(&ack, &worker,
+                                         err, sizeof(err)) == 0);
+    worker.capabilities &= ~DS4_DIST_V3_CAP_SPEC_DECODE_V1;
+    coordinator.capabilities &= ~DS4_DIST_V3_CAP_SPEC_DECODE_V1;
+
     worker = nhi_offer(DS4_DIST_V3_POLICY_AUTO, NHI_RING_LARGE,
                        NHI_MAX_LARGE);
     coordinator = nhi_offer(DS4_DIST_V3_POLICY_AUTO, NHI_RING_SMALL,

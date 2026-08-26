@@ -328,7 +328,8 @@ int ds4_dist_v3_negotiate(
     *ack = (ds4_dist_v3_hello_ack){0};
     ack->protocol_version = DS4_DIST_V3_PROTOCOL_VERSION;
     ack->coordinator_caps = coordinator->capabilities;
-    ack->selected_caps = common_caps & DS4_DIST_V3_CAP_BULK_DESC_V1;
+    ack->selected_caps = common_caps & (DS4_DIST_V3_CAP_BULK_DESC_V1 |
+                                        DS4_DIST_V3_CAP_SPEC_DECODE_V1);
     ds4_dist_v3_u64_to_halves(generation,
                               &ack->generation_hi, &ack->generation_lo);
     if (both_nhi) {
