@@ -568,6 +568,16 @@ ROCm validation result and containment
   tokens/s and 39.205 versus 36.487 seconds wall (7.1% lower throughput,
   7.45% longer wall); prefill was 81.80 versus 82.19 tokens/s. The report's
   screening decision therefore remains negative despite correctness PASS.
+  Accepted drafts are not free target forwards in exact mode: they were
+  computed in verifier spans. A useful first-order row count is 460 cycles +
+  59 proposed/target-evaluated draft rows = 519 target rows versus 512 in the
+  baseline; 53 accepted drafts compress the emitted cycle count but do not
+  remove their target evaluation. Worker proposal accounting retained
+  1.858 seconds (1.547 seconds in the support stage chain), about 68% of the
+  2.718-second wall regression; rejected rows, partial replay, span setup,
+  synchronization/readback, and transport account for the remainder. Thus an
+  exact speedup requires broad K-row target-layer amortization and/or a much
+  cheaper proposer, not acceptance accuracy alone.
 - `DS4_DIST_SPEC_EXACT` remains explicit opt-in. The default verifies drafts,
   restores the speculative frontier, and serially replays accepted tokens.
   This is conservative containment of an unproven direct-state-retention path,
