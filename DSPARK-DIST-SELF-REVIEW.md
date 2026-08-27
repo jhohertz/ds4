@@ -508,8 +508,30 @@ ROCm validation result and containment
   ordinary non-prequant one-row calls, never a generic multi-row reduction.
   `DS4_ROCM_Q8_EXACT_KROW_REQUIRED=1` is test/benchmark-only and turns scratch
   or selector fallback into failure, so a passing production-head benchmark
-  positively attests K-row dispatch. It has not yet been performance-tested on
-  ROCm and does not establish complete hidden/KV or host-output identity.
+  positively attests K-row dispatch.
+- Sealed bilateral ROCm bundle `stage3-f7edfcf-krow-v2` validated commit
+  `f7edfcf552363976a3f5b0ad50a1737d7dcb86ea` on both gfx1151 hosts. Every
+  production-head row was byte-identical. Averaged across the two hosts, the
+  4096x129280 K-row call took 2.461/2.474/2.481/2.487 ms for k=2/3/4/5 versus
+  5.088/7.630/10.191/12.726 ms serial (2.07x/3.08x/4.11x/5.12x). The
+  7168x129280 call took 4.264/4.271/4.274/4.280 ms versus
+  8.933/13.343/17.736/22.163 ms (2.10x/3.12x/4.15x/5.18x). The 537 MiB and
+  939 MiB weight streams therefore sustain about 229 and 231 GB/s; row time is
+  nearly flat as k grows, so this kernel is already primarily memory-bandwidth
+  limited. The bilateral build hashes, tests, restoration gates, and dmesg
+  deltas all passed. This establishes exact Q8-head dispatch and isolated
+  speedup, not complete hidden/KV or end-to-end inference identity.
+- Sealed no-env bundle `stage3-11a0c28-inference-v32e` also validated the
+  default primary-target cache policy with a loaded support model and
+  `DS4_MTP_SPEC_DISABLE=1`. Both 512-token payloads were byte-identical to each
+  other and sealed v30 (SHA256
+  `5f38d237fa0622975c53d5affca6e86e66f18cba5294e5aa18475e5a436ccc71`):
+  14.45 versus 14.42 decode tokens/s and 36.487 versus 36.561 seconds wall
+  (1.002x). The required primary-preserved/support-disabled policy line was
+  present on both support-loaded roles, the multi-model override was absent,
+  and restoration/dmesg/evidence gates passed. This proves the default policy
+  no longer changes target arithmetic merely by loading support; speculation
+  was deliberately disabled and no proposal correctness is implied.
 - `DS4_DIST_SPEC_EXACT` remains explicit opt-in. The default verifies drafts,
   restores the speculative frontier, and serially replays accepted tokens.
   This is conservative containment of an unproven direct-state-retention path,
@@ -520,15 +542,15 @@ ROCm validation result and containment
 
 Validation required before any direct-commit default
 
-1. ROCm-build the primary-only multi-model cache fix, prove no-env support-loaded
-   plain decode matches no-spec for at least 512 greedy token IDs, and inspect
-   memory/cache telemetry on both ranks.
-2. Run the ROCm k-row test at the real 7168-wide input for every 2..5-row
-   exact-API span and its self-forced prequant-disabled rollback child. Then
-   run `tests/bench_q8_krow_rocm --production-head`, which fail-safely forces
-   the prequant K-row selector on. Require every 4096x129280 and 7168x129280
-   row to byte-match separate production one-row calls and retain the measured
-   exact-row versus serial-head timings.
+1. **Passed (v32e):** ROCm-build the primary-only multi-model cache fix and
+   prove no-env support-loaded plain decode matches no-spec for 512 greedy
+   tokens on both ranks. The sealed phase retained policy, cache, executable,
+   output, restoration, and dmesg evidence.
+2. **Passed (`f7edfcf` krow v2):** run the ROCm k-row test at the real
+   7168-wide input for every 2..5-row exact-API span and its self-forced
+   prequant-disabled rollback child, then run the fail-closed production-head
+   benchmark. Both hosts passed every bitwise comparison and retained the
+   timings above.
 3. Repeat the replay-default speculative arm with real proposals and accepts;
    require exact token identity now that target arithmetic is held constant.
 4. Compare fast-span and per-row hidden rows, KV/compressed-KV,
