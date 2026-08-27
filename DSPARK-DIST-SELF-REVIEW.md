@@ -454,40 +454,39 @@ Original exactness argument and failed assumption
   `metal_graph_dspark_capture_decode_layer`, mirroring the single-token decode
   row (ds4.c:61023-61026), so the target-hidden ring records each layer's
   OUTPUT (last row wins) exactly as sequential decode does.
-- Acceptance logic is untouched: the coordinator still accepts draft i iff
-  `dist_logits_argmax(rows[i]) == drafts[i+1]` (ds4_distributed.c
-  `ds4_dist_session_mtp_spec_cycle`), and a partial accept / non-exact
-  backend still rewinds and runs `dist_mtp_spec_replay_accept`
-  (ds4_distributed.c:6731) on the exact single-token route.  A full fast-span
-  accept, however, retains the span state and last-row logits without replay,
-  so the batched Q8 head must be byte-identical—not merely reduction-order
-  similar—to preserve the serial greedy stream.
+- Acceptance logic still accepts draft i iff
+  `dist_logits_argmax(rows[i]) == drafts[i+1]`.  The release path then rewinds
+  and runs `dist_mtp_spec_replay_accept` through ordinary one-token decode.
+  The direct-commit experiment instead retains verifier KV/state and last-row
+  logits after a full accept; therefore every layer, timeline, capture, and
+  output-head side effect—not only each accepted argmax—must match serial
+  replay before that shortcut can preserve the greedy stream.
 
 ROCm validation result and containment
 
-- The v25f 512-token screen disproved the batched-head identity assumption.
-  All three no-spec samples were byte-stable, all twelve fast-span DSpark
-  samples were byte-stable within and across scheduler/confidence variants,
-  but every DSpark sample diverged from no-spec after a 505-character common
-  decoded prefix.  This is deterministic path-dependent greedy-token
-  divergence, not sampling or response metadata noise.
-- v25f medians were 36.533s no-spec, 40.743s default scheduler, 47.103s
-  scheduler-off, 48.978s at confidence 0.65, and 51.129s at confidence 0.60.
-  More accepted drafts per cycle monotonically increased wall time; the
-  default scheduler remains the least-cost DSpark policy but was still 11.5%
-  slower than no-spec in this workload.
-- `DS4_DIST_SPEC_EXACT_SPAN` is therefore opt-in after this review.  Exact
-  mode defaults to the prior per-row one-token-head fallback.  Enabling the
-  research span prints a warning that exact greedy identity is not
-  guaranteed.  The fast implementation remains available for differential
-  kernel work but must not decide production exact output.
+- v25f showed deterministic 512-token divergence in every direct-commit
+  DSpark policy after a 505-character common decoded prefix.  v26a then set
+  `DS4_DIST_SPEC_EXACT_SPAN=0`, forcing the ordinary per-row verifier head,
+  and produced the exact same divergent completion byte-for-byte.  The padded
+  fast head was therefore not the root cause: the broader verifier-state
+  retention / replay bypass remains unproven.
+- v26a reproduced the timing result (36.508s no-spec, 40.694s per-row direct
+  commit, ratio 1.115) with coordinator counters 450 cycles / 77 proposed /
+  63 accepted.  The worker finalized rich cost telemetry but, as expected
+  without coordinator feedback, reported zero committed cycles/proposals and
+  2130.971ms proposal work plus 332 scheduler skips.
+- `DS4_DIST_SPEC_EXACT` is now explicit opt-in.  The default verifies drafts,
+  restores the speculative frontier, and serially replays accepted tokens.
+  Enabling direct commits prints a warning that exact greedy identity is not
+  guaranteed.  `DS4_DIST_SPEC_EXACT_SPAN` remains a nested diagnostic knob;
+  neither direct variant is the release path.
 
-Validation required before re-enabling the fast span
+Validation required before any direct-commit default
 
-1. Compare every full logits row from the production 2..8-row padded head
-   byte-for-byte with separate one-row heads at the real 7168-wide input.
-2. Compare fast-span and per-row hidden rows, compressor/indexer state, and
-   DSpark capture at raw-window and compression boundaries.
-3. Run at least 512 greedy token IDs end-to-end against no-spec, with actual
-   proposals and accepts, before allowing fast-span state or last-row logits
-   to bypass serial replay again.
+1. Prove the replay-default path matches no-spec for at least 512 greedy token
+   IDs with actual proposals and accepts.
+2. Compare per-row verifier and replay hidden rows, KV/compressed-KV,
+   compressor/indexer state, capture state, and final logits to locate the
+   direct-commit divergence.
+3. Separately prove any fast head byte-identical at production dimensions.
+   Only after all state and token gates pass may verifier state bypass replay.

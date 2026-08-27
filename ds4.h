@@ -527,10 +527,10 @@ int ds4_session_eval_layer_slice_exact_rows(ds4_session *s,
                                             bool output_logits,
                                             char *err,
                                             size_t errlen);
-/* Whether a distributed speculative verify span may use the per-row exact
- * layer-slice path (and therefore trust its rows without replay).  Bounded
- * to the small-batch row count that keeps the hidden/logits transfers cheap;
- * non-ROCm builds and GLM sessions keep the batched verify + replay path. */
+/* Whether a distributed speculative verify span may retain verifier state
+ * without ordinary one-token replay.  This direct-commit experiment is
+ * bounded to small ROCm spans and requires explicit DS4_DIST_SPEC_EXACT
+ * opt-in; the default and all non-ROCm/GLM sessions verify then replay. */
 bool ds4_session_dist_spec_exact_verify(const ds4_session *s, uint32_t n_tokens);
 /* Exact two-row verifier for a layer slice (fast Q8 decode kernels, two
  * rows alternating per layer).  The coordinator produces the two hidden

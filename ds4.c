@@ -61487,18 +61487,23 @@ int ds4_session_eval_layer_slice_logits_all(ds4_session *s,
 bool ds4_session_dist_spec_exact_verify(const ds4_session *s, uint32_t n_tokens) {
     if (!s || !s->engine) return false;
 #ifdef DS4_ROCM_BUILD
-    /* The per-row exact span is exercised only on the ROCm build where the
-     * replay arm's serial round trips dominate the speculative wall clock.
-     * Metal keeps the batched verify + replay path (its batch output head is
-     * already sequential-safe and never bit-exact across rows).  GLM uses a
-     * separate graph and layer-slice decode path, so stay on the existing
-     * replay arm there as well. */
+    /* Direct verifier-state commits skip the ordinary one-token replay after
+     * acceptance.  Even per-row verifier launches produced a deterministic
+     * long-run greedy divergence on the ROCm distributed route, so this is a
+     * diagnostic experiment rather than the exact release path.  Default to
+     * batched verification followed by serial replay; GLM/CPU always replay. */
     if (ds4_session_is_glm(s) || ds4_session_is_cpu(s)) return false;
     if (n_tokens < 2u || n_tokens > 8u) return false;
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_DIST_SPEC_EXACT");
-        cached = (env == NULL || env[0] != '0') ? 1 : 0;
+        cached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+        if (cached != 0) {
+            fprintf(stderr,
+                    "ds4: WARNING DS4_DIST_SPEC_EXACT enables experimental "
+                    "direct verifier-state commits; exact greedy identity "
+                    "is not guaranteed\n");
+        }
     }
     return cached != 0;
 #else
