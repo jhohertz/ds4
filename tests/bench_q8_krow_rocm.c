@@ -107,6 +107,15 @@ static int run_shape(const shape *sh) {
         fprintf(stderr, "krow bench: invalid shape configuration\n");
         return 0;
     }
+    int gpu_ready = 0;
+    if (!ds4_gpu_init()) {
+        fprintf(stderr, "krow bench: ds4_gpu_init failed\n");
+        return 0;
+    }
+    gpu_ready = 1;
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(false);
+
     const uint32_t in_dim = sh->in_dim;
     const uint32_t out_dim = sh->out_dim;
     const uint32_t blocks = (in_dim + 31u) / 32u;
@@ -221,6 +230,9 @@ cleanup:
     if (x_batch_t) ds4_gpu_tensor_free(x_batch_t);
     if (out_batch_t) ds4_gpu_tensor_free(out_batch_t);
     if (out_row_t) ds4_gpu_tensor_free(out_row_t);
+    /* The runtime may retain a mapped-host registration for this model.
+     * Release it before invalidating the backing mmap. */
+    if (gpu_ready) ds4_gpu_cleanup();
     if (model != MAP_FAILED) munmap(model, (size_t)model_size);
     if (model_file) fclose(model_file);
     free(x);
@@ -236,6 +248,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s [--production-head]\n", argv[0]);
         return 2;
     }
+    /* This binary measures the k-row tier, not its sequential rollback.
+     * Force the selector before ds4_gpu_init() caches it so an inherited
+     * environment cannot produce a plausible but meaningless 1.00x run. */
+    if (setenv("DS4_ROCM_DSV4_PREQUANT_DECODE", "1", 1) != 0 ||
+        setenv("DS4_ROCM_Q8_EXACT_KROW_REQUIRED", "1", 1) != 0) {
+        perror("krow bench: setenv");
+        return 1;
+    }
     /* Normal production decode shapes plus a separately selected full-vocab
      * oracle for both Flash and Pro embedding widths.  The large cases use
      * fewer iterations but still compare every output bit before timing. */
@@ -248,22 +268,16 @@ int main(int argc, char **argv) {
         {4096u, 129280u, 5u, 10},
         {7168u, 129280u, 5u, 10},
     };
-    if (!ds4_gpu_init()) {
-        fprintf(stderr, "krow bench: ds4_gpu_init failed\n");
-        return 1;
-    }
-    ds4_gpu_set_quality(false);
-    ds4_gpu_set_ssd_streaming(false);
     int ok = 1;
     const shape *selected = production_head ? production_shapes : shapes;
     const size_t selected_n = production_head
         ? sizeof(production_shapes) / sizeof(production_shapes[0])
         : sizeof(shapes) / sizeof(shapes[0]);
+    fprintf(stderr,
+            "krow bench: prequant k-row tier forced on and required\n");
     for (size_t i = 0; i < selected_n; i++) {
         if (!run_shape(&selected[i])) ok = 0;
     }
-    ds4_gpu_set_model_map(NULL, 0u);
-    ds4_gpu_cleanup();
     fprintf(stderr, "krow bench: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

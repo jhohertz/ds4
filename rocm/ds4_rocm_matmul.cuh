@@ -337,8 +337,15 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
                                                      x, n_tok, "q8_f16_out");
 }
 
+static bool cuda_q8_exact_krow_required(void) {
+    const char *env = getenv("DS4_ROCM_Q8_EXACT_KROW_REQUIRED");
+    return env != NULL && env[0] != '\0' && env[0] != '0';
+}
+
 /* Returns -1 only when scratch is unavailable, so exact callers can fall
- * back to ordinary one-row launches without entering a generic batch tier. */
+ * back to ordinary one-row launches without entering a generic batch tier.
+ * A benchmark/test may set DS4_ROCM_Q8_EXACT_KROW_REQUIRED=1 to turn that
+ * transparent fallback into a failure and positively attest dispatch. */
 static int cuda_matmul_q8_0_krow_exact_launch(
         ds4_gpu_tensor       *out,
         const unsigned char  *w,
@@ -352,7 +359,7 @@ static int cuda_matmul_q8_0_krow_exact_launch(
     const uint64_t tmp_bytes =
         scale_offset + (uint64_t)n_rows * blocks * sizeof(float);
     void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 exact krow prequant");
-    if (!tmp) return -1;
+    if (!tmp) return cuda_q8_exact_krow_required() ? 0 : -1;
 
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
@@ -651,12 +658,15 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     const char *wptr = cuda_model_range_ptr(
             model_map, weight_offset, weight_bytes, "q8_0 decode rows exact");
     if (!wptr) return 0;
-    if (n_rows >= 2u && n_rows <= 5u &&
-        cuda_q8_prequant_decode_enabled()) {
-        const int exact_rc = cuda_matmul_q8_0_krow_exact_launch(
-                out, reinterpret_cast<const unsigned char *>(wptr), in_dim,
-                out_dim, x, n_rows, blocks);
-        if (exact_rc >= 0) return exact_rc;
+    if (n_rows >= 2u && n_rows <= 5u) {
+        if (cuda_q8_prequant_decode_enabled()) {
+            const int exact_rc = cuda_matmul_q8_0_krow_exact_launch(
+                    out, reinterpret_cast<const unsigned char *>(wptr), in_dim,
+                    out_dim, x, n_rows, blocks);
+            if (exact_rc >= 0) return exact_rc;
+        } else if (cuda_q8_exact_krow_required()) {
+            return 0;
+        }
     }
 
     /* Never hand an exact span to a generic multi-row dispatch: if prequant
@@ -870,6 +880,57 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         break;
     }
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1, const void *model_map,
+        uint64_t model_size, uint64_t weight0_offset,
+        uint64_t weight1_offset, uint64_t in_dim, uint64_t out0_dim,
+        uint64_t out1_dim, const ds4_gpu_tensor *x, uint32_t n_rows) {
+    if (!out0 || !out1 || !x || !model_map || n_rows == 0u) return 0;
+    if (n_rows == 1u) {
+        return ds4_gpu_matmul_q8_0_pair_tensor(
+                out0, out1, model_map, model_size, weight0_offset,
+                weight1_offset, in_dim, out0_dim, out1_dim, x, 1u);
+    }
+
+    if (n_rows <= 5u) {
+        if (cuda_q8_prequant_decode_enabled()) {
+            if (ds4_gpu_matmul_q8_0_pair_tensor(
+                    out0, out1, model_map, model_size, weight0_offset,
+                    weight1_offset, in_dim, out0_dim, out1_dim, x,
+                    n_rows)) {
+                return 1;
+            }
+            if (cuda_q8_exact_krow_required()) return 0;
+        } else if (cuda_q8_exact_krow_required()) {
+            return 0;
+        }
+    }
+
+    /* Wider spans, an explicit prequant rollback, or scratch pressure retain
+     * the exact contract through ordinary one-row pair calls. Never route an
+     * exact span through either generic multi-row matrix independently. */
+    for (uint32_t r = 0; r < n_rows; r++) {
+        ds4_gpu_tensor *o0 = ds4_gpu_tensor_view(
+                out0, (uint64_t)r * out0_dim * sizeof(float),
+                out0_dim * sizeof(float));
+        ds4_gpu_tensor *o1 = ds4_gpu_tensor_view(
+                out1, (uint64_t)r * out1_dim * sizeof(float),
+                out1_dim * sizeof(float));
+        ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(
+                x, (uint64_t)r * in_dim * sizeof(float),
+                in_dim * sizeof(float));
+        const int ok = o0 && o1 && x_row &&
+            ds4_gpu_matmul_q8_0_pair_tensor(
+                    o0, o1, model_map, model_size, weight0_offset,
+                    weight1_offset, in_dim, out0_dim, out1_dim, x_row, 1u);
+        if (o0) ds4_gpu_tensor_free(o0);
+        if (o1) ds4_gpu_tensor_free(o1);
+        if (x_row) ds4_gpu_tensor_free(x_row);
+        if (!ok) return 0;
+    }
+    return 1;
 }
 
 static int cuda_matmul_q8_0_hc_expand_tensor_labeled(

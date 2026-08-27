@@ -498,11 +498,25 @@ ROCm validation result and containment
   output afterward.
 - The exact-head dispatch fix additionally removes the old 2..7-row padding
   and exercises the production 7168-wide input in both prequant-enabled and
-  disabled modes. It has not yet been performance-tested on ROCm and does not
-  establish complete hidden/KV or host-output identity.
+  disabled modes. In enabled mode its oracle is the production one-row decode
+  implementation (`matmul_q8_0_preq_rows_w32_kernel`) invoked separately for
+  each row; the candidate is a different K-row kernel and launch. They
+  intentionally share activation quantization and test data, so this proves
+  the claimed property—bit-equivalence to ordinary target decode—not
+  independent mathematical correctness of the Q8 quantizer or model quality.
+  The disabled child instead proves that the exact API rolls back to separate
+  ordinary non-prequant one-row calls, never a generic multi-row reduction.
+  `DS4_ROCM_Q8_EXACT_KROW_REQUIRED=1` is test/benchmark-only and turns scratch
+  or selector fallback into failure, so a passing production-head benchmark
+  positively attests K-row dispatch. It has not yet been performance-tested on
+  ROCm and does not establish complete hidden/KV or host-output identity.
 - `DS4_DIST_SPEC_EXACT` remains explicit opt-in. The default verifies drafts,
   restores the speculative frontier, and serially replays accepted tokens.
-  `DS4_DIST_SPEC_EXACT_SPAN` remains nested and experimental.
+  This is conservative containment of an unproven direct-state-retention path,
+  not a claim that the fast path is correct: v25f disproved end-to-end identity
+  for the then-current experiment, and the Q8-head repair has not yet proved
+  all hidden/KV/capture state. `DS4_DIST_SPEC_EXACT_SPAN` therefore remains
+  nested and experimental.
 
 Validation required before any direct-commit default
 
@@ -510,10 +524,11 @@ Validation required before any direct-commit default
    plain decode matches no-spec for at least 512 greedy token IDs, and inspect
    memory/cache telemetry on both ranks.
 2. Run the ROCm k-row test at the real 7168-wide input for every 2..5-row
-   exact-API span, then run `tests/bench_q8_krow_rocm --production-head`
-   with prequant enabled and with `DS4_ROCM_DSV4_PREQUANT_DECODE=0`. Require
-   every 4096x129280 and 7168x129280 row to byte-match separate one-row calls
-   and retain the measured exact-row versus serial-head timings.
+   exact-API span and its self-forced prequant-disabled rollback child. Then
+   run `tests/bench_q8_krow_rocm --production-head`, which fail-safely forces
+   the prequant K-row selector on. Require every 4096x129280 and 7168x129280
+   row to byte-match separate production one-row calls and retain the measured
+   exact-row versus serial-head timings.
 3. Repeat the replay-default speculative arm with real proposals and accepts;
    require exact token identity now that target arithmetic is held constant.
 4. Compare fast-span and per-row hidden rows, KV/compressed-KV,

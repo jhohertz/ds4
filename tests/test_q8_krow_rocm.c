@@ -66,6 +66,15 @@ static void fill_q8_weights(uint8_t *w, uint32_t out_dim, uint32_t blocks) {
 }
 
 static int run_shape(const shape *sh, bool exact_api_only) {
+    int gpu_ready = 0;
+    if (!ds4_gpu_init()) {
+        fprintf(stderr, "q8 krow: ds4_gpu_init failed\n");
+        return 0;
+    }
+    gpu_ready = 1;
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(false);
+
     const uint32_t in_dim = sh->in_dim;
     const uint32_t out_dim = sh->out_dim;
     const uint32_t blocks = (in_dim + 31u) / 32u;
@@ -178,17 +187,16 @@ static int run_shape(const shape *sh, bool exact_api_only) {
                 }
             }
         }
-        /* Timed pass: the same call the exactness check exercised.  With
-         * DS4_ROCM_DSV4_PREQUANT_DECODE=0 the dispatch reverts to the f32
-         * batch tiers, so this doubles as an A/B probe for the tier. */
+        /* Timed pass through the exact API. The disabled child and spans
+         * wider than five must remain on its serial one-row rollback. */
         const int iters = 100;
         double best = 1e30;
         for (int t = 0; t < 3; t++) {
             const double t0 = now_sec();
             for (int i = 0; i < iters; i++) {
-                if (!ds4_gpu_matmul_q8_0_tensor(out_batch_t, model, model_size,
-                                                weight_offset, in_dim, out_dim,
-                                                x_batch_t, k)) {
+                if (!ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                        out_batch_t, model, model_size, weight_offset,
+                        in_dim, out_dim, x_batch_t, k)) {
                     ok = 0;
                     break;
                 }
@@ -208,8 +216,6 @@ static int run_shape(const shape *sh, bool exact_api_only) {
         }
         fprintf(stderr, ") %.3f ms/call\n", best);
     }
-
-    if (exact_api_only) goto cleanup;
 
     /* Pair entry point: n_rows in 2..5 must match per-row one-row pair
      * calls, whose reduction order comes from the fused pair kernel. */
@@ -273,6 +279,8 @@ static int run_shape(const shape *sh, bool exact_api_only) {
         free(out1_batch);
         free(out1_row);
     }
+
+    if (exact_api_only) goto cleanup;
 
     /* Shared-expert rows entry: per-row bit-equality with the one-row
      * shared gate/up + swiglu entry (both weight matrices point at the
@@ -389,12 +397,27 @@ cleanup:
     if (x_row_t) ds4_gpu_tensor_free(x_row_t);
     if (out_batch_t) ds4_gpu_tensor_free(out_batch_t);
     if (out_row_t) ds4_gpu_tensor_free(out_row_t);
+    /* The ROCm runtime can retain hipHostRegister state for the current
+     * model mapping. Release it while the mmap is still valid. */
+    if (gpu_ready) ds4_gpu_cleanup();
     if (model != MAP_FAILED) munmap(model, (size_t)model_size);
     if (model_file) fclose(model_file);
+    free(x);
+    free(out_batch);
+    free(out_row);
     return ok;
 }
 
 static int test_primary_cache_survives_support_map(void) {
+    int gpu_ready = 0;
+    if (!ds4_gpu_init()) {
+        fprintf(stderr, "q8 multi-model: ds4_gpu_init failed\n");
+        return 0;
+    }
+    gpu_ready = 1;
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(false);
+
     enum { IN_DIM = 2048u, OUT_DIM = 4096u, N_TOK = 8u };
     const uint32_t blocks = (IN_DIM + 31u) / 32u;
     const uint64_t weight_offset = 4096u;
@@ -511,6 +534,9 @@ cleanup:
     free(x);
     free(before);
     free(after);
+    /* Primary and support mappings must outlive every retained model range
+     * and Q8-F16 cache registration. */
+    if (gpu_ready) ds4_gpu_cleanup();
     if (model != MAP_FAILED) munmap(model, (size_t)model_size);
     if (support != MAP_FAILED) munmap(support, (size_t)support_size);
     if (support2 != MAP_FAILED) munmap(support2, (size_t)support_size);
@@ -527,11 +553,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s [--prequant-disabled]\n", argv[0]);
         return 2;
     }
+    /* Make both direct and forked modes self-describing: the parent must
+     * exercise the k-row tier even if the shell inherited =0, while the
+     * rollback mode must disable it before the runtime caches the setting. */
+    if (setenv("DS4_ROCM_DSV4_PREQUANT_DECODE",
+               fallback_mode ? "0" : "1", 1) != 0 ||
+        setenv("DS4_ROCM_Q8_EXACT_KROW_REQUIRED",
+               fallback_mode ? "0" : "1", 1) != 0) {
+        perror("q8 krow: setenv");
+        return 1;
+    }
     if (!fallback_mode) {
         const pid_t child = fork();
         if (child == 0) {
-            (void)setenv("DS4_ROCM_DSV4_PREQUANT_DECODE", "0", 1);
-            execl(argv[0], argv[0], "--prequant-disabled", (char *)NULL);
+            execlp(argv[0], argv[0], "--prequant-disabled", (char *)NULL);
             _exit(127);
         }
         int status = 0;
@@ -552,12 +587,6 @@ int main(int argc, char **argv) {
         {4096u, 4099u},
         {7168u, 257u},
     };
-    if (!ds4_gpu_init()) {
-        fprintf(stderr, "q8 krow: ds4_gpu_init failed\n");
-        return 1;
-    }
-    ds4_gpu_set_quality(false);
-    ds4_gpu_set_ssd_streaming(false);
     int ok = 1;
     const size_t first = fallback_mode ?
         sizeof(shapes) / sizeof(shapes[0]) - 1u : 0u;
@@ -565,8 +594,6 @@ int main(int argc, char **argv) {
         if (!run_shape(&shapes[i], fallback_mode)) ok = 0;
     }
     if (!fallback_mode && !test_primary_cache_survives_support_map()) ok = 0;
-    ds4_gpu_set_model_map(NULL, 0u);
-    ds4_gpu_cleanup();
     fprintf(stderr, "%s: %s\n",
             fallback_mode ? "Q8_0 k-row ROCm prequant-disabled"
                           : "Q8_0 k-row ROCm matvec",
