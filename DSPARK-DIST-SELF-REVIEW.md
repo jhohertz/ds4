@@ -423,6 +423,20 @@ Experimental implementation (still opt-in)
   the original per-row loop.
   The outer exact gate (`DS4_DIST_SPEC_EXACT`, ROCm-only) is unchanged, and
   Metal/CPU/GLM/large spans still take the batched-verify + replay arm.
+- A further nested experiment, `DS4_DIST_SPEC_EXACT_SHARED_ROWS=1`, changes
+  only the admitted 2..5-row exact span. For each layer it runs
+  `METAL_DECODE_LAYER_TO_SHARED_MID` sequentially for every verifier row,
+  retaining causal KV/compressor/indexer/attention/router/routed-MoE order.
+  It gathers each row's `ffn_norm`, routed output, post-attention HC, and HC
+  split, issues one scalar-order Q8 shared gate/up+SwiGLU call, then runs the
+  ordinary one-row shared-down/HC expansion, graph-pointer swap, and capture
+  sequentially. It does not use the independent-session batching helpers.
+- Admission is preflighted once before embeddings, cache writes, or capture
+  reset. It requires resident prequant Q8 shared tensors, all row workspaces,
+  one tier, no quality/TP/streaming/debug/profile/reference/steering/materialized-FFN
+  mode, and no alternate shared-overlap/router path. Unsupported admission
+  leaves the existing exact span untouched. Once admitted, any failure
+  invalidates the session; there is no mid-span fallback.
 
 Original exactness argument and failed assumption
 
@@ -538,7 +552,9 @@ ROCm validation result and containment
   not a claim that the fast path is correct: v25f disproved end-to-end identity
   for the then-current experiment, and the Q8-head repair has not yet proved
   all hidden/KV/capture state. `DS4_DIST_SPEC_EXACT_SPAN` therefore remains
-  nested and experimental.
+  nested and experimental. `DS4_DIST_SPEC_EXACT_SHARED_ROWS` is nested one
+  level further, defaults off, and prints a prominent warning; it has no
+  bearing on the sealed results above.
 
 Validation required before any direct-commit default
 
@@ -555,6 +571,12 @@ Validation required before any direct-commit default
    require exact token identity now that target arithmetic is held constant.
 4. Compare fast-span and per-row hidden rows, KV/compressed-KV,
    compressor/indexer state, capture state, and final logits before considering
-   direct verifier-state retention.
-5. Only after all state and token gates pass may verifier state bypass replay
+   direct verifier-state retention. For the shared-row sub-experiment, cover
+   K=2,3,4,5 separately and compare every layer boundary against both the
+   ordinary exact span and serial one-row decode, including routed/shared
+   intermediates and the last-row capture ring.
+5. Measure the shared-row candidate independently after identity passes;
+   confirm exactly one gate/up+SwiGLU launch per layer and one shared-down/HC
+   launch per row, with no hidden synchronization or fallback.
+6. Only after all state and token gates pass may verifier state bypass replay
    or the experimental exact span become a default.

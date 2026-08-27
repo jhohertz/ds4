@@ -61577,6 +61577,257 @@ static bool ds4_session_eval_layer_slice_exact_span_enabled(void) {
     return cached != 0;
 }
 
+/* Nested experiment: preserve the row-serial attention/router/routed-MoE and
+ * shared-down/HC arithmetic, batching only the Q8 shared gate/up + SwiGLU.
+ * This switch is consulted only from the already opt-in exact-span path. */
+static bool ds4_session_eval_layer_slice_exact_shared_rows_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_DIST_SPEC_EXACT_SHARED_ROWS");
+        cached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+        if (cached != 0) {
+            fprintf(stderr,
+                    "\n"
+                    "============================================================\n"
+                    "ds4: WARNING: EXPERIMENTAL EXACT-SPAN SHARED-ROW BATCHING\n"
+                    "ds4: DS4_DIST_SPEC_EXACT_SHARED_ROWS batches verifier shared\n"
+                    "ds4: gate/up + SwiGLU only. It requires the enclosing exact and\n"
+                    "ds4: exact-span opt-ins; hidden/KV/capture identity is unproved.\n"
+                    "============================================================\n"
+                    "\n");
+        }
+    }
+    return cached != 0;
+}
+
+static bool ds4_session_eval_layer_slice_exact_shared_rows_supported(
+        const ds4_session *s,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t layer_start,
+        uint32_t layer_end) {
+    if (!s || !s->engine || n_tokens < 2u || n_tokens > 5u) return false;
+    const ds4_engine *e = s->engine;
+    const ds4_gpu_graph *g = &s->graph;
+#ifdef DS4_ROCM_BUILD
+    const char *prequant = getenv("DS4_ROCM_DSV4_PREQUANT_DECODE");
+    if (prequant && (prequant[0] == '\0' || strcmp(prequant, "0") == 0)) {
+        return false;
+    }
+#endif
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * DS4_N_HC +
+                            (uint64_t)DS4_N_HC * DS4_N_HC;
+
+    /* Decide the whole span before embeddings, cache writes, capture reset, or
+     * command encoding. An admitted path never falls back after a row starts. */
+    if (g->placement || g->active_tier != 0 || g->raw_cap == 0u ||
+        g->ssd_streaming || g->ssd_streaming_cold || g->quality ||
+        e->tp.active || g->tp_world > 1u || g->cuda_tp_decode ||
+        g->cuda_tp_attn || g->cuda_tp_moe || g->cuda_tp_shared ||
+        !g->shared_gate_up_swiglu_fuse || g->materialize_ffn_out ||
+        g->decode_stage_profile || g->decode_index_stage_profile ||
+        g->output_stage_profile || g_expert_profile.active ||
+        g->debug_deferred_active ||
+        metal_graph_debug_get_config()->prefix != NULL ||
+        getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") != NULL ||
+        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
+        getenv("DS4_MOE_REPLAY_SELECTED_IDS") != NULL ||
+        metal_graph_directional_steering_attn_enabled(g) ||
+        metal_graph_directional_steering_ffn_enabled(g) ||
+        metal_graph_use_reference_hc_decode() ||
+        metal_graph_use_reference_kv_decode() ||
+        metal_graph_use_reference_qkv_norm() ||
+        metal_graph_use_reference_qkv_pair_proj() ||
+        metal_graph_use_reference_compressor_pair_proj() ||
+        metal_graph_use_reference_hc_norm_decode() ||
+        metal_graph_use_reference_shared_down_hc() ||
+        metal_graph_use_reference_attn_out_hc() ||
+        metal_graph_use_q4_selected_shared_overlap(g) ||
+        metal_graph_use_iq2_selected_shared_overlap(g) ||
+        metal_graph_use_cuda_selected_shared_overlap(g) ||
+        metal_graph_use_iq2_selected_readahead_shared_delay(g)) {
+        return false;
+    }
+
+    const ds4_gpu_tensor *batch_cur_hc = metal_graph_batch_cur_hc(g);
+    const ds4_gpu_tensor *shared_out = metal_graph_shared_out(g);
+    const ds4_gpu_tensor *batch_ffn_norm = metal_graph_batch_ffn_norm(g);
+    const ds4_gpu_tensor *batch_routed_out = metal_graph_batch_routed_out(g);
+    const ds4_gpu_tensor *batch_after_attn_hc =
+        metal_graph_batch_after_attn_hc(g);
+    const ds4_gpu_tensor *batch_hc_split = metal_graph_batch_hc_split(g);
+    const ds4_gpu_tensor *batch_gate = metal_graph_batch_shared_gate(g);
+    const ds4_gpu_tensor *batch_up = metal_graph_batch_shared_up(g);
+    const ds4_gpu_tensor *batch_mid = metal_graph_batch_shared_mid(g);
+    if (!batch_cur_hc || !shared_out || !batch_ffn_norm ||
+        !batch_routed_out || !batch_after_attn_hc || !batch_hc_split ||
+        !batch_gate || !batch_up || !batch_mid ||
+        ds4_gpu_tensor_bytes(batch_cur_hc) <
+            2u * (uint64_t)n_tokens * hc_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(shared_out) <
+            (uint64_t)DS4_N_EMBD * sizeof(float) ||
+        ds4_gpu_tensor_bytes(batch_ffn_norm) <
+            (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float) ||
+        ds4_gpu_tensor_bytes(batch_routed_out) <
+            (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float) ||
+        ds4_gpu_tensor_bytes(batch_after_attn_hc) <
+            (uint64_t)n_tokens * hc_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(batch_hc_split) <
+            (uint64_t)n_tokens * mix_hc * sizeof(float)) {
+        return false;
+    }
+
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *layer = &e->weights.layer[il];
+        const uint64_t shared_dim = layer->ffn_gate_shexp
+            ? layer->ffn_gate_shexp->dim[1] : 0u;
+        if (!layer->ffn_gate_shexp || !layer->ffn_up_shexp ||
+            !layer->ffn_down_shexp ||
+            layer->ffn_gate_shexp->type != DS4_TENSOR_Q8_0 ||
+            layer->ffn_up_shexp->type != DS4_TENSOR_Q8_0 ||
+            layer->ffn_down_shexp->type != DS4_TENSOR_Q8_0 ||
+            layer->ffn_gate_shexp->ndim != 2 ||
+            layer->ffn_up_shexp->ndim != 2 ||
+            layer->ffn_down_shexp->ndim != 2 ||
+            !g->layer_raw_cache[il] ||
+            layer->ffn_gate_shexp->dim[0] != DS4_N_EMBD ||
+            layer->ffn_up_shexp->dim[0] != DS4_N_EMBD ||
+            layer->ffn_up_shexp->dim[1] != shared_dim ||
+            layer->ffn_down_shexp->dim[0] != shared_dim ||
+            layer->ffn_down_shexp->dim[1] != DS4_N_EMBD ||
+            shared_dim == 0u ||
+            ds4_gpu_tensor_bytes(batch_gate) <
+                (uint64_t)n_tokens * shared_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(batch_up) <
+                (uint64_t)n_tokens * shared_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(batch_mid) <
+                (uint64_t)n_tokens * shared_dim * sizeof(float) ||
+            metal_graph_decode_stage_profile_enabled(il) ||
+            metal_graph_layer_stage_profile_enabled(il) ||
+            metal_graph_decode_cpu_router_applicable(g, layer)) {
+            return false;
+        }
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            if (metal_graph_needs_ffn_out(g, il, pos0 + i)) return false;
+        }
+    }
+    return true;
+}
+
+static bool ds4_session_eval_layer_slice_exact_shared_rows_layer(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        uint32_t il,
+        uint32_t pos0,
+        const int *tokens,
+        uint32_t n_tokens,
+        ds4_gpu_tensor **cur,
+        ds4_gpu_tensor **next) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * DS4_N_HC +
+                            (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t norm_row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t hc_row_bytes = hc_dim * sizeof(float);
+    const uint64_t split_row_bytes = mix_hc * sizeof(float);
+    const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
+    const uint64_t shared_row_bytes = shared_dim * sizeof(float);
+    bool ok = true;
+
+    /* Keep all causal state transitions row ordered. Only after each row has
+     * finished KV/compressor/indexer/attention/router/routed-MoE do we save
+     * the four one-row inputs that the delayed shared-down needs. */
+    for (uint32_t i = 0; ok && i < n_tokens; i++) {
+        const uint32_t pos = pos0 + i;
+        const uint32_t raw_row = pos % g->raw_cap;
+        g->cur_hc_by_tier[g->active_tier] = cur[i];
+        g->after_ffn_hc_by_tier[g->active_tier] = next[i];
+        ok = metal_graph_encode_decode_layer_phase(
+                g, model, layer, il, pos,
+                g->layer_raw_cache[il], g->raw_cap, raw_row,
+                metal_graph_raw_span_for_batch(g, pos, 1), tokens[i],
+                METAL_DECODE_LAYER_TO_SHARED_MID);
+        if (ok) ok = ds4_gpu_tensor_copy(
+                metal_graph_batch_ffn_norm(g),
+                (uint64_t)i * norm_row_bytes,
+                metal_graph_ffn_norm(g), 0, norm_row_bytes) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(
+                metal_graph_batch_routed_out(g),
+                (uint64_t)i * norm_row_bytes,
+                metal_graph_routed_out(g), 0, norm_row_bytes) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(
+                metal_graph_batch_after_attn_hc(g),
+                (uint64_t)i * hc_row_bytes,
+                metal_graph_after_attn_hc(g), 0, hc_row_bytes) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(
+                metal_graph_batch_hc_split(g),
+                (uint64_t)i * split_row_bytes,
+                metal_graph_hc_split(g), 0, split_row_bytes) != 0;
+    }
+
+    ds4_gpu_tensor *gate = NULL;
+    ds4_gpu_tensor *up = NULL;
+    ds4_gpu_tensor *mid = NULL;
+    if (ok) {
+        gate = ds4_gpu_tensor_view(metal_graph_batch_shared_gate(g), 0,
+                                   (uint64_t)n_tokens * shared_row_bytes);
+        up = ds4_gpu_tensor_view(metal_graph_batch_shared_up(g), 0,
+                                 (uint64_t)n_tokens * shared_row_bytes);
+        mid = ds4_gpu_tensor_view(metal_graph_batch_shared_mid(g), 0,
+                                  (uint64_t)n_tokens * shared_row_bytes);
+        ok = gate && up && mid;
+    }
+    if (ok) {
+        ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                gate, up, mid, model->map, model->size,
+                layer->ffn_gate_shexp->abs_offset,
+                layer->ffn_up_shexp->abs_offset,
+                DS4_N_EMBD, shared_dim,
+                metal_graph_batch_ffn_norm(g), n_tokens,
+                DS4_SWIGLU_CLAMP_EXP) != 0;
+    }
+
+    /* Preserve exact decode arithmetic after the only batched call: each row
+     * uses the ordinary one-row shared-down + residual HC expansion, then the
+     * ordinary graph-pointer swap and capture, in causal row order. */
+    for (uint32_t i = 0; ok && i < n_tokens; i++) {
+        ds4_gpu_tensor *mid_row = metal_graph_tensor_row_view(
+                mid, i, shared_dim);
+        ds4_gpu_tensor *routed_row = metal_graph_tensor_row_view(
+                metal_graph_batch_routed_out(g), i, DS4_N_EMBD);
+        ds4_gpu_tensor *after_attn_row = metal_graph_tensor_row_view(
+                metal_graph_batch_after_attn_hc(g), i, hc_dim);
+        ds4_gpu_tensor *split_row = metal_graph_tensor_row_view(
+                metal_graph_batch_hc_split(g), i, mix_hc);
+        ok = mid_row && routed_row && after_attn_row && split_row;
+        if (ok) {
+            ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+                    next[i], metal_graph_shared_out(g),
+                    model->map, model->size,
+                    layer->ffn_down_shexp->abs_offset,
+                    shared_dim, DS4_N_EMBD, mid_row, routed_row,
+                    after_attn_row, split_row, DS4_N_EMBD, DS4_N_HC) != 0;
+        }
+        ds4_gpu_tensor_free(split_row);
+        ds4_gpu_tensor_free(after_attn_row);
+        ds4_gpu_tensor_free(routed_row);
+        ds4_gpu_tensor_free(mid_row);
+        if (ok) {
+            ds4_gpu_tensor *tmp = cur[i];
+            cur[i] = next[i];
+            next[i] = tmp;
+            g->cur_hc_by_tier[g->active_tier] = cur[i];
+            g->after_ffn_hc_by_tier[g->active_tier] = next[i];
+            ok = metal_graph_dspark_capture_decode_layer(g, il);
+        }
+    }
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(gate);
+    return ok;
+}
+
 static int ds4_session_eval_layer_slice_exact_span(
         ds4_session *s,
         const int *tokens,
@@ -61614,6 +61865,14 @@ static int ds4_session_eval_layer_slice_exact_span(
         s->checkpoint_valid = false;
         return 1;
     }
+
+    /* The nested shared-row decision is span-wide and precedes every graph or
+     * cache mutation. Unsupported configurations retain the existing exact
+     * span unchanged, even when the nested environment variable is present. */
+    const bool batch_shared_rows =
+        ds4_session_eval_layer_slice_exact_shared_rows_enabled() &&
+        ds4_session_eval_layer_slice_exact_shared_rows_supported(
+            s, n_tokens, pos0, layer_start, layer_end);
 
     ds4_gpu_tensor *cur[5];
     ds4_gpu_tensor *next[5];
@@ -61661,6 +61920,12 @@ static int ds4_session_eval_layer_slice_exact_span(
         ok = ds4_gpu_begin_commands() != 0;
     }
     for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+        if (batch_shared_rows) {
+            ok = ds4_session_eval_layer_slice_exact_shared_rows_layer(
+                    g, &e->model, &e->weights.layer[il], il, pos0,
+                    tokens, n_tokens, cur, next);
+            continue;
+        }
         for (uint32_t i = 0; i < n_tokens; i++) {
             const uint32_t pos = pos0 + i;
             const uint32_t raw_row = pos % g->raw_cap;
@@ -61739,7 +62004,13 @@ static int ds4_session_eval_layer_slice_exact_span(
         }
         if (errlen) snprintf(err, errlen, "%s layer-slice exact span failed",
                              ds4_backend_name(e->backend));
-        s->checkpoint_valid = false;
+        if (batch_shared_rows) {
+            /* Cache and capture state may contain only a prefix of this
+             * layer-major span. Never expose it to a retry or fallback. */
+            ds4_session_invalidate(s);
+        } else {
+            s->checkpoint_valid = false;
+        }
         return 1;
     }
     ds4_session_slice_commit_timeline(s, tokens, n_tokens);
