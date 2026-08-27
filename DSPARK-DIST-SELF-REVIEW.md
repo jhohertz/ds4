@@ -394,12 +394,12 @@ Cost split (profile-by-inspection of the sealed v23c logs + code)
   head/layer weight re-stream — both are what `ds4_session_eval_layer_slice_exact_rows`
   was doing.
 
-Experimental implementation (ds4.c only, additive +200 lines)
+Experimental implementation (still opt-in)
 
 - `ds4_session_eval_layer_slice_exact_span` (ds4.c, `#ifndef DS4_NO_GPU`)
   attempts to reuse the one-token layer kernels in one command buffer per
   *span* instead of per row:
-  - 2..8 rows ride `metal_graph_encode_decode_layer` (ds4.c:25634) — the
+  - 2..5 rows ride `metal_graph_encode_decode_layer` (ds4.c:25634) — the
     identical layer kernel the single-token decode path uses — interleaved
     per layer (row 0..n-1 within each layer) so each layer's weights are
     streamed once and reused by every row.  The interleave is the same
@@ -409,15 +409,18 @@ Experimental implementation (ds4.c only, additive +200 lines)
     `hc_weighted_sum` and output-norm stages one row at a time through the
     same single-token kernels (n_tok == 1 => the ordered-chunk f16 reduce)
     and then batches only the Q8 vocab matmul via
-    `metal_graph_encode_output_head_exact_span` (ds4.c:26277).  The batched
-    Q8 stage still streams the ~562 MiB head weights exactly once instead of
-    once per row; the f16/norm stages keep the per-row reduction order.
+    `metal_graph_encode_output_head_exact_span` (ds4.c:26313).  The candidate
+    now sends an unpadded 2..5-row span to
+    `ds4_gpu_matmul_q8_0_decode_rows_exact_tensor`; Q8 output-TP shards use the
+    same exact API.  Unsupported output weights or shapes fail closed rather
+    than selecting a generic multi-row projection.
   - One `ds4_gpu_end_commands()` + one `ds4_gpu_tensor_read_any()` per span
     replaces 2*N syncs + 2*N readbacks.
 - `ds4_session_eval_layer_slice_exact_rows` dispatches to the span only when
   `DS4_DIST_SPEC_EXACT_SPAN=1` explicitly opts into the experiment and the
-  span is single-tier, 2..8 rows, `2*n <= prefill_cap`, and (for the worker)
-  `spec_logits` is present.  The default keeps the original per-row loop.
+  span is single-tier, 2..5 rows, `2*n <= prefill_cap`, and (for the worker)
+  `spec_logits` is present.  Spans above five rows and the default path keep
+  the original per-row loop.
   The outer exact gate (`DS4_DIST_SPEC_EXACT`, ROCm-only) is unchanged, and
   Metal/CPU/GLM/large spans still take the batched-verify + replay arm.
 
@@ -431,24 +434,19 @@ Original exactness argument and failed assumption
   weight-hot transformation, but v25f proves that the complete span cannot be
   called exact without differential hidden-state and logits evidence.
 - Head part (f16/norm stages): `metal_graph_encode_output_head_exact_span`
-  (ds4.c:26277) runs `output_hc_fn`, `output_hc_weights`, `hc_weighted_sum`
-  and `output_norm` over per-row views with `n_tok == 1`, so
+  runs `output_hc_fn`, `output_hc_weights`, `hc_weighted_sum` and
+  `output_norm` over per-row views with `n_tok == 1`, so
   `ds4_gpu_matmul_f16_tensor` selects the ordered-chunk single-token kernel
   (rocm/ds4_rocm_matmul.cuh:927-978) rather than the n_tok > 1 cublas/tree
-  kernel; every stage whose result feeds sigmoid / norm is therefore
-  bit-identical to a one-row head by construction.  Only the final Q8 vocab
-  matmul is batched: `metal_graph_output_logits_head_matmul` (ds4.c:26029)
-  pads 2..7 rows to 8 and selects
-  `matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel`
-  (rocm/ds4_rocm_q8.cuh:886) for n_tok in 2..8.  That kernel accumulates per
-  output row as `for b ascending: acc += (d*q)*x[b*32+lane]` then
-  `warp_sum_f32`, the same reduction order (blocks ascending, warp sum last)
-  and the same `q8_0_scale_broadcast_w32` operand scale as the single-token
-  `matmul_q8_0_f32_sharedx_warp_rows_w32_kernel` (rocm/ds4_rocm_q8.cuh:670);
-  the zero-padding rows are never read by the coordinator (it reads only
-  `n_tokens` rows).  This source-level reduction-order argument did not prove
-  identical compiler contraction or kernel arithmetic; the v25f result below
-  disproved the end-to-end identity claim.
+  kernel; these stages are intended to retain the one-row arithmetic path.
+  v25f showed that the old final Q8 path did not: it padded 2..7 rows to 8 and
+  selected a generic ROCm direct-F32 batch kernel instead of the serial one-row
+  Q8 prequant path.  The
+  next candidate removes that padding and routes to the exact 2..5-row
+  prequant kernel.  If prequant is disabled or its scratch is unavailable, the
+  exact API issues ordinary one-row calls and never a generic multi-row call.
+  This is an implementation fix, not yet end-to-end exactness or performance
+  evidence.
 - Capture ring: the interleaved loop swaps the graph's `cur_hc_by_tier` /
   `after_ffn_hc_by_tier` pointers alongside the local ping-pong swap before
   `metal_graph_dspark_capture_decode_layer`, mirroring the single-token decode
@@ -485,22 +483,23 @@ ROCm validation result and containment
   `5f38d237fa0622975c53d5affca6e86e66f18cba5294e5aa18475e5a436ccc71`),
   restored prefill (82.24 versus 82.10 tokens/s), and was wall-neutral
   (36.554s versus 36.519s). Restoration and dmesg gates passed.
-- The runtime fix tracks the first mapping as the primary target. In a
+- The runtime fix uses an explicitly marked primary target mapping. In a
   multi-model process, target Q8-to-F16 ranges remain eligible and are not
   discarded merely because a support mapping is loaded; support-model
   expansion remains disabled by default unless the existing explicit env opts
   it in. If an eligible primary preload cannot be created, startup fails rather
-  than silently selecting different target arithmetic. Thus loading DSpark no
-  longer changes ordinary target arithmetic or spends optional memory on
-  expanded support weights. The engine marks the primary mapping explicitly;
-  model handoffs synchronize before source-range release, and a support-cache
-  failure disables only support expansion instead of discarding valid target
-  ranges.
-- `tests/test_q8_krow_rocm.c` now includes a multi-model regression: it enters
+  than silently selecting different target arithmetic. Model handoffs
+  synchronize before source-range release, and a support-cache failure disables
+  only support expansion instead of discarding valid target ranges.
+- `tests/test_q8_krow_rocm.c` includes a multi-model regression: it enters
   multi-model mode, requires a 2048x4096 primary Q8-to-F16 preload, evaluates
   eight rows, maps a second support image, and requires bitwise-identical target
   output afterward.
-- `DS4_DIST_SPEC_EXACT` is still explicit opt-in. The default verifies drafts,
+- The exact-head dispatch fix additionally removes the old 2..7-row padding
+  and exercises the production 7168-wide input in both prequant-enabled and
+  disabled modes. It has not yet been performance-tested on ROCm and does not
+  establish complete hidden/KV or host-output identity.
+- `DS4_DIST_SPEC_EXACT` remains explicit opt-in. The default verifies drafts,
   restores the speculative frontier, and serially replays accepted tokens.
   `DS4_DIST_SPEC_EXACT_SPAN` remains nested and experimental.
 
@@ -509,10 +508,13 @@ Validation required before any direct-commit default
 1. ROCm-build the primary-only multi-model cache fix, prove no-env support-loaded
    plain decode matches no-spec for at least 512 greedy token IDs, and inspect
    memory/cache telemetry on both ranks.
-2. Repeat the replay-default speculative arm with real proposals and accepts;
+2. Run the ROCm k-row test at the real 7168-wide input for every 2..5-row
+   exact-API span and byte-compare it with separate one-row calls; then repeat
+   with the production vocabulary output width.
+3. Repeat the replay-default speculative arm with real proposals and accepts;
    require exact token identity now that target arithmetic is held constant.
-3. Compare per-row verifier and replay hidden rows, KV/compressed-KV,
+4. Compare fast-span and per-row hidden rows, KV/compressed-KV,
    compressor/indexer state, capture state, and final logits before considering
    direct verifier-state retention.
-4. Separately prove any fast head byte-identical at production dimensions.
-   Only after all state and token gates pass may verifier state bypass replay.
+5. Only after all state and token gates pass may verifier state bypass replay
+   or the experimental exact span become a default.

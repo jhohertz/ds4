@@ -1,4 +1,6 @@
 /* Bit-exactness test for the ROCm k-row Q8_0 prequant matvec tier.
+ * Includes the production 7168-wide vocabulary-head input with a small output
+ * dimension so dispatch arithmetic is realistic without a large test model.
  *
  * The decode tier (matmul_q8_0_preq_rows_w32_kernel) defines the reference
  * summation order for one-row evals.  The k-row tier must produce, for
@@ -18,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -62,7 +65,7 @@ static void fill_q8_weights(uint8_t *w, uint32_t out_dim, uint32_t blocks) {
     }
 }
 
-static int run_shape(const shape *sh) {
+static int run_shape(const shape *sh, bool exact_api_only) {
     const uint32_t in_dim = sh->in_dim;
     const uint32_t out_dim = sh->out_dim;
     const uint32_t blocks = (in_dim + 31u) / 32u;
@@ -205,6 +208,8 @@ static int run_shape(const shape *sh) {
         }
         fprintf(stderr, ") %.3f ms/call\n", best);
     }
+
+    if (exact_api_only) goto cleanup;
 
     /* Pair entry point: n_rows in 2..5 must match per-row one-row pair
      * calls, whose reduction order comes from the fused pair kernel. */
@@ -515,14 +520,37 @@ cleanup:
     return ok;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    const bool fallback_mode = argc == 2 &&
+                               strcmp(argv[1], "--prequant-disabled") == 0;
+    if (argc != 1 && !fallback_mode) {
+        fprintf(stderr, "usage: %s [--prequant-disabled]\n", argv[0]);
+        return 2;
+    }
+    if (!fallback_mode) {
+        const pid_t child = fork();
+        if (child == 0) {
+            (void)setenv("DS4_ROCM_DSV4_PREQUANT_DECODE", "0", 1);
+            execl(argv[0], argv[0], "--prequant-disabled", (char *)NULL);
+            _exit(127);
+        }
+        int status = 0;
+        if (child < 0 || waitpid(child, &status, 0) != child ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fprintf(stderr, "q8 krow: prequant-disabled subprocess failed\n");
+            return 1;
+        }
+    }
+
     /* Production decode matvec shapes: square attention-sized, the shared
-     * expert pair, a wide FFN, and an odd out_dim for row-guard coverage. */
+     * expert pair, a wide FFN, an odd out_dim for row guards, and the vocab
+     * head's real 7168 input width with a memory-bounded output dimension. */
     const shape shapes[] = {
         {4096u, 4096u},
         {2048u, 4096u},
         {4096u, 14336u},
         {4096u, 4099u},
+        {7168u, 257u},
     };
     if (!ds4_gpu_init()) {
         fprintf(stderr, "q8 krow: ds4_gpu_init failed\n");
@@ -531,10 +559,12 @@ int main(void) {
     ds4_gpu_set_quality(false);
     ds4_gpu_set_ssd_streaming(false);
     int ok = 1;
-    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
-        if (!run_shape(&shapes[i])) ok = 0;
+    const size_t first = fallback_mode ?
+        sizeof(shapes) / sizeof(shapes[0]) - 1u : 0u;
+    for (size_t i = first; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        if (!run_shape(&shapes[i], fallback_mode)) ok = 0;
     }
-    if (!test_primary_cache_survives_support_map()) ok = 0;
+    if (!fallback_mode && !test_primary_cache_survives_support_map()) ok = 0;
     ds4_gpu_set_model_map(NULL, 0u);
     ds4_gpu_cleanup();
     fprintf(stderr, "Q8_0 k-row ROCm matvec: %s\n", ok ? "PASS" : "FAIL");

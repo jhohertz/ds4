@@ -25654,7 +25654,8 @@ static bool metal_graph_output_logits_head_matmul(
         ds4_gpu_tensor       *norm_full,
         ds4_gpu_tensor       *dst_logits,
         uint32_t              n_tokens,
-        uint64_t              vocab_dim);
+        uint64_t              vocab_dim,
+        bool                  exact_rows);
 
 /* Encode the final HC collapse, output norm, and vocab projection on Metal. */
 static bool metal_graph_encode_output_head(
@@ -25751,7 +25752,7 @@ static bool metal_graph_encode_output_head(
     } else if (ok && g->cuda_tp_ep && g->cuda_tp_output) {
         ok = metal_graph_output_logits_head_matmul(
                 g, model, weights, metal_graph_output_norm(g),
-                metal_graph_logits(g), 1, vocab_dim);
+                metal_graph_logits(g), 1, vocab_dim, false);
     } else if (ok) {
         ok = metal_graph_matmul_dense_quant_tensor(metal_graph_logits(g),
                                                    model,
@@ -26024,8 +26025,8 @@ static bool metal_graph_read_output_split_top1(
  * tiny MTP suffixes we instead process all rows together and let the GPU reduce
  * each row to a top id; the CPU reads back just those ids plus the last row's
  * logits needed to continue the exact target stream. */
-/* Shared vocab-head matmul: pads small batches to 8 rows for the exact-mma Q8
- * kernel and shards the vocabulary across output-TP tiers. */
+/* Shared vocab-head matmul: normal callers retain the padded batch dispatch;
+ * exact_rows keeps a 2..5-row Q8 span unpadded and in the decode-exact API. */
 static bool metal_graph_output_logits_head_matmul(
         ds4_gpu_graph        *g,
         const ds4_model      *model,
@@ -26033,18 +26034,28 @@ static bool metal_graph_output_logits_head_matmul(
         ds4_gpu_tensor       *norm_full,
         ds4_gpu_tensor       *dst_logits,
         uint32_t              n_tokens,
-        uint64_t              vocab_dim) {
-    if (!g || !model || !weights || !norm_full || n_tokens == 0 ||
-        !dst_logits ||
+        uint64_t              vocab_dim,
+        bool                  exact_rows) {
+    if (!g || !model || !weights || !weights->output || !norm_full ||
+        n_tokens == 0 || !dst_logits ||
         ds4_gpu_tensor_bytes(dst_logits) <
             (uint64_t)n_tokens * vocab_dim * sizeof(float)) {
         return false;
     }
-    const uint32_t head_rows =
-        (n_tokens > 1 && n_tokens < 8 &&
-         ds4_gpu_tensor_bytes(dst_logits) >= 8u * vocab_dim * sizeof(float) &&
-         ds4_gpu_tensor_bytes(norm_full) >=
-             8u * DS4_N_EMBD * sizeof(float)) ? 8u : n_tokens;
+    if (exact_rows &&
+        (n_tokens < 2u || n_tokens > 5u ||
+         weights->output->type != DS4_TENSOR_Q8_0 ||
+         weights->output->ndim != 2 ||
+         weights->output->dim[0] != DS4_N_EMBD ||
+         weights->output->dim[1] != vocab_dim ||
+         (DS4_N_EMBD & 31u) != 0u)) {
+        return false;
+    }
+    const uint32_t head_rows = exact_rows ? n_tokens :
+        ((n_tokens > 1 && n_tokens < 8 &&
+          ds4_gpu_tensor_bytes(dst_logits) >= 8u * vocab_dim * sizeof(float) &&
+          ds4_gpu_tensor_bytes(norm_full) >=
+              8u * DS4_N_EMBD * sizeof(float)) ? 8u : n_tokens);
     ds4_gpu_tensor *output_norm =
         ds4_gpu_tensor_view(norm_full,
                             0,
@@ -26129,17 +26140,30 @@ static bool metal_graph_output_logits_head_matmul(
                                     0,
                                     (uint64_t)head_rows * DS4_N_EMBD *
                                         sizeof(float));
-            ok = shard_out && (t == home_tier || shard_in) &&
-                 ds4_gpu_matmul_q8_0_tensor(shard_out,
-                                            model->map,
-                                            model->size,
-                                            weights->output->abs_offset +
-                                                split_start[i] * row_bytes,
-                                            DS4_N_EMBD,
-                                            split_count[i],
-                                            t == home_tier ? output_norm :
-                                                             shard_in,
-                                            head_rows) != 0;
+            ok = shard_out && (t == home_tier || shard_in);
+            if (ok && exact_rows) {
+                ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                         shard_out,
+                         model->map,
+                         model->size,
+                         weights->output->abs_offset +
+                             split_start[i] * row_bytes,
+                         DS4_N_EMBD,
+                         split_count[i],
+                         t == home_tier ? output_norm : shard_in,
+                         head_rows) != 0;
+            } else if (ok) {
+                ok = ds4_gpu_matmul_q8_0_tensor(
+                         shard_out,
+                         model->map,
+                         model->size,
+                         weights->output->abs_offset +
+                             split_start[i] * row_bytes,
+                         DS4_N_EMBD,
+                         split_count[i],
+                         t == home_tier ? output_norm : shard_in,
+                         head_rows) != 0;
+            }
             ds4_gpu_tensor_free(shard_in);
             ds4_gpu_tensor_free(shard_out);
         }
@@ -26167,13 +26191,26 @@ static bool metal_graph_output_logits_head_matmul(
             }
         }
     } else if (ok && !(g->cuda_tp_ep && g->cuda_tp_output)) {
-        ok = metal_graph_matmul_dense_quant_tensor(logits,
-                                                   model,
-                                                   weights->output,
-                                                   DS4_N_EMBD,
-                                                   vocab_dim,
-                                                   output_norm,
-                                                   head_rows);
+        if (exact_rows) {
+            ok = !g->cuda_tp_output &&
+                 ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                     logits,
+                     model->map,
+                     model->size,
+                     weights->output->abs_offset,
+                     DS4_N_EMBD,
+                     vocab_dim,
+                     output_norm,
+                     head_rows) != 0;
+        } else {
+            ok = metal_graph_matmul_dense_quant_tensor(logits,
+                                                       model,
+                                                       weights->output,
+                                                       DS4_N_EMBD,
+                                                       vocab_dim,
+                                                       output_norm,
+                                                       head_rows);
+        }
     } else if (ok) {
         /* The expert-parallel cache stores only output vocabulary shards, so
          * a single-device full-head fallback would access uncached weights. */
@@ -26249,7 +26286,7 @@ static bool metal_graph_encode_output_head_batch(
                                                        DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_output_logits_head_matmul(
             g, model, weights, metal_graph_batch_ffn_norm(g),
-            g->spec_logits, n_tokens, vocab_dim);
+            g->spec_logits, n_tokens, vocab_dim, false);
 
     ds4_gpu_tensor_free(output_norm);
     ds4_gpu_tensor_free(output_embd);
@@ -26270,10 +26307,9 @@ static ds4_gpu_tensor *metal_graph_tensor_row_view(
  * the sequential decode head uses, so the f16 reduction is the ordered-chunk
  * n_tok == 1 order, not the n_tok > 1 cublas/tree order.  The per-row
  * output_norm rows land contiguously in batch_ffn_norm, which
- * metal_graph_output_logits_head_matmul then projects through the Q8 vocab
- * weights as one batched matmul: that stage reduces warp-ordered per row and
- * streaming the vocab weights once is the 562 MiB re-stream win this span was
- * built to keep. */
+ * metal_graph_output_logits_head_matmul then projects through the exact tiny-row
+ * Q8 API without padding.  The ROCm k-row tier preserves one-row arithmetic
+ * while streaming the vocab weights once. */
 static bool metal_graph_encode_output_head_exact_span(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -26326,7 +26362,7 @@ static bool metal_graph_encode_output_head_exact_span(
     }
     if (ok) ok = metal_graph_output_logits_head_matmul(
             g, model, weights, metal_graph_batch_ffn_norm(g),
-            g->spec_logits, n_tokens, vocab_dim);
+            g->spec_logits, n_tokens, vocab_dim, true);
     return ok;
 }
 
@@ -61522,13 +61558,10 @@ bool ds4_session_dist_spec_exact_verify(const ds4_session *s, uint32_t n_tokens)
 
 #ifndef DS4_NO_GPU
 /* Experimental weight-hot verifier span.  The transformer and pre-vocab
- * head stages use the ordinary one-row kernels, but the final Q8 vocabulary
- * projection is padded and dispatched as a multi-row ROCm matmul.  That
- * kernel is not structurally identical to the serial shared-X decode head;
- * a long greedy identity run demonstrated that its last-row logits can
- * eventually select a different token.  Keep the optimization available for
- * differential research, but exact mode must default to the ordinary per-row
- * head below until the complete fast output head is byte-identical. */
+ * head stages use the ordinary one-row kernels, and the final Q8 vocabulary
+ * projection uses the unpadded 2..5-row decode-exact API.  Keep the
+ * optimization opt-in until hidden/KV state and long greedy identity have
+ * also been demonstrated end to end. */
 static bool ds4_session_eval_layer_slice_exact_span_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -61565,7 +61598,7 @@ static int ds4_session_eval_layer_slice_exact_span(
     /* The interleaved ping-pong needs two hc rows per token.  The dispatcher
      * already checked width and single-tier; these bounds are the fail-closed
      * guards in case a future caller reaches the span directly. */
-    if (n_tokens < 2u || n_tokens > 8u ||
+    if (n_tokens < 2u || n_tokens > 5u ||
         2u * (uint64_t)n_tokens > (uint64_t)s->prefill_cap) {
         if (errlen) snprintf(err, errlen, "layer-slice exact span is too wide");
         s->checkpoint_valid = false;
@@ -61582,8 +61615,8 @@ static int ds4_session_eval_layer_slice_exact_span(
         return 1;
     }
 
-    ds4_gpu_tensor *cur[8];
-    ds4_gpu_tensor *next[8];
+    ds4_gpu_tensor *cur[5];
+    ds4_gpu_tensor *next[5];
     for (uint32_t i = 0; i < n_tokens; i++) {
         cur[i] = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g), i, hc_dim);
         next[i] = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g),
@@ -61790,12 +61823,10 @@ int ds4_session_eval_layer_slice_exact_rows(ds4_session *s,
         return 1;
     }
     /* Fast span path: one command buffer, weight-hot interleaved layers, and
-     * one batched head.  The batch_cur_hc ping-pong needs two hc rows per
-     * token, so it only applies to the same single-tier, 2..8-row verify
-     * spans the dist spec gate already admits.  Wider/multi-tier spans keep
-     * the original per-row loop. */
+     * one exact tiny-row head.  The ROCm k-row tier is defined for 2..5 rows;
+     * wider and multi-tier spans keep the original per-row loop. */
     if (ds4_session_eval_layer_slice_exact_span_enabled() &&
-        n_tokens >= 2u && n_tokens <= 8u &&
+        n_tokens >= 2u && n_tokens <= 5u &&
         2u * (uint64_t)n_tokens <= (uint64_t)s->prefill_cap &&
         s->graph.placement == NULL &&
         s->graph.raw_cap != 0 &&
