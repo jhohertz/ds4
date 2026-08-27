@@ -541,6 +541,16 @@ ROCm validation result and containment
   limited. The bilateral build hashes, tests, restoration gates, and dmesg
   deltas all passed. This establishes exact Q8-head dispatch and isolated
   speedup, not complete hidden/KV or end-to-end inference identity.
+- Sealed bilateral ROCm bundle `stage3-223b182-krow-v2` then validated the
+  default-off shared gate/up exact-row implementation at commit
+  `223b182e48c29b4cee22474a910262c1007227e0`. Both hosts produced identical
+  production and test binary hashes, passed normal `strix-halo`, distributed,
+  TP, MXFP4, graph, Q8 K=2..5, and production-head gates, and passed all four
+  fail-closed shared-row static contracts. Restoration, zero dmesg deltas,
+  and all 226 sealed evidence rows passed. This proves bilateral compilation,
+  unchanged head arithmetic, and the source-level admission contract; it does
+  not yet prove that production inference admits the shared path or preserves
+  end-to-end identity.
 - Sealed no-env bundle `stage3-11a0c28-inference-v32e` also validated the
   default primary-target cache policy with a loaded support model and
   `DS4_MTP_SPEC_DISABLE=1`. Both 512-token payloads were byte-identical to each
