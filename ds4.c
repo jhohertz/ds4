@@ -15106,6 +15106,11 @@ typedef struct {
     ds4_gpu_tensor *router_probs_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *router_selected_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *router_weights_by_tier[DS4_MAX_GPUS];
+    /* Ephemeral exact-span diagnostic destination. When non-NULL, the router
+     * queues its selected IDs here before any following row can overwrite the
+     * singleton router_selected tensor. Never owned by the graph. */
+    ds4_gpu_tensor *exact_route_probe_arena;
+    uint64_t exact_route_probe_offset;
     ds4_gpu_tensor *routed_gate_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *routed_up_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *routed_mid_by_tier[DS4_MAX_GPUS];
@@ -22392,6 +22397,12 @@ static bool metal_graph_encode_decode_layer_phase(
     const int cuda_tp_home_tier = g->active_tier;
     const int cuda_tp_partner_tier = g->cuda_tp_decode
         ? metal_graph_cuda_tp_partner_tier(cuda_tp_home_tier) : -1;
+    /* Cache the default-off diagnostic check once for this layer invocation.
+     * ROCm and Metal execute eagerly; CUDA graph islands are disabled while
+     * the destination is armed so every replayed router still queues a copy. */
+    const bool exact_route_probe =
+        g->exact_route_probe_arena != NULL &&
+        phase != METAL_DECODE_LAYER_FROM_ROUTER;
     const bool tp_split_attn = g->tp_world == 2;
     const uint32_t tp_heads = tp_split_attn ?
         (uint32_t)DS4_N_HEAD / 2u : (uint32_t)DS4_N_HEAD;
@@ -22483,6 +22494,7 @@ static bool metal_graph_encode_decode_layer_phase(
         !decode_stage_profile &&
         !g_expert_profile.active &&
         metal_graph_debug_get_config()->prefix == NULL &&
+        !exact_route_probe &&
         ds4_gpu_decode_graphs_supported() != 0;
     const bool island_a_ok =
         decode_graphs_common_ok &&
@@ -24370,6 +24382,20 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                    layer->ffn_gate_exps->bytes,
                                                                    layer->ffn_down_exps->bytes,
                                                                    g);
+    }
+    /* The exact-span probe is deliberately captured at the router boundary:
+     * this D2D blit is ordered after selection and before routed-MoE or the
+     * next row can reuse router_selected. It adds no synchronization. */
+    if (ok && exact_route_probe) {
+        const uint64_t selected_bytes =
+            (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t);
+        ok = ds4_gpu_tensor_copy(
+                g->exact_route_probe_arena,
+                g->exact_route_probe_offset,
+                metal_graph_router_selected(g),
+                0,
+                selected_bytes) != 0;
+        if (ok) g->exact_route_probe_offset += selected_bytes;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     DS4_TP_DECODE_STAGE_CHECK("router");
@@ -50330,6 +50356,9 @@ struct ds4_session {
 #endif
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
+#ifndef DS4_NO_GPU
+    uint64_t exact_route_probe_spans;
+#endif
     ds4_session_progress_fn progress;
     void *progress_ud;
     ds4_session_progress_fn display_progress;
@@ -61601,6 +61630,209 @@ static bool ds4_session_eval_layer_slice_exact_shared_rows_enabled(void) {
     return cached != 0;
 }
 
+typedef struct {
+    ds4_gpu_tensor *arena;
+    int32_t *host_ids;
+    uint64_t arena_bytes;
+    uint32_t rows;
+    uint32_t layer_start;
+    uint32_t layer_end;
+} ds4_exact_route_probe;
+
+static bool ds4_session_eval_layer_slice_exact_route_probe_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_DIST_SPEC_EXACT_ROUTE_PROBE");
+        cached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/* UINT64_MAX means unlimited. A present limit must be a bounded positive
+ * integer; malformed values fail the requested diagnostic closed. */
+static bool ds4_session_eval_layer_slice_exact_route_probe_limit(
+        uint64_t *limit_out) {
+    static int cached = -1;
+    static uint64_t cached_limit = UINT64_MAX;
+    if (cached < 0) {
+        const char *env = getenv("DS4_DIST_SPEC_EXACT_ROUTE_PROBE_LIMIT");
+        cached = 1;
+        if (env && env[0]) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long long value = strtoull(env, &end, 10);
+            if (end == env || *end != '\0' || errno != 0 || value == 0u ||
+                value > UINT32_MAX) {
+                cached = 0;
+            } else {
+                cached_limit = (uint64_t)value;
+            }
+        }
+    }
+    if (limit_out) *limit_out = cached_limit;
+    return cached != 0;
+}
+
+static void ds4_exact_route_probe_discard(ds4_exact_route_probe *probe) {
+    if (!probe) return;
+    ds4_gpu_tensor_free(probe->arena);
+    free(probe->host_ids);
+    memset(probe, 0, sizeof(*probe));
+}
+
+static bool ds4_exact_route_probe_prepare(
+        ds4_exact_route_probe *probe,
+        uint32_t rows,
+        uint32_t layer_start,
+        uint32_t layer_end) {
+    if (!probe || rows < 2u || rows > 5u || layer_start > layer_end ||
+        DS4_N_EXPERT_USED == 0u || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
+        return false;
+    }
+    memset(probe, 0, sizeof(*probe));
+    const uint64_t layers = (uint64_t)layer_end - layer_start + 1u;
+    const uint64_t values = layers * rows * DS4_N_EXPERT_USED;
+    if (values > UINT64_MAX / sizeof(int32_t) ||
+        values > SIZE_MAX / sizeof(int32_t)) {
+        return false;
+    }
+    probe->arena_bytes = values * sizeof(int32_t);
+    probe->rows = rows;
+    probe->layer_start = layer_start;
+    probe->layer_end = layer_end;
+    probe->host_ids = malloc((size_t)probe->arena_bytes);
+    if (!probe->host_ids) return false;
+    probe->arena = ds4_gpu_tensor_alloc_ptr_on(0, probe->arena_bytes);
+    if (!probe->arena) {
+        ds4_exact_route_probe_discard(probe);
+        return false;
+    }
+    return true;
+}
+
+static bool ds4_exact_route_probe_line_append(
+        char *line,
+        size_t cap,
+        size_t *used,
+        const char *fmt,
+        ...) {
+    if (!line || !used || *used >= cap) return false;
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf(line + *used, cap - *used, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - *used) return false;
+    *used += (size_t)n;
+    return true;
+}
+
+static bool ds4_exact_route_probe_contains(
+        const int32_t *ids,
+        uint32_t count,
+        int32_t id) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (ids[i] == id) return true;
+    }
+    return false;
+}
+
+static bool ds4_exact_route_probe_emit(
+        const ds4_exact_route_probe *probe,
+        uint32_t pos0,
+        bool shared_rows) {
+    if (!probe || !probe->arena || !probe->host_ids) return false;
+    const uint32_t used_experts = DS4_N_EXPERT_USED;
+    const uint32_t layer_count = probe->layer_end - probe->layer_start + 1u;
+    for (uint32_t layer_index = 0; layer_index < layer_count; layer_index++) {
+        const int32_t *layer_ids = probe->host_ids +
+            (uint64_t)layer_index * probe->rows * used_experts;
+        int32_t union_ids[5u * DS4_MAX_EXPERT_USED];
+        uint32_t union_count = 0;
+        char line[4096];
+        size_t len = 0;
+        bool ok = ds4_exact_route_probe_line_append(
+                line, sizeof(line), &len,
+                "ds4: exact-route-probe pos0=%u rows=%u layers=%u:%u "
+                "layer=%u path=%s raw_sets=",
+                pos0, probe->rows, probe->layer_start, probe->layer_end,
+                probe->layer_start + layer_index,
+                shared_rows ? "shared-rows" : "ordinary");
+        for (uint32_t row = 0; ok && row < probe->rows; row++) {
+            const int32_t *row_ids = layer_ids + (uint64_t)row * used_experts;
+            ok = ds4_exact_route_probe_line_append(
+                    line, sizeof(line), &len, "%sr%u:[",
+                    row == 0u ? "" : ";", row);
+            for (uint32_t slot = 0; ok && slot < used_experts; slot++) {
+                const int32_t id = row_ids[slot];
+                ok = ds4_exact_route_probe_line_append(
+                        line, sizeof(line), &len, "%s%d",
+                        slot == 0u ? "" : ",", id);
+                if (!ds4_exact_route_probe_contains(union_ids, union_count, id)) {
+                    if (union_count >= 5u * DS4_MAX_EXPERT_USED) return false;
+                    union_ids[union_count++] = id;
+                }
+            }
+            if (ok) ok = ds4_exact_route_probe_line_append(
+                    line, sizeof(line), &len, "]");
+        }
+        if (ok) ok = ds4_exact_route_probe_line_append(
+                line, sizeof(line), &len, " adjacent=");
+        for (uint32_t row = 0; ok && row + 1u < probe->rows; row++) {
+            const int32_t *left = layer_ids + (uint64_t)row * used_experts;
+            const int32_t *right = left + used_experts;
+            int32_t intersection[DS4_MAX_EXPERT_USED];
+            int32_t pair_union[2u * DS4_MAX_EXPERT_USED];
+            uint32_t intersection_count = 0;
+            uint32_t pair_union_count = 0;
+            for (uint32_t slot = 0; slot < used_experts; slot++) {
+                const int32_t id = left[slot];
+                if (!ds4_exact_route_probe_contains(
+                            pair_union, pair_union_count, id)) {
+                    pair_union[pair_union_count++] = id;
+                }
+                if (ds4_exact_route_probe_contains(right, used_experts, id) &&
+                    !ds4_exact_route_probe_contains(
+                            intersection, intersection_count, id)) {
+                    intersection[intersection_count++] = id;
+                }
+            }
+            for (uint32_t slot = 0; slot < used_experts; slot++) {
+                const int32_t id = right[slot];
+                if (!ds4_exact_route_probe_contains(
+                            pair_union, pair_union_count, id)) {
+                    pair_union[pair_union_count++] = id;
+                }
+            }
+            ok = ds4_exact_route_probe_line_append(
+                    line, sizeof(line), &len,
+                    "%sr%u-r%u:{intersection=[",
+                    row == 0u ? "" : ";", row, row + 1u);
+            for (uint32_t i = 0; ok && i < intersection_count; i++) {
+                ok = ds4_exact_route_probe_line_append(
+                        line, sizeof(line), &len, "%s%d",
+                        i == 0u ? "" : ",", intersection[i]);
+            }
+            const double jaccard = pair_union_count == 0u ? 1.0 :
+                (double)intersection_count / (double)pair_union_count;
+            if (ok) ok = ds4_exact_route_probe_line_append(
+                    line, sizeof(line), &len,
+                    "],count=%u,jaccard=%.6f}",
+                    intersection_count, jaccard);
+        }
+        if (ok) ok = ds4_exact_route_probe_line_append(
+                line, sizeof(line), &len, " union=[");
+        for (uint32_t i = 0; ok && i < union_count; i++) {
+            ok = ds4_exact_route_probe_line_append(
+                    line, sizeof(line), &len, "%s%d",
+                    i == 0u ? "" : ",", union_ids[i]);
+        }
+        if (ok) ok = ds4_exact_route_probe_line_append(
+                line, sizeof(line), &len, "]");
+        if (!ok || fprintf(stderr, "%s\n", line) < 0) return false;
+    }
+    return true;
+}
+
 static bool ds4_session_eval_layer_slice_exact_shared_rows_required(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -61909,6 +62141,40 @@ static int ds4_session_eval_layer_slice_exact_span(
                 n_tokens, layer_start, layer_end);
     }
 
+    ds4_exact_route_probe route_probe;
+    memset(&route_probe, 0, sizeof(route_probe));
+    ds4_exact_route_probe *active_route_probe = NULL;
+    const bool route_probe_requested =
+        ds4_session_eval_layer_slice_exact_route_probe_enabled();
+    uint64_t route_probe_limit = UINT64_MAX;
+    if (route_probe_requested &&
+        !ds4_session_eval_layer_slice_exact_route_probe_limit(
+                &route_probe_limit)) {
+        if (errlen) {
+            snprintf(err, errlen,
+                     "invalid DS4_DIST_SPEC_EXACT_ROUTE_PROBE_LIMIT");
+        }
+        ds4_session_invalidate(s);
+        return 1;
+    }
+    if (route_probe_requested &&
+        s->exact_route_probe_spans < route_probe_limit) {
+        if (g->exact_route_probe_arena != NULL ||
+            !ds4_exact_route_probe_prepare(
+                    &route_probe, n_tokens, layer_start, layer_end)) {
+            if (errlen) {
+                snprintf(err, errlen,
+                         "exact-span route probe allocation failed");
+            }
+            ds4_exact_route_probe_discard(&route_probe);
+            ds4_session_invalidate(s);
+            return 1;
+        }
+        active_route_probe = &route_probe;
+        g->exact_route_probe_arena = route_probe.arena;
+        g->exact_route_probe_offset = 0;
+    }
+
     ds4_gpu_tensor *cur[5];
     ds4_gpu_tensor *next[5];
     for (uint32_t i = 0; i < n_tokens; i++) {
@@ -61921,7 +62187,10 @@ static int ds4_session_eval_layer_slice_exact_span(
                 ds4_gpu_tensor_free(next[j]);
             }
             if (errlen) snprintf(err, errlen, "layer-slice exact span row views failed");
-            s->checkpoint_valid = false;
+            g->exact_route_probe_arena = NULL;
+            ds4_exact_route_probe_discard(&route_probe);
+            if (active_route_probe) ds4_session_invalidate(s);
+            else s->checkpoint_valid = false;
             return 1;
         }
     }
@@ -61992,6 +62261,14 @@ static int ds4_session_eval_layer_slice_exact_span(
     }
     g->cur_hc_by_tier[g->active_tier] = saved_cur;
     g->after_ffn_hc_by_tier[g->active_tier] = saved_after;
+    if (ok && active_route_probe &&
+        g->exact_route_probe_offset != active_route_probe->arena_bytes) {
+        ok = false;
+    }
+    /* No later command in this span routes an expert. Disarm the borrowed
+     * destination now, but retain its storage through end_commands/readback. */
+    g->exact_route_probe_arena = NULL;
+    g->exact_route_probe_offset = 0;
 
     /* After an odd number of layers the final hidden state of each row sits
      * in the second half of the borrowed rows; copy it back so one contiguous
@@ -62014,8 +62291,28 @@ static int ds4_session_eval_layer_slice_exact_span(
                                                        n_tokens,
                                                        e->weights.output->dim[1]);
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
+    bool failure_sync_attempted = false;
+    bool failure_sync_ok = true;
+    if (ok) {
+        ok = ds4_gpu_end_commands() != 0;
+    } else {
+        failure_sync_attempted = true;
+        failure_sync_ok = ds4_gpu_synchronize() != 0;
+    }
+
+    /* end_commands is the span's existing single synchronization point. The
+     * diagnostic performs exactly one host read after it, then emits all
+     * per-layer records from that snapshot. */
+    if (ok && active_route_probe) {
+        ok = ds4_gpu_tensor_read(active_route_probe->arena, 0,
+                                 active_route_probe->host_ids,
+                                 active_route_probe->arena_bytes) != 0;
+        if (ok) {
+            ok = ds4_exact_route_probe_emit(active_route_probe, pos0,
+                                            batch_shared_rows);
+        }
+        if (ok) s->exact_route_probe_spans++;
+    }
 
     if (ok && output_hc) {
         ok = ds4_gpu_tensor_read_any(metal_graph_batch_cur_hc(g), 0,
@@ -62029,12 +62326,31 @@ static int ds4_session_eval_layer_slice_exact_span(
                                          sizeof(float)) != 0;
     }
 
+    if (!ok && !failure_sync_attempted) {
+        failure_sync_attempted = true;
+        failure_sync_ok = ds4_gpu_synchronize() != 0;
+    }
+    if (!ok && !failure_sync_ok && active_route_probe) {
+        /* Completion of the queued D2D snapshots is unknown. Orphan only their
+         * tiny destination tensor and wrapper; the graph no longer borrows it,
+         * and the ordinary exact-span cleanup and failure handling stay intact. */
+        g->exact_route_probe_arena = NULL;
+        g->exact_route_probe_offset = 0;
+        route_probe.arena = NULL;
+        free(route_probe.host_ids);
+        route_probe.host_ids = NULL;
+        fprintf(stderr,
+                "ds4: leaking %llu-byte exact-span route probe GPU arena after "
+                "failed synchronization\n",
+                (unsigned long long)route_probe.arena_bytes);
+    }
     for (uint32_t i = 0; i < n_tokens; i++) {
         ds4_gpu_tensor_free(cur[i]);
         ds4_gpu_tensor_free(next[i]);
     }
+    ds4_exact_route_probe_discard(&route_probe);
     if (!ok) {
-        if (ds4_gpu_synchronize() == 0) {
+        if (!failure_sync_ok) {
             fprintf(stderr, "ds4: synchronize after layer-slice exact span failure also failed\n");
         }
         if (errlen) snprintf(err, errlen, "%s layer-slice exact span failed",
@@ -62042,6 +62358,10 @@ static int ds4_session_eval_layer_slice_exact_span(
         if (batch_shared_rows) {
             /* Cache and capture state may contain only a prefix of this
              * layer-major span. Never expose it to a retry or fallback. */
+            ds4_session_invalidate(s);
+        } else if (active_route_probe) {
+            /* A requested diagnostic fails closed on copy/read/log failure
+             * rather than continuing with missing records. */
             ds4_session_invalidate(s);
         } else {
             s->checkpoint_valid = false;
