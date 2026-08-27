@@ -41,10 +41,22 @@ class ExactSharedRowsStaticTest(unittest.TestCase):
             ),
             2,
         )
+        required = c_function(
+            "ds4_session_eval_layer_slice_exact_shared_rows_required"
+        )
+        self.assertIn(
+            'getenv("DS4_DIST_SPEC_EXACT_SHARED_ROWS_REQUIRED")', required
+        )
         admission = span.index(
             "ds4_session_eval_layer_slice_exact_shared_rows_supported"
         )
-        self.assertLess(admission, span.index("ds4_gpu_tensor_write"))
+        required_gate = span.index(
+            "ds4_session_eval_layer_slice_exact_shared_rows_required"
+        )
+        active = span.index("exact-span shared rows ACTIVE backend=ROCm")
+        self.assertLess(admission, required_gate)
+        self.assertLess(required_gate, active)
+        self.assertLess(active, span.index("ds4_gpu_tensor_write"))
         self.assertLess(admission, span.index("ds4_gpu_embed_token_hc_tensor"))
         self.assertLess(admission, span.index("metal_graph_dspark_capture_begin"))
 
@@ -52,6 +64,8 @@ class ExactSharedRowsStaticTest(unittest.TestCase):
         supported = c_function(
             "ds4_session_eval_layer_slice_exact_shared_rows_supported"
         )
+        self.assertIn("#if !defined(DS4_ROCM_BUILD)", supported)
+        self.assertIn("return false;\n#else", supported)
         required_guards = (
             "g->placement",
             "g->quality",
@@ -61,6 +75,7 @@ class ExactSharedRowsStaticTest(unittest.TestCase):
             "DS4_ROCM_DSV4_PREQUANT_DECODE",
             "g->debug_deferred_active",
             "g_expert_profile.active",
+            "metal_graph_hc_norm_fusion_check_enabled",
             "metal_graph_use_reference_shared_down_hc",
             "metal_graph_directional_steering_attn_enabled",
             "metal_graph_directional_steering_ffn_enabled",
@@ -106,7 +121,14 @@ class ExactSharedRowsStaticTest(unittest.TestCase):
         failure = span[span.rindex("if (!ok)") :]
         self.assertIn("if (batch_shared_rows)", failure)
         self.assertIn("ds4_session_invalidate(s)", failure)
-        self.assertIn("no mid-span fallback", REVIEW.lower())
+        required_gate = span[
+            span.index("ds4_session_eval_layer_slice_exact_shared_rows_required") :
+            span.index("ds4_gpu_tensor_write")
+        ]
+        self.assertIn("!batch_shared_rows", required_gate)
+        self.assertIn("ds4_session_invalidate(s)", required_gate)
+        self.assertIn("no mid-span", REVIEW.lower())
+        self.assertIn("fallback", REVIEW.lower())
         self.assertIn("K=2,3,4,5", REVIEW)
 
 

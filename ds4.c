@@ -61600,21 +61600,36 @@ static bool ds4_session_eval_layer_slice_exact_shared_rows_enabled(void) {
     return cached != 0;
 }
 
+static bool ds4_session_eval_layer_slice_exact_shared_rows_required(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_DIST_SPEC_EXACT_SHARED_ROWS_REQUIRED");
+        cached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static bool ds4_session_eval_layer_slice_exact_shared_rows_supported(
         const ds4_session *s,
         uint32_t n_tokens,
         uint32_t pos0,
         uint32_t layer_start,
         uint32_t layer_end) {
+#if !defined(DS4_ROCM_BUILD)
+    (void)s;
+    (void)n_tokens;
+    (void)pos0;
+    (void)layer_start;
+    (void)layer_end;
+    return false;
+#else
     if (!s || !s->engine || n_tokens < 2u || n_tokens > 5u) return false;
     const ds4_engine *e = s->engine;
     const ds4_gpu_graph *g = &s->graph;
-#ifdef DS4_ROCM_BUILD
     const char *prequant = getenv("DS4_ROCM_DSV4_PREQUANT_DECODE");
     if (prequant && (prequant[0] == '\0' || strcmp(prequant, "0") == 0)) {
         return false;
     }
-#endif
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC +
                             (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -61628,6 +61643,7 @@ static bool ds4_session_eval_layer_slice_exact_shared_rows_supported(
         !g->shared_gate_up_swiglu_fuse || g->materialize_ffn_out ||
         g->decode_stage_profile || g->decode_index_stage_profile ||
         g->output_stage_profile || g_expert_profile.active ||
+        metal_graph_hc_norm_fusion_check_enabled() ||
         g->debug_deferred_active ||
         metal_graph_debug_get_config()->prefix != NULL ||
         getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") != NULL ||
@@ -61713,6 +61729,7 @@ static bool ds4_session_eval_layer_slice_exact_shared_rows_supported(
         }
     }
     return true;
+#endif
 }
 
 static bool ds4_session_eval_layer_slice_exact_shared_rows_layer(
@@ -61869,10 +61886,27 @@ static int ds4_session_eval_layer_slice_exact_span(
     /* The nested shared-row decision is span-wide and precedes every graph or
      * cache mutation. Unsupported configurations retain the existing exact
      * span unchanged, even when the nested environment variable is present. */
+    const bool shared_rows_requested =
+        ds4_session_eval_layer_slice_exact_shared_rows_enabled();
     const bool batch_shared_rows =
-        ds4_session_eval_layer_slice_exact_shared_rows_enabled() &&
+        shared_rows_requested &&
         ds4_session_eval_layer_slice_exact_shared_rows_supported(
             s, n_tokens, pos0, layer_start, layer_end);
+    if (ds4_session_eval_layer_slice_exact_shared_rows_required() &&
+        !batch_shared_rows) {
+        if (errlen) {
+            snprintf(err, errlen,
+                     "required exact-span shared-row path is unavailable");
+        }
+        ds4_session_invalidate(s);
+        return 1;
+    }
+    if (batch_shared_rows) {
+        fprintf(stderr,
+                "ds4: exact-span shared rows ACTIVE backend=ROCm "
+                "rows=%u layers=%u:%u\n",
+                n_tokens, layer_start, layer_end);
+    }
 
     ds4_gpu_tensor *cur[5];
     ds4_gpu_tensor *next[5];
