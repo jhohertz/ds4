@@ -510,8 +510,10 @@ Validation required before any direct-commit default
    plain decode matches no-spec for at least 512 greedy token IDs, and inspect
    memory/cache telemetry on both ranks.
 2. Run the ROCm k-row test at the real 7168-wide input for every 2..5-row
-   exact-API span and byte-compare it with separate one-row calls; then repeat
-   with the production vocabulary output width.
+   exact-API span, then run `tests/bench_q8_krow_rocm --production-head`
+   with prequant enabled and with `DS4_ROCM_DSV4_PREQUANT_DECODE=0`. Require
+   every 4096x129280 and 7168x129280 row to byte-match separate one-row calls
+   and retain the measured exact-row versus serial-head timings.
 3. Repeat the replay-default speculative arm with real proposals and accepts;
    require exact token identity now that target arithmetic is held constant.
 4. Compare fast-span and per-row hidden rows, KV/compressed-KV,
