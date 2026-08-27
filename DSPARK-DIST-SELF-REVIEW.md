@@ -599,6 +599,18 @@ ROCm validation result and containment
   0.062 seconds. More proposal coverage does not help until verification is
   substantially cheaper; the existing no-draft/confidence backoff remains the
   better measured policy.
+- A first-order break-even model for the scheduler-enabled run is stricter
+  than the acceptance rate suggests. Charging all 1.858 seconds of proposer
+  work and about 0.300 seconds of remaining span overhead gives
+  `59*c < 52*71.3ms - 1858ms - 300ms`, so the marginal target cost `c` of a
+  drafted verifier row must fall below about 26 ms—roughly a 2.7x reduction—
+  before exact speculation merely breaks even. If rejected rows retain a full
+  standalone cost while only accepted rows receive the batched marginal cost,
+  the bound is about 21 ms (3.4x). Current measurements cannot distinguish
+  those two models because the marginal row still costs approximately a full
+  row. Halving total proposer cost would relax the first bound to about 42 ms;
+  therefore proposer reduction and routed-expert overlap/fraction measurements
+  are prerequisites to deciding whether broad verifier batching is feasible.
 - `DS4_DIST_SPEC_EXACT` remains explicit opt-in. The default verifies drafts,
   restores the speculative frontier, and serially replays accepted tokens.
   This is conservative containment of an unproven direct-state-retention path,
