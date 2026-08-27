@@ -3631,6 +3631,11 @@ static int dist_coordinator_eval_span(
 
     const double local_t0 = profile ? dist_now_sec() : 0.0;
     int rc;
+    const bool exact_rows =
+        !decode2_span &&
+        (spec_flags & DS4_DIST_WORK_F_SPEC_VERIFY) != 0 &&
+        n_tokens > 1u &&
+        ds4_session_dist_spec_exact_verify(session, n_tokens);
     if (decode2_span) {
         const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
         rc = ds4_session_eval_layer_slice_decode2(session,
@@ -3648,6 +3653,19 @@ static int dist_coordinator_eval_span(
                                                   NULL,
                                                   err,
                                                   errlen);
+    } else if (exact_rows) {
+        rc = ds4_session_eval_layer_slice_exact_rows(session,
+                                                     tokens,
+                                                     n_tokens,
+                                                     pos0,
+                                                     state->local_start,
+                                                     state->local_end,
+                                                     NULL,
+                                                     hidden,
+                                                     NULL,
+                                                     false,
+                                                     err,
+                                                     errlen);
     } else {
         rc = ds4_session_eval_layer_slice(session,
                                           tokens,
@@ -6964,6 +6982,7 @@ int ds4_dist_session_mtp_spec_cycle(
         memcpy(span_tokens + 1, fused_pending,
                (size_t)fused_k * sizeof(span_tokens[0]));
         const uint32_t rows_n = (uint32_t)fused_k + 1u;
+        const bool exact_span = ds4_session_dist_spec_exact_verify(owner, rows_n);
         float *rows = malloc((size_t)rows_n * (size_t)vocab * sizeof(float));
         if (!rows) {
             if (errlen) snprintf(err, errlen, "out of memory allocating speculative verify rows");
@@ -7014,9 +7033,39 @@ int ds4_dist_session_mtp_spec_cycle(
             }
             accept_n++;
         }
-        /* accept_n above is only a replay-length bound; the exact accept/emit
-         * decision is re-derived inside dist_mtp_spec_replay_accept from
-         * single-token output-head logits (never the batched verify rows). */
+        /* The exact per-row span already decoded every token through the
+         * ordinary single-token layer-slice path with the KV advanced row by
+         * row, so rows[] equals what the replay arm would have produced.  On
+         * a full accept we can keep the span's commits and use the last row
+         * directly, skipping the serial replay round trips.  A partial accept
+         * (or a non-exact backend) still rewinds the rejected suffix and
+         * re-commits the accepted prefix through the exact replay arm. */
+        if (exact_span && accept_n == fused_k) {
+            const float *last_row = rows + (uint64_t)fused_k * vocab;
+            d->spec_accepted += (uint64_t)fused_k;
+            if (getenv("DS4_MTP_SPEC_LOG")) {
+                fprintf(stderr,
+                        "ds4: dist mtp spec fused exact drafted=%d accepted=%d cont=%d span=%.1fms\n",
+                        fused_k, fused_k, n_cont, fused_ms);
+            }
+            ds4_session_set_logits(owner, last_row, vocab);
+            if (n_cont > 0 && span_tokens[fused_k] != eos_token) {
+                int cnt = n_cont > 16 ? 16 : n_cont;
+                memcpy(d->spec_pending_drafts, cont,
+                       (size_t)cnt * sizeof(cont[0]));
+                d->spec_pending_count = cnt;
+                d->spec_pending_token = dist_logits_argmax(last_row, vocab);
+                d->spec_pending_pos = start + rows_n;
+            }
+            free(rows);
+            int n_accept = 0;
+            accepted[n_accept++] = first_token;
+            for (int i = 0; i < fused_k && n_accept < accepted_cap; i++) {
+                accepted[n_accept++] = span_tokens[i + 1];
+                if (span_tokens[i + 1] == eos_token) break;
+            }
+            return n_accept;
+        }
         /* Exact commit: re-decode the base token plus the accepted drafts one
          * token at a time through the ordinary distributed route so the
          * committed tokens and the next sample match plain per-token decode. */
@@ -7191,6 +7240,9 @@ int ds4_dist_session_mtp_spec_cycle(
     /* DSpark verify spans also return continuation drafts proposed from the
      * last row, so a full accept can fuse the next cycle into one span. */
     const bool want_cont = !decode2_verify && !ds4_engine_has_mtp(e);
+    const bool exact_span =
+        !decode2_verify &&
+        ds4_session_dist_spec_exact_verify(owner, (uint32_t)draft_n);
     int cont[16];
     int n_cont = 0;
     const double verify_t0 = dist_now_sec();
@@ -7242,11 +7294,43 @@ int ds4_dist_session_mtp_spec_cycle(
             }
         }
     }
-    /* accept_n above is only a replay-length bound (and the legacy decode2
-     * verifier result stays exact); the final accept/emit decision is made
-     * inside dist_mtp_spec_replay_accept from single-token output-head
-     * logits, so the batched verify rows never decide what is emitted. */
+    /* On the exact path accept_n above is authoritative (rows[] equals
+     * sequential decode); on the batched path it is only a replay-length
+     * bound and the final accept/emit decision is re-derived inside
+     * dist_mtp_spec_replay_accept from single-token output-head logits, so
+     * the batched verify rows never decide what is emitted. */
     if (accept_n > 0) {
+        /* The exact per-row span already decoded every draft through the
+         * ordinary single-token layer-slice path with the KV advanced row by
+         * row, so rows[] equals what the replay arm would have produced.  A
+         * full accept can therefore keep the span's commits and use the last
+         * row directly, skipping the serial replay round trips.  Partial
+         * accepts (or a non-exact backend) still rewind the rejected suffix
+         * and re-commit the accepted prefix through the exact replay arm. */
+        if (exact_span && accept_n == draft_n) {
+            const float *last_row = rows + (uint64_t)(draft_n - 1) * vocab;
+            d->spec_accepted += (uint64_t)draft_n;
+            if (getenv("DS4_MTP_SPEC_LOG")) {
+                fprintf(stderr,
+                        "ds4: dist mtp spec verify exact drafted=%d accepted=%d decode2=0 base=%.1fms verify=%.1fms\n",
+                        draft_n, draft_n, base_ms, verify_ms);
+            }
+            ds4_session_set_logits(owner, last_row, vocab);
+            if (want_cont && n_cont > 0 && drafts[draft_n - 1] != eos_token) {
+                int cnt = n_cont > 16 ? 16 : n_cont;
+                memcpy(d->spec_pending_drafts, cont,
+                       (size_t)cnt * sizeof(cont[0]));
+                d->spec_pending_count = cnt;
+                d->spec_pending_token = dist_logits_argmax(last_row, vocab);
+                d->spec_pending_pos = start + 1u + (uint32_t)draft_n;
+            }
+            free(rows);
+            for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+                accepted[n_accept++] = drafts[i];
+                if (drafts[i] == eos_token) break;
+            }
+            return n_accept;
+        }
         /* Exact commit: re-decode the accepted drafts one token at a time
          * from the committed prefix (first_token was already committed by
          * the base decode) so the emitted tokens and the next sample match
@@ -9961,6 +10045,9 @@ static int dist_worker_process_work_message(
             return dist_worker_upstream_send_work_error(upstream, request_id, "worker speculative frontier snapshot failed");
         }
     }
+    const bool exact_verify_rows =
+        spec_verify && output_all_logits &&
+        ds4_session_dist_spec_exact_verify(session->session, work.n_tokens);
     const double eval_t0 = dist_now_sec();
     int eval_rc = spec_commit
         ? ds4_session_dist_spec_commit_prefix(session->session,
@@ -9986,17 +10073,30 @@ static int dist_worker_process_work_message(
                                                err,
                                                sizeof(err))
         : output_all_logits
-            ? ds4_session_eval_layer_slice_logits_all(session->session,
-                                                      tokens,
-                                                      work.n_tokens,
-                                                      work.pos0,
-                                                      work.layer_start,
-                                                      work.layer_end,
-                                                      input_hc,
-                                                      NULL,
-                                                      result,
-                                                      err,
-                                                      sizeof(err))
+            ? (exact_verify_rows
+               ? ds4_session_eval_layer_slice_exact_rows(session->session,
+                                                         tokens,
+                                                         work.n_tokens,
+                                                         work.pos0,
+                                                         work.layer_start,
+                                                         work.layer_end,
+                                                         input_hc,
+                                                         NULL,
+                                                         result,
+                                                         true,
+                                                         err,
+                                                         sizeof(err))
+               : ds4_session_eval_layer_slice_logits_all(session->session,
+                                                         tokens,
+                                                         work.n_tokens,
+                                                         work.pos0,
+                                                         work.layer_start,
+                                                         work.layer_end,
+                                                         input_hc,
+                                                         NULL,
+                                                         result,
+                                                         err,
+                                                         sizeof(err)))
             : ds4_session_eval_layer_slice(session->session,
                                            tokens,
                                            work.n_tokens,

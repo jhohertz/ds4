@@ -508,6 +508,29 @@ int ds4_session_eval_layer_slice_logits_all(ds4_session *s,
                                             float *logits,
                                             char *err,
                                             size_t errlen);
+/* Per-row exact layer-slice verifier: each token is decoded one at a time
+ * through the ordinary single-token layer-slice path, so every emitted row
+ * (logits or hidden state) is bit-identical to the sequential replay arm.
+ * The coordinator runs this to produce one hidden row per token and the
+ * worker consumes those rows and emits one logits row per token, all within
+ * a single distributed span (one round trip, KV advanced row by row). */
+int ds4_session_eval_layer_slice_exact_rows(ds4_session *s,
+                                            const int *tokens,
+                                            uint32_t n_tokens,
+                                            uint32_t pos0,
+                                            uint32_t layer_start,
+                                            uint32_t layer_end,
+                                            const float *input_hc,
+                                            float *output_hc,
+                                            float *logits,
+                                            bool output_logits,
+                                            char *err,
+                                            size_t errlen);
+/* Whether a distributed speculative verify span may use the per-row exact
+ * layer-slice path (and therefore trust its rows without replay).  Bounded
+ * to the small-batch row count that keeps the hidden/logits transfers cheap;
+ * non-ROCm builds and GLM sessions keep the batched verify + replay path. */
+bool ds4_session_dist_spec_exact_verify(const ds4_session *s, uint32_t n_tokens);
 /* Exact two-row verifier for a layer slice (fast Q8 decode kernels, two
  * rows alternating per layer).  The coordinator produces the two hidden
  * states; the worker runs the output head: top0 for row 0 and full logits

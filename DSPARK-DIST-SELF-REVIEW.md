@@ -254,3 +254,73 @@ the `DS4_MTP_SPEC_LOG`/`DS4_DSPARK_SPEC_LOG` diagnostics are preserved.
 Validated on this host by compiling `ds4_distributed.o` (Metal/CPU link path)
 and `tests/test_dist_v3` (92/92); the ROCm executable warm-path must be
 re-run on the NHI pair to close the residual `rocm/*.cuh` compile risk.
+
+## Exact per-row verify span (perf-dspark-replay-opt)
+
+Cost split (from the sealed v22b measurement and this code path):
+
+- v22b measured spec wall 13.147s vs nospec 10.742s (99 cycles, 32 proposed,
+  29 accepted).  The speculative cycle still paid the cost of the DSpark
+  propose pipeline (negligible, hidden behind the base decode on the worker),
+  a batched verify span per proposal group (one `F_SPEC_VERIFY |
+  F_OUTPUT_ALL_LOGITS` span, cheap), and then `dist_mtp_spec_replay_accept`
+  re-decoding every accepted draft one token at a time through the ordinary
+  distributed route.  That serial replay is the dominant overhead: 29 accepted
+  drafts become 29 extra single-token round trips (plus one more for each
+  partially-accepted span), which is why decode t/s drops from 14.50 to 11.16.
+- The optimization folds the replay's single-token decode compute back into
+  the verify span itself.  Instead of running the multi-row layer batch and
+  then re-decoding, the verify span decodes each row sequentially through the
+  same `ds4_session_eval_layer_slice(..., n_tokens=1, ...)` call the replay
+  and no-spec arms use, with KV advanced row by row.  The coordinator produces
+  one hidden row per token, ships them once (`F_INPUT_HC`), and the worker
+  consumes them and emits one logits row per token.  A full accept therefore
+  needs exactly one round trip instead of 1 batch + N serial round trips.
+
+What changed:
+
+- `ds4.c` `ds4_session_eval_layer_slice_exact_rows`: per-token loop over the
+  ordinary single-token layer-slice entry point.  Each row's logits/hidden are
+  produced by the exact same kernel/accumulation order as sequential decode
+  (`ds4.c:60654` path), so bit-identity is by construction, not by kernel
+  tuning.
+- `ds4_session_dist_spec_exact_verify`: gate.  True only on ROCm builds, for
+  non-GLM/non-CPU sessions, and spans of <= 8 rows
+  (`DS4_DIST_SPEC_EXACT=0` disables).  Metal/CPU and larger spans return
+  false and keep the batched verify + exact replay arm unchanged.
+- `ds4_distributed.c`:
+  - `dist_coordinator_eval_span` runs its local slice through the per-row
+    exact path for `F_SPEC_VERIFY` spans when the gate is true.
+  - The worker eval dispatch uses `ds4_session_eval_layer_slice_exact_rows`
+    for `F_SPEC_VERIFY | F_OUTPUT_ALL_LOGITS` spans when the same gate is true.
+  - `ds4_dist_session_mtp_spec_cycle` trusts the span rows on a full accept
+    (`exact_span && accept_n == draft_n`), keeping the span's commits and
+    setting `owner` logits from the last row; partial accepts (or non-exact
+    backends) still restore the frontier and run `dist_mtp_spec_replay_accept`.
+
+Exactness argument:
+
+- Each verify row is `ds4_session_eval_layer_slice(s, &tokens[i], 1, pos0+i,
+  ..., input_hc_i, output_hc_i/logits_i, ...)`, the identical call the
+  `dist_mtp_spec_replay_accept` arm issues one span at a time
+  (`ds4_distributed.c:6731`) and the identical call the no-spec arm uses per
+  token.  The only difference is that the rows are packed into one WORK span
+  and one `F_INPUT_HC`/`LOGITS_NROWS` exchange instead of N spans, so the
+  returned rows are bit-identical to sequential decode.  The worker's
+  `F_SPEC_VERIFY` frontier snapshot is still taken before the span; a full
+  accept leaves both machines' commits in place (they are already the accepted
+  prefix), while a partial accept rewinds via the same replay path as before.
+  There is no new wire flag: both sides derive the exact/batched decision from
+  the same `ds4_session_dist_spec_exact_verify` gate, so no protocol surface
+  changed.
+
+Paths that still replay:
+
+- Any non-ROCm build (Metal/CPU), GLM sessions, and spans > 8 rows use the
+  existing batched verify + exact replay arm.  Legacy MTP `decode2` two-row
+  verifies and partial accepts also retain the replay arm.  All existing
+  `dist spec stats` / WHY logs and `F_SPEC_*` protocol surface are preserved.
+
+Validation performed on this host (macOS): `make ds4 ds4-server` and
+`make test-dist-v3` (92/92 passing).  ROCm warm-path bit-identity and the
+authoritative A/B remain to be measured on the NHI harness window.

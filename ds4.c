@@ -61410,6 +61410,131 @@ int ds4_session_eval_layer_slice_logits_all(ds4_session *s,
 #endif
 }
 
+bool ds4_session_dist_spec_exact_verify(const ds4_session *s, uint32_t n_tokens) {
+    if (!s || !s->engine) return false;
+#ifdef DS4_ROCM_BUILD
+    /* The per-row exact span is exercised only on the ROCm build where the
+     * replay arm's serial round trips dominate the speculative wall clock.
+     * Metal keeps the batched verify + replay path (its batch output head is
+     * already sequential-safe and never bit-exact across rows).  GLM uses a
+     * separate graph and layer-slice decode path, so stay on the existing
+     * replay arm there as well. */
+    if (ds4_session_is_glm(s) || ds4_session_is_cpu(s)) return false;
+    if (n_tokens < 2u || n_tokens > 8u) return false;
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_DIST_SPEC_EXACT");
+        cached = (env == NULL || env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+#else
+    (void)n_tokens;
+    return false;
+#endif
+}
+
+int ds4_session_eval_layer_slice_exact_rows(ds4_session *s,
+                                            const int *tokens,
+                                            uint32_t n_tokens,
+                                            uint32_t pos0,
+                                            uint32_t layer_start,
+                                            uint32_t layer_end,
+                                            const float *input_hc,
+                                            float *output_hc,
+                                            float *logits,
+                                            bool output_logits,
+                                            char *err,
+                                            size_t errlen) {
+    if (!s || !s->engine) {
+        if (errlen) snprintf(err, errlen, "missing layer-slice session");
+        return 1;
+    }
+    if (n_tokens < 2u || (uint64_t)pos0 + (uint64_t)n_tokens > (uint64_t)UINT32_MAX) {
+        if (errlen) snprintf(err, errlen, "invalid exact layer-slice token span");
+        return 1;
+    }
+    const uint32_t executable_layers = ds4_model_normal_layer_count();
+    if (executable_layers == 0 ||
+        layer_start > layer_end ||
+        layer_end >= executable_layers) {
+        if (errlen) snprintf(err, errlen, "invalid layer-slice layer range %u:%u",
+                             layer_start, layer_end);
+        return 1;
+    }
+    if (layer_start != 0 && !input_hc) {
+        if (errlen) snprintf(err, errlen, "layer-slice layer %u requires input hidden-state",
+                             layer_start);
+        return 1;
+    }
+    if (output_logits && layer_end + 1u != executable_layers) {
+        if (errlen) snprintf(err, errlen, "layer-slice logits require final transformer layer");
+        return 1;
+    }
+    if (output_logits && !logits) {
+        if (errlen) snprintf(err, errlen, "layer-slice logits output is missing");
+        return 1;
+    }
+    if (!input_hc && !output_hc && !output_logits) {
+        if (errlen) snprintf(err, errlen, "exact layer-slice span has no outputs");
+        return 1;
+    }
+    if (!weights_layers_bound(&s->engine->weights, layer_start, layer_end)) {
+        if (errlen) snprintf(err, errlen, "requested layer slice %u:%u is not loaded",
+                             layer_start, layer_end);
+        return 1;
+    }
+    if (ds4_session_slice_check_timeline(s, tokens, n_tokens, pos0, err, errlen) != 0) {
+        return 1;
+    }
+    if (ds4_session_is_cpu(s)) {
+        if (errlen) snprintf(err, errlen, "layer slices require the graph backend");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    (void)output_hc;
+    (void)logits;
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    s->checkpoint_valid = false;
+    return 1;
+#else
+    if (ds4_session_is_glm(s)) {
+        if (errlen) snprintf(err, errlen, "per-row layer-slice exact spans are not supported for GLM");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    if (n_tokens > s->prefill_cap) {
+        if (errlen) snprintf(err, errlen, "layer-slice chunk %u exceeds prefill cap %u",
+                             n_tokens, s->prefill_cap);
+        return 1;
+    }
+    const uint64_t hc_values = ds4_engine_hidden_f32_values(s->engine);
+    const int vocab = output_logits ? ds4_engine_vocab_size(s->engine) : 0;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        const float *row_in = input_hc
+            ? input_hc + (uint64_t)i * hc_values : NULL;
+        float *row_out = output_hc
+            ? output_hc + (uint64_t)i * hc_values : NULL;
+        float *row_logits = output_logits
+            ? logits + (uint64_t)i * vocab : NULL;
+        const int rc = ds4_session_eval_layer_slice(s,
+                                                    tokens + i,
+                                                    1u,
+                                                    pos0 + i,
+                                                    layer_start,
+                                                    layer_end,
+                                                    row_in,
+                                                    row_out,
+                                                    output_logits,
+                                                    row_logits,
+                                                    err,
+                                                    errlen);
+        if (rc != 0) return rc;
+    }
+    return 0;
+#endif
+}
+
 /* Exact two-row verifier for a layer slice, mirroring
  * metal_graph_verify_decode2_exact: both rows ride the fast Q8 decode
  * kernels (not the generic F32 batch path) and the two encodes alternate per
