@@ -61590,8 +61590,9 @@ static bool ds4_session_eval_layer_slice_exact_shared_rows_enabled(void) {
                     "\n"
                     "============================================================\n"
                     "ds4: WARNING: EXPERIMENTAL EXACT-SPAN SHARED-ROW BATCHING\n"
-                    "ds4: DS4_DIST_SPEC_EXACT_SHARED_ROWS batches verifier shared\n"
-                    "ds4: gate/up + SwiGLU only. It requires the enclosing exact and\n"
+                    "ds4: DS4_DIST_SPEC_EXACT_SHARED_ROWS requests verifier shared\n"
+                    "ds4: gate/up + SwiGLU batching; an ACTIVE line confirms admission.\n"
+                    "ds4: It requires the enclosing exact and\n"
                     "ds4: exact-span opt-ins; hidden/KV/capture identity is unproved.\n"
                     "============================================================\n"
                     "\n");

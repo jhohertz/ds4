@@ -542,6 +542,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
+	python3 tests/test_exact_shared_rows_static.py
 	./tests/test_sampling
 
 dspark-acceptance: ds4
