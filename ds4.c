@@ -26258,6 +26258,78 @@ static bool metal_graph_encode_output_head_batch(
     return ok;
 }
 
+static ds4_gpu_tensor *metal_graph_tensor_row_view(
+        ds4_gpu_tensor *base,
+        uint32_t          row,
+        uint64_t          row_values);
+
+/* Exact-span output head: batch only the Q8 vocab matmul.  Every stage that
+ * feeds sigmoid / the final norm (the f16 output_hc_fn projection, output
+ * HC softmax weights, residual hc_weighted_sum and the output RMS norm) runs
+ * one row at a time through the same single-token kernels and per-row views
+ * the sequential decode head uses, so the f16 reduction is the ordered-chunk
+ * n_tok == 1 order, not the n_tok > 1 cublas/tree order.  The per-row
+ * output_norm rows land contiguously in batch_ffn_norm, which
+ * metal_graph_output_logits_head_matmul then projects through the Q8 vocab
+ * weights as one batched matmul: that stage reduces warp-ordered per row and
+ * streaming the vocab weights once is the 562 MiB re-stream win this span was
+ * built to keep. */
+static bool metal_graph_encode_output_head_exact_span(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint32_t               n_tokens,
+        uint64_t               vocab_dim) {
+    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < n_tokens; i++) {
+        ds4_gpu_tensor *hc = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g), i, hc_dim);
+        ds4_gpu_tensor *flat = metal_graph_tensor_row_view(metal_graph_batch_flat_hc(g), i, hc_dim);
+        ds4_gpu_tensor *pre = metal_graph_tensor_row_view(metal_graph_batch_hc_mix(g), i, DS4_N_HC);
+        ds4_gpu_tensor *w = metal_graph_tensor_row_view(metal_graph_batch_hc_split(g), i, DS4_N_HC);
+        ds4_gpu_tensor *embd = metal_graph_tensor_row_view(metal_graph_batch_ffn_cur(g), i, DS4_N_EMBD);
+        ds4_gpu_tensor *norm = metal_graph_tensor_row_view(metal_graph_batch_ffn_norm(g), i, DS4_N_EMBD);
+        ok = hc && flat && pre && w && embd && norm;
+        if (ok) ok = ds4_gpu_rms_norm_plain_tensor(flat, hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_matmul_f16_tensor(pre,
+                                                 model->map,
+                                                 model->size,
+                                                 weights->output_hc_fn->abs_offset,
+                                                 hc_dim,
+                                                 DS4_N_HC,
+                                                 flat,
+                                                 1) != 0;
+        if (ok) ok = ds4_gpu_output_hc_weights_tensor(w,
+                                                        pre,
+                                                        model->map,
+                                                        model->size,
+                                                        weights->output_hc_scale->abs_offset,
+                                                        weights->output_hc_base->abs_offset,
+                                                        DS4_N_HC,
+                                                        DS4_HC_EPS) != 0;
+        if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(embd, hc, w, DS4_N_EMBD, DS4_N_HC) != 0;
+        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(norm,
+                                                      embd,
+                                                      model->map,
+                                                      model->size,
+                                                      weights->output_norm->abs_offset,
+                                                      DS4_N_EMBD,
+                                                      DS4_RMS_EPS) != 0;
+        ds4_gpu_tensor_free(norm);
+        ds4_gpu_tensor_free(embd);
+        ds4_gpu_tensor_free(w);
+        ds4_gpu_tensor_free(pre);
+        ds4_gpu_tensor_free(flat);
+        ds4_gpu_tensor_free(hc);
+    }
+    if (ok) ok = metal_graph_output_logits_head_matmul(
+            g, model, weights, metal_graph_batch_ffn_norm(g),
+            g->spec_logits, n_tokens, vocab_dim);
+    return ok;
+}
+
 static bool metal_graph_matmul_plain_tensor(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,
@@ -61441,8 +61513,13 @@ bool ds4_session_dist_spec_exact_verify(const ds4_session *s, uint32_t n_tokens)
  * the output head's weights from DRAM for each row.  This span variant keeps
  * the same bit-exact kernels but executes all rows in ONE command buffer,
  * interleaving rows per layer so a layer's weights are streamed once and
- * reused by every row.  The output head is a single direct 2..8-row batch
- * whose per-row summation order is identical to the one-row head. */
+ * reused by every row.  The output head runs the f16 output_hc_fn,
+ * output_hc_weights, hc_weighted_sum and output_norm stages one row at a
+ * time with the same single-token kernels (n_tok == 1 keeps the
+ * ordered-chunk f16 reduction), so every stage feeding sigmoid/norm is
+ * bit-identical to sequential decode.  Only the Q8 vocab matmul is batched:
+ * its per-row warp-ordered reduction is order-stable and it loops the
+ * 562 MiB vocab weights once instead of once per row. */
 static bool ds4_session_eval_layer_slice_exact_span_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -61555,6 +61632,13 @@ static int ds4_session_eval_layer_slice_exact_span(
             ds4_gpu_tensor *tmp = cur[i];
             cur[i] = next[i];
             next[i] = tmp;
+            /* Swap the graph's cur/after pointers alongside the local
+             * ping-pong swap before capture, exactly like the single-token
+             * decode row (ds4.c:61023-61026), so dspark_capture_decode_layer
+             * records the layer OUTPUT rather than its input and the
+             * target-hidden ring matches sequential decode. */
+            g->cur_hc_by_tier[g->active_tier] = cur[i];
+            g->after_ffn_hc_by_tier[g->active_tier] = next[i];
             if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
         }
     }
@@ -61576,11 +61660,11 @@ static int ds4_session_eval_layer_slice_exact_span(
         }
     }
     if (ok && output_logits) {
-        ok = metal_graph_encode_output_head_batch(g,
-                                                  &e->model,
-                                                  &e->weights,
-                                                  n_tokens,
-                                                  e->weights.output->dim[1]);
+        ok = metal_graph_encode_output_head_exact_span(g,
+                                                       &e->model,
+                                                       &e->weights,
+                                                       n_tokens,
+                                                       e->weights.output->dim[1]);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();

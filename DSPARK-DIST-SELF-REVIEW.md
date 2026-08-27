@@ -405,11 +405,13 @@ What changed (ds4.c only, additive +200 lines)
     streamed once and reused by every row.  The interleave is the same
     weight-hot pattern the exact two-row verifier
     `ds4_session_eval_layer_slice_decode2` (ds4.c:61544) already used.
-  - The output head runs once as
-    `metal_graph_encode_output_head_batch` (ds4.c:26187) over all rows; for
-    2..8 rows this dispatches the existing direct warp-row Q8 kernel
-    (rocm/ds4_rocm_matmul.cuh:40 -> rocm/ds4_rocm_q8.cuh:886) that streams the
-    head weights exactly once instead of once per row.
+  - The output head runs its f16 `output_hc_fn`, `output_hc_weights`,
+    `hc_weighted_sum` and output-norm stages one row at a time through the
+    same single-token kernels (n_tok == 1 => the ordered-chunk f16 reduce)
+    and then batches only the Q8 vocab matmul via
+    `metal_graph_encode_output_head_exact_span` (ds4.c:26277).  The batched
+    Q8 stage still streams the ~562 MiB head weights exactly once instead of
+    once per row; the f16/norm stages keep the per-row reduction order.
   - One `ds4_gpu_end_commands()` + one `ds4_gpu_tensor_read_any()` per span
     replaces 2*N syncs + 2*N readbacks.
 - `ds4_session_eval_layer_slice_exact_rows` now dispatches to the span when
@@ -433,17 +435,28 @@ Why still bit-exact (argument with file:line)
   row-major evaluation would have produced.  The kernels are deterministic and
   read bit-identical inputs, so each row's hidden state is bit-identical to a
   one-row launch.
-- Head part: `metal_graph_output_logits_head_matmul` (ds4.c:26029) pads 2..7
-  rows to 8 and then `cuda_matmul_q8_0_tensor_labeled`
-  (rocm/ds4_rocm_matmul.cuh:338) selects `matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel`
+- Head part (f16/norm stages): `metal_graph_encode_output_head_exact_span`
+  (ds4.c:26277) runs `output_hc_fn`, `output_hc_weights`, `hc_weighted_sum`
+  and `output_norm` over per-row views with `n_tok == 1`, so
+  `ds4_gpu_matmul_f16_tensor` selects the ordered-chunk single-token kernel
+  (rocm/ds4_rocm_matmul.cuh:927-978) rather than the n_tok > 1 cublas/tree
+  kernel; every stage whose result feeds sigmoid / norm is therefore
+  bit-identical to a one-row head by construction.  Only the final Q8 vocab
+  matmul is batched: `metal_graph_output_logits_head_matmul` (ds4.c:26029)
+  pads 2..7 rows to 8 and selects
+  `matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel`
   (rocm/ds4_rocm_q8.cuh:886) for n_tok in 2..8.  That kernel accumulates per
   output row as `for b ascending: acc += (d*q)*x[b*32+lane]` then
-  `warp_sum_f32`, which is the same reduction order (blocks ascending, warp
-  sum last) and the same `q8_0_scale_broadcast_w32` operand scale as the
-  single-token head kernel `matmul_q8_0_f32_sharedx_warp_rows_w32_kernel`
-  (rocm/ds4_rocm_q8.cuh:670).  Therefore each row's logits are bit-identical
-  to a one-row head; the zero-padding rows are never read by the coordinator
-  (it reads only `n_tokens` rows).
+  `warp_sum_f32`, the same reduction order (blocks ascending, warp sum last)
+  and the same `q8_0_scale_broadcast_w32` operand scale as the single-token
+  `matmul_q8_0_f32_sharedx_warp_rows_w32_kernel` (rocm/ds4_rocm_q8.cuh:670);
+  the zero-padding rows are never read by the coordinator (it reads only
+  `n_tokens` rows).
+- Capture ring: the interleaved loop swaps the graph's `cur_hc_by_tier` /
+  `after_ffn_hc_by_tier` pointers alongside the local ping-pong swap before
+  `metal_graph_dspark_capture_decode_layer`, mirroring the single-token decode
+  row (ds4.c:61023-61026), so the target-hidden ring records each layer's
+  OUTPUT (last row wins) exactly as sequential decode does.
 - Acceptance logic is untouched: the coordinator still accepts draft i iff
   `dist_logits_argmax(rows[i]) == drafts[i+1]` (ds4_distributed.c
   `ds4_dist_session_mtp_spec_cycle`), and a partial accept / non-exact
@@ -470,17 +483,15 @@ Validation performed on this host (macOS)
 
 Only the ROCm host A/B can settle (identity gates fail closed)
 
-1. Bit-identity of the interleaved span vs the prior per-row exact loop and
-   vs no-spec single-token decode (empirical; the argument above is by
-   inspection).  A/B by running with `DS4_DIST_SPEC_EXACT_SPAN=0` vs `1`.
-2. Bit-identity of the batched direct head kernel vs the single-token sharedx
-   head under -ffast-math contraction (reduction-order argument holds, but
-   the compiler must emit the same `fma` shape across the two kernels).
-3. The actual v23c-format wall/t/s and whether the predicted < 1.0x ratio is
+1. Bit-identity of the batched direct Q8 vocab kernel vs the single-token
+   sharedx head under -ffast-math contraction (reduction-order argument holds,
+   but the compiler must emit the same `fma` shape across the two kernels).
+   The f16 `output_hc_fn` / norm / `hc_weighted_sum` stages now run per-row
+   through the single-token kernels, so they no longer need a host A/B.
+2. The actual v23c-format wall/t/s and whether the predicted < 1.0x ratio is
    realized; the direct-kernel env `DS4_ROCM_BATCH_DIRECT=0` additionally
    restores the tile kernel for the head A/B.
-4. The DSpark capture ring after interleaved capture (last row must remain the
-   captured target hidden state feeding the next propose).
-5. Any residual memory / command-buffer behavior specific to the Strix Halo
+3. Any residual memory / command-buffer behavior specific to the Strix Halo
    deque (the span uses one command buffer for the whole slice, unlike the
-   per-row path's `metal_graph_token_split_after_layers` flush cadence).
+   per-row path's `metal_graph_token_split_after_layers` flush cadence) and
+   the resulting next-cycle draft quality.
