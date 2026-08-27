@@ -627,6 +627,17 @@ static uint32_t dist_resolved_layer_end(const ds4_dist_options *opt, uint32_t n_
     return opt->layers.end;
 }
 
+/* Research-only trust-all speculation knob (measurement mode, never the
+ * default).  When enabled the distributed speculative cycle emits every
+ * drafted token without running any target-model verify span or acceptance
+ * check, so the emitted completion is NOT guaranteed to match greedy decode.
+ * Matches the DS4_DSPARK_STATS env convention: enabled for any non-empty
+ * value other than "0". */
+static bool ds4_dist_spec_trust_all_enabled(void) {
+    const char *env = getenv("DS4_DIST_SPEC_TRUST_ALL");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
 static const char *dist_role_name(ds4_distributed_role role) {
     switch (role) {
     case DS4_DISTRIBUTED_NONE:        return "none";
@@ -6466,6 +6477,12 @@ int ds4_dist_session_create(
                      local_end,
                      d->state.activation_bits);
 
+    if (ds4_dist_spec_trust_all_enabled() &&
+        ds4_engine_mtp_draft_tokens(engine) > 1) {
+        fprintf(stderr,
+                "ds4: WARNING: DS4_DIST_SPEC_TRUST_ALL=1 — target-model verification DISABLED (research mode); emitted completion is not guaranteed to match greedy decode\n");
+    }
+
     d->accept_ctx.state = &d->state;
     d->accept_ctx.listen_fd = listen_fd;
     if (pthread_create(&d->accept_tid, NULL, dist_coordinator_accept_main, &d->accept_ctx) != 0) {
@@ -6941,6 +6958,85 @@ int ds4_dist_session_mtp_spec_cycle(
             const int v = atoi(env);
             if (v >= 2 && v <= 16) min_verify = v;
         }
+    }
+
+    /* Trust-all research mode: emit every drafted token with no verify span
+     * or acceptance check (measurement only, never the default).  The base
+     * decode still runs so the target commits the pending token and feeds the
+     * drafter; the returned drafts are then trusted and emitted as-is. */
+    if (ds4_dist_spec_trust_all_enabled()) {
+        d->spec_pending_count = 0;
+        int n_accept = 0;
+        accepted[n_accept++] = first_token;
+        float *logits0 = malloc((size_t)vocab * sizeof(float));
+        if (!logits0) {
+            if (errlen) snprintf(err, errlen, "out of memory allocating speculative logits");
+            return -1;
+        }
+        int drafts[16];
+        int n_drafts = 0;
+        const double cycle_t0 = dist_now_sec();
+        const int rc = dist_coordinator_eval_span(&d->state,
+                                                  owner,
+                                                  &d->plan,
+                                                  &first_token,
+                                                  1,
+                                                  start,
+                                                  d->session_id,
+                                                  d->request_id++,
+                                                  false,
+                                                  DS4_DIST_WORK_F_OUTPUT_DRAFTS,
+                                                  false,
+                                                  NULL,
+                                                  logits0,
+                                                  drafts,
+                                                  &n_drafts,
+                                                  err,
+                                                  errlen);
+        const double base_ms = (dist_now_sec() - cycle_t0) * 1000.0;
+        if (rc != 0) {
+            free(logits0);
+            if (dist_mtp_spec_recover_after_failure(d, owner, start, first_token,
+                                                    rc, err, errlen) != 0) {
+                fprintf(stderr,
+                        "ds4: dist spec unrecoverable after trust-all base decode why=%s\n",
+                        err && err[0] ? err : "(no detail)");
+                if (errlen) snprintf(err, errlen, "%s", fail_msg);
+                return -1;
+            }
+            return n_accept;
+        }
+        ds4_session_set_logits(owner, logits0, vocab);
+        int draft_n = draft_cap;
+        if (first_token != eos_token && max_tokens > 1 &&
+            n_accept < accepted_cap && n_drafts > 0) {
+            if (draft_n > max_tokens - n_accept) draft_n = max_tokens - n_accept;
+            if (draft_n > accepted_cap - n_accept) draft_n = accepted_cap - n_accept;
+            const int room = ds4_session_ctx(owner) - ds4_session_tokens(owner)->len;
+            if (draft_n > room - 1) draft_n = room - 1;
+            if (n_drafts < draft_n) draft_n = n_drafts;
+        } else {
+            draft_n = 0;
+        }
+        if (draft_n < 0) draft_n = 0;
+        if (draft_n > 0) {
+            d->spec_proposed += (uint64_t)draft_n;
+            d->spec_accepted += (uint64_t)draft_n;
+            for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+                accepted[n_accept++] = drafts[i];
+                if (drafts[i] == eos_token) break;
+            }
+        }
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            fprintf(stderr,
+                    "ds4: dist mtp spec trust_all token=%d drafts=%d emitted=%d base=%.1fms\n",
+                    first_token,
+                    draft_n,
+                    n_accept - 1,
+                    base_ms);
+        }
+        free(logits0);
+        return n_accept;
     }
 
     /* 0. Fused span: when the previous cycle fully accepted its block, the

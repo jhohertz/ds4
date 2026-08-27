@@ -324,3 +324,38 @@ Paths that still replay:
 Validation performed on this host (macOS): `make ds4 ds4-server` and
 `make test-dist-v3` (92/92 passing).  ROCm warm-path bit-identity and the
 authoritative A/B remain to be measured on the NHI harness window.
+
+## Trust-all research mode
+
+`DS4_DIST_SPEC_TRUST_ALL=1` is a research-only measurement knob for the
+distributed speculative cycle, never the default and not a correctness feature.
+It is inert unless all of these hold:
+
+- the env is set to a non-empty value other than `0` (the same convention as
+  `DS4_DSPARK_STATS`);
+- the backend offers drafts (`ds4_engine_mtp_draft_tokens(engine) > 1`,
+  true for a loaded `--mtp --dspark` support model); and
+- the existing `draft_cap < 2` fallback has not already demoted the cycle to
+  the ordinary per-token decode (so `dist_route_plan_supports_spec` also held).
+
+When active, `ds4_dist_session_mtp_spec_cycle` emits every drafted token
+directly: it still runs the ordinary base decode (committing `first_token` and
+pulling `F_OUTPUT_DRAFTS`), then returns all returned drafts without any
+`F_SPEC_VERIFY` span, acceptance scan, or replay.  `spec_proposed` and
+`spec_accepted` both advance by the emitted draft count, so the
+`dist spec stats` accept_rate is 100%; `spec_cycles` counts the base decodes.
+Missing drafts (`n_drafts == 0`) leave `draft_n == 0`, so the cycle returns
+exactly the single decoded token, matching the ordinary fallback.
+
+- The coordinator session prints once at creation (only when the env is set
+  and the backend offers drafts):
+  `ds4: WARNING: DS4_DIST_SPEC_TRUST_ALL=1 — target-model verification DISABLED (research mode); emitted completion is not guaranteed to match greedy decode`
+- Temperature is not special-cased here: the knob only lives in
+  `ds4_dist_session_mtp_spec_cycle`, which the non-greedy distributed arm never
+  reaches, so sampling semantics are unchanged.
+- The live logits are set from the base-decode logits, so the next boundary
+  token is the target's own next greedy token; the emitted completion is
+  explicitly not required to match greedy decode.
+- No wire/protocol surface changed.  The existing exact/non-exact arms,
+  `dist spec stats` format, and WHY logs are unchanged.  `DS4_MTP_SPEC_LOG`
+  adds one gated diagnostic line (`ds4: dist mtp spec trust_all ...`).
