@@ -449,9 +449,10 @@ Original exactness argument and failed assumption
   evidence.
 - Capture ring: the interleaved loop swaps the graph's `cur_hc_by_tier` /
   `after_ffn_hc_by_tier` pointers alongside the local ping-pong swap before
-  `metal_graph_dspark_capture_decode_layer`, mirroring the single-token decode
-  row (ds4.c:61023-61026), so the target-hidden ring records each layer's
-  OUTPUT (last row wins) exactly as sequential decode does.
+  `metal_graph_dspark_capture_decode_layer`, mirroring the pointer swaps in
+  `ds4_session_eval_layer_slice` immediately before each capture call
+  (currently ds4.c:61115-61119 and 61141-61144), so the target-hidden ring
+  records each layer's OUTPUT (last row wins) exactly as sequential decode does.
 - Acceptance logic still accepts draft i iff
   `dist_logits_argmax(rows[i]) == drafts[i+1]`.  The release path then rewinds
   and runs `dist_mtp_spec_replay_accept` through ordinary one-token decode.

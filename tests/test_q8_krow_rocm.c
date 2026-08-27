@@ -567,6 +567,9 @@ int main(int argc, char **argv) {
     if (!fallback_mode && !test_primary_cache_survives_support_map()) ok = 0;
     ds4_gpu_set_model_map(NULL, 0u);
     ds4_gpu_cleanup();
-    fprintf(stderr, "Q8_0 k-row ROCm matvec: %s\n", ok ? "PASS" : "FAIL");
+    fprintf(stderr, "%s: %s\n",
+            fallback_mode ? "Q8_0 k-row ROCm prequant-disabled"
+                          : "Q8_0 k-row ROCm matvec",
+            ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
