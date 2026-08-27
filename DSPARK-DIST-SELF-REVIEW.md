@@ -465,28 +465,54 @@ Original exactness argument and failed assumption
 ROCm validation result and containment
 
 - v25f showed deterministic 512-token divergence in every direct-commit
-  DSpark policy after a 505-character common decoded prefix.  v26a then set
-  `DS4_DIST_SPEC_EXACT_SPAN=0`, forcing the ordinary per-row verifier head,
-  and produced the exact same divergent completion byte-for-byte.  The padded
-  fast head was therefore not the root cause: the broader verifier-state
-  retention / replay bypass remains unproven.
-- v26a reproduced the timing result (36.508s no-spec, 40.694s per-row direct
-  commit, ratio 1.115) with coordinator counters 450 cycles / 77 proposed /
-  63 accepted.  The worker finalized rich cost telemetry but, as expected
-  without coordinator feedback, reported zero committed cycles/proposals and
-  2130.971ms proposal work plus 332 scheduler skips.
-- `DS4_DIST_SPEC_EXACT` is now explicit opt-in.  The default verifies drafts,
+  DSpark policy after a 505-character common decoded prefix. v26a disabled the
+  padded fast verifier head and produced that same alternate completion, so
+  the fast head was not the necessary cause.
+- v27 forced restore plus serial one-token replay for every accepted prefix and
+  still produced the identical alternate completion. v29 then set the actual
+  server gate `DS4_MTP_SPEC_DISABLE=1`: it emitted no speculative WORK flags,
+  proposals, verify spans, accepts, rollback, or replay, but merely loading the
+  support model still produced the same bytes. This excluded all distributed
+  speculative state machinery as the necessary identity seam.
+- The root seam was ROCm's multi-model Q8 policy. Loading the support GGUF set
+  `g_q8_f16_disabled_for_multi_model=1`; target prefill therefore fell back
+  from its normal expanded-F16 Q8 path to different-arithmetic direct Q8
+  kernels. v29's decode rate was unchanged while prefill fell from 82.14 to
+  71.37 tokens/s, matching this mechanism.
+- Sealed v30 kept DSpark target capture active, kept speculation disabled, and
+  set `DS4_ROCM_Q8_F16_CACHE_MULTI_MODEL=1` on both ranks. It restored exact
+  512-token identity (both reasoning payloads SHA256
+  `5f38d237fa0622975c53d5affca6e86e66f18cba5294e5aa18475e5a436ccc71`),
+  restored prefill (82.24 versus 82.10 tokens/s), and was wall-neutral
+  (36.554s versus 36.519s). Restoration and dmesg gates passed.
+- The runtime fix tracks the first mapping as the primary target. In a
+  multi-model process, target Q8-to-F16 ranges remain eligible and are not
+  discarded merely because a support mapping is loaded; support-model
+  expansion remains disabled by default unless the existing explicit env opts
+  it in. If an eligible primary preload cannot be created, startup fails rather
+  than silently selecting different target arithmetic. Thus loading DSpark no
+  longer changes ordinary target arithmetic or spends optional memory on
+  expanded support weights. The engine marks the primary mapping explicitly;
+  model handoffs synchronize before source-range release, and a support-cache
+  failure disables only support expansion instead of discarding valid target
+  ranges.
+- `tests/test_q8_krow_rocm.c` now includes a multi-model regression: it enters
+  multi-model mode, requires a 2048x4096 primary Q8-to-F16 preload, evaluates
+  eight rows, maps a second support image, and requires bitwise-identical target
+  output afterward.
+- `DS4_DIST_SPEC_EXACT` is still explicit opt-in. The default verifies drafts,
   restores the speculative frontier, and serially replays accepted tokens.
-  Enabling direct commits prints a warning that exact greedy identity is not
-  guaranteed.  `DS4_DIST_SPEC_EXACT_SPAN` remains a nested diagnostic knob;
-  neither direct variant is the release path.
+  `DS4_DIST_SPEC_EXACT_SPAN` remains nested and experimental.
 
 Validation required before any direct-commit default
 
-1. Prove the replay-default path matches no-spec for at least 512 greedy token
-   IDs with actual proposals and accepts.
-2. Compare per-row verifier and replay hidden rows, KV/compressed-KV,
-   compressor/indexer state, capture state, and final logits to locate the
-   direct-commit divergence.
-3. Separately prove any fast head byte-identical at production dimensions.
+1. ROCm-build the primary-only multi-model cache fix, prove no-env support-loaded
+   plain decode matches no-spec for at least 512 greedy token IDs, and inspect
+   memory/cache telemetry on both ranks.
+2. Repeat the replay-default speculative arm with real proposals and accepts;
+   require exact token identity now that target arithmetic is held constant.
+3. Compare per-row verifier and replay hidden rows, KV/compressed-KV,
+   compressor/indexer state, capture state, and final logits before considering
+   direct verifier-state retention.
+4. Separately prove any fast head byte-identical at production dimensions.
    Only after all state and token gates pass may verifier state bypass replay.

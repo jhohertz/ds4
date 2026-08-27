@@ -259,7 +259,8 @@ static int cuda_matmul_q8_0_tensor_f16_gemm(
                                      CUBLAS_GEMM_DEFAULT);
     if (st == CUBLAS_STATUS_SUCCESS) return 1;
     fprintf(stderr, "ds4: " DS4_GPU_BLAS_NAME " q8 f16 matmul failed: status %d\n", (int)st);
-    cuda_q8_f16_cache_disable_after_failure(DS4_GPU_BLAS_NAME " f16 matmul failure",
+    cuda_q8_f16_cache_disable_after_failure(model_map,
+                                            DS4_GPU_BLAS_NAME " f16 matmul failure",
                                             in_dim * out_dim * sizeof(__half));
     return 0;
 }
@@ -316,7 +317,8 @@ static int cuda_matmul_q8_0_tensor_f16_gemm_out_half(
                                      CUBLAS_GEMM_DEFAULT);
     if (st == CUBLAS_STATUS_SUCCESS) return 1;
     fprintf(stderr, "ds4: " DS4_GPU_BLAS_NAME " q8 f16-out matmul failed: status %d\n", (int)st);
-    cuda_q8_f16_cache_disable_after_failure(DS4_GPU_BLAS_NAME " f16-out matmul failure",
+    cuda_q8_f16_cache_disable_after_failure(model_map,
+                                            DS4_GPU_BLAS_NAME " f16-out matmul failure",
                                             in_dim * out_dim * sizeof(__half));
     return 0;
 }
@@ -540,7 +542,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                              CUBLAS_GEMM_DEFAULT);
             if (st == CUBLAS_STATUS_SUCCESS) return 1;
             fprintf(stderr, "ds4: " DS4_GPU_BLAS_NAME " q8 f16 matmul failed: status %d\n", (int)st);
-            cuda_q8_f16_cache_disable_after_failure(DS4_GPU_BLAS_NAME " f16 matmul failure",
+            cuda_q8_f16_cache_disable_after_failure(model_map,
+                                                    DS4_GPU_BLAS_NAME " f16 matmul failure",
                                                     in_dim * out_dim * sizeof(__half));
             /* The F16 expansion cache is only an optimization.  If cuBLAS
              * rejects the cached path under memory pressure, retry the same

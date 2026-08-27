@@ -117,8 +117,9 @@ static int run_shape(const shape *sh) {
     }
     for (uint64_t i = 0; i < (uint64_t)MAX_K * in_dim; i++) x[i] = rng_float();
 
-    if (!ds4_gpu_set_model_map(model, model_size)) {
-        fprintf(stderr, "q8 krow: model map setup failed\n");
+    if (!ds4_gpu_set_primary_model_map(model, model_size) ||
+        !ds4_gpu_set_model_map(model, model_size)) {
+        fprintf(stderr, "q8 krow: primary model map setup failed\n");
         ok = 0;
         goto cleanup;
     }
@@ -388,6 +389,132 @@ cleanup:
     return ok;
 }
 
+static int test_primary_cache_survives_support_map(void) {
+    enum { IN_DIM = 2048u, OUT_DIM = 4096u, N_TOK = 8u };
+    const uint32_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t weight_offset = 4096u;
+    const uint64_t weight_bytes =
+        (uint64_t)OUT_DIM * blocks * Q8_BLOCK_BYTES;
+    const uint64_t model_size = weight_offset + weight_bytes;
+    const uint64_t support_size = 4096u;
+
+    int ok = 1;
+    FILE *model_file = tmpfile();
+    FILE *support_file = tmpfile();
+    FILE *support2_file = tmpfile();
+    void *model = MAP_FAILED;
+    void *support = MAP_FAILED;
+    void *support2 = MAP_FAILED;
+    float *x = NULL;
+    float *before = NULL;
+    float *after = NULL;
+    ds4_gpu_tensor *x_t = NULL;
+    ds4_gpu_tensor *out_t = NULL;
+
+    if (model_file && ftruncate(fileno(model_file), (off_t)model_size) == 0) {
+        model = mmap(NULL, (size_t)model_size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fileno(model_file), 0);
+    }
+    if (support_file &&
+        ftruncate(fileno(support_file), (off_t)support_size) == 0) {
+        support = mmap(NULL, (size_t)support_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fileno(support_file), 0);
+    }
+    if (support2_file &&
+        ftruncate(fileno(support2_file), (off_t)support_size) == 0) {
+        support2 = mmap(NULL, (size_t)support_size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fileno(support2_file), 0);
+    }
+    x = (float *)malloc((size_t)N_TOK * IN_DIM * sizeof(float));
+    before = (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    after = (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    if (!model_file || !support_file || !support2_file ||
+        model == MAP_FAILED || support == MAP_FAILED ||
+        support2 == MAP_FAILED || !x || !before || !after) {
+        fprintf(stderr, "q8 multi-model: host allocation failed\n");
+        ok = 0;
+        goto cleanup;
+    }
+    memset(model, 0, (size_t)model_size);
+    memset(support, 0, (size_t)support_size);
+    memset(support2, 0, (size_t)support_size);
+    rng_state = 0x6d756c74u;
+    fill_q8_weights((uint8_t *)model + weight_offset, OUT_DIM, blocks);
+    for (uint64_t i = 0; i < (uint64_t)N_TOK * IN_DIM; i++) {
+        x[i] = rng_float();
+    }
+
+    /* Enter multi-model mode before the explicit target preload so failure is
+     * fail-closed rather than an optional direct-Q8 fallback. */
+    if (!ds4_gpu_set_primary_model_map(model, model_size) ||
+        !ds4_gpu_set_model_map(model, model_size) ||
+        !ds4_gpu_set_model_map(support, support_size) ||
+        !ds4_gpu_cache_q8_f16_range(model, model_size, weight_offset,
+                                     weight_bytes, IN_DIM, OUT_DIM,
+                                     "ffn_down_shexp")) {
+        fprintf(stderr, "q8 multi-model: primary cache setup failed\n");
+        ok = 0;
+        goto cleanup;
+    }
+    x_t = ds4_gpu_tensor_alloc((uint64_t)N_TOK * IN_DIM * sizeof(float));
+    out_t = ds4_gpu_tensor_alloc((uint64_t)N_TOK * OUT_DIM * sizeof(float));
+    if (!x_t || !out_t ||
+        !ds4_gpu_tensor_write(x_t, 0u, x,
+                              (uint64_t)N_TOK * IN_DIM * sizeof(float)) ||
+        !ds4_gpu_matmul_q8_0_tensor(out_t, model, model_size,
+                                    weight_offset, IN_DIM, OUT_DIM,
+                                    x_t, N_TOK) ||
+        !ds4_gpu_tensor_read(out_t, 0u, before,
+                             (uint64_t)N_TOK * OUT_DIM * sizeof(float))) {
+        fprintf(stderr, "q8 multi-model: primary baseline failed\n");
+        ok = 0;
+        goto cleanup;
+    }
+
+    if (!ds4_gpu_set_model_map(support2, support_size) ||
+        !ds4_gpu_matmul_q8_0_tensor(out_t, model, model_size,
+                                    weight_offset, IN_DIM, OUT_DIM,
+                                    x_t, N_TOK) ||
+        !ds4_gpu_tensor_read(out_t, 0u, after,
+                             (uint64_t)N_TOK * OUT_DIM * sizeof(float))) {
+        fprintf(stderr, "q8 multi-model: target eval after support map failed\n");
+        ok = 0;
+        goto cleanup;
+    }
+    if (memcmp(before, after,
+               (size_t)N_TOK * OUT_DIM * sizeof(float)) != 0) {
+        uint64_t first = 0;
+        while (first < (uint64_t)N_TOK * OUT_DIM &&
+               memcmp(&before[first], &after[first], sizeof(float)) == 0) {
+            first++;
+        }
+        fprintf(stderr,
+                "q8 multi-model: target output changed after support map "
+                "(first=%llu before=%a after=%a)\n",
+                (unsigned long long)first,
+                first < (uint64_t)N_TOK * OUT_DIM ? before[first] : 0.0,
+                first < (uint64_t)N_TOK * OUT_DIM ? after[first] : 0.0);
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "q8 multi-model primary cache: BITEXACT after support map\n");
+    }
+
+cleanup:
+    if (x_t) ds4_gpu_tensor_free(x_t);
+    if (out_t) ds4_gpu_tensor_free(out_t);
+    free(x);
+    free(before);
+    free(after);
+    if (model != MAP_FAILED) munmap(model, (size_t)model_size);
+    if (support != MAP_FAILED) munmap(support, (size_t)support_size);
+    if (support2 != MAP_FAILED) munmap(support2, (size_t)support_size);
+    if (model_file) fclose(model_file);
+    if (support_file) fclose(support_file);
+    if (support2_file) fclose(support2_file);
+    return ok;
+}
+
 int main(void) {
     /* Production decode matvec shapes: square attention-sized, the shared
      * expert pair, a wide FFN, and an odd out_dim for row-guard coverage. */
@@ -407,6 +534,7 @@ int main(void) {
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
         if (!run_shape(&shapes[i])) ok = 0;
     }
+    if (!test_primary_cache_survives_support_map()) ok = 0;
     ds4_gpu_set_model_map(NULL, 0u);
     ds4_gpu_cleanup();
     fprintf(stderr, "Q8_0 k-row ROCm matvec: %s\n", ok ? "PASS" : "FAIL");

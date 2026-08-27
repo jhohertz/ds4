@@ -59123,6 +59123,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 }
             }
         }
+        if (!ds4_gpu_set_primary_model_map(e->model.map, e->model.size)) {
+            fprintf(stderr,
+                    "ds4: %s failed to mark the primary target model; aborting startup\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         (void)ds4_gpu_set_model_fd(e->model.fd);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         if (e->backend == DS4_BACKEND_CUDA &&
