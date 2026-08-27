@@ -6699,14 +6699,17 @@ int ds4_dist_session_eval(
 
 /* Re-decode an accepted speculative prefix one token at a time through the
  * ordinary distributed route (the same single-token eval the non-spec arm
- * uses).  This makes temperature-0 output token-identical to baseline and
- * avoids the batched-verify-order divergence of the old direct prefix commit.
- * It is also the recovery path: each span here is the plain decode, so a
- * caller can rewind to the committed prefix and keep going instead of ending
- * the request.  The worker's verify-span frontier snapshot is consumed on the
- * first token to rewind the remote slice; the remaining tokens follow as
- * ordinary single-token spans.  On success *last_logits holds the exact logits
- * after the final replayed token and the function returns the replayed count. */
+ * uses), and make the accept/emit decision exactly from those single-token
+ * logits: after decoding token i, the next token in `tokens` must equal
+ * `dist_logits_argmax(last_logits)` re-computed on the single-token
+ * output-head path.  The scan stops at the first divergence and returns the
+ * number of verified (emitted) tokens, so no batched verify-row argmax ever
+ * decides what is accepted.  On success *last_logits holds the exact logits
+ * after the final replayed token.  It is also the recovery path: each span
+ * here is the plain decode, so a caller can rewind to the committed prefix
+ * and keep going instead of ending the request.  The worker's verify-span
+ * frontier snapshot is consumed on the first token to rewind the remote
+ * slice; the remaining tokens follow as ordinary single-token spans. */
 static int dist_mtp_spec_replay_accept(
         ds4_dist_session *d,
         ds4_session *owner,
@@ -6717,6 +6720,7 @@ static int dist_mtp_spec_replay_accept(
         float *last_logits,
         char *err,
         size_t errlen) {
+    const int vocab = ds4_engine_vocab_size(d->state.engine);
     for (int i = 0; i < count; i++) {
         const bool rewind = remote_rewind && i == 0;
         const int rc = dist_coordinator_eval_span(
@@ -6744,6 +6748,18 @@ static int dist_mtp_spec_replay_accept(
                         i, rc, err && err[0] ? err : "(no detail)");
             }
             return -1;
+        }
+        if (i + 1 < count) {
+            const int next = dist_logits_argmax(last_logits, vocab);
+            if (next != tokens[i + 1]) {
+                if (getenv("DS4_DSPARK_SPEC_LOG")) {
+                    fprintf(stderr,
+                            "ds4: dist spec exact replay rejects token %d "
+                            "(argmax=%d != %d)\n",
+                            i + 1, next, tokens[i + 1]);
+                }
+                return i + 1;
+            }
         }
     }
     return count;
@@ -6998,12 +7014,9 @@ int ds4_dist_session_mtp_spec_cycle(
             }
             accept_n++;
         }
-        d->spec_accepted += (uint64_t)accept_n;
-        if (getenv("DS4_MTP_SPEC_LOG")) {
-            fprintf(stderr,
-                    "ds4: dist mtp spec fused drafted=%d accepted=%d cont=%d span=%.1fms\n",
-                    fused_k, accept_n, n_cont, fused_ms);
-        }
+        /* accept_n above is only a replay-length bound; the exact accept/emit
+         * decision is re-derived inside dist_mtp_spec_replay_accept from
+         * single-token output-head logits (never the batched verify rows). */
         /* Exact commit: re-decode the base token plus the accepted drafts one
          * token at a time through the ordinary distributed route so the
          * committed tokens and the next sample match plain per-token decode. */
@@ -7049,8 +7062,16 @@ int ds4_dist_session_mtp_spec_cycle(
             }
             return n_accept;
         }
+        const int exact_drafts = repl - 1; /* span_tokens[0] is the base token. */
+        d->spec_accepted += (uint64_t)exact_drafts;
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            fprintf(stderr,
+                    "ds4: dist mtp spec fused drafted=%d accepted=%d cont=%d span=%.1fms\n",
+                    fused_k, exact_drafts, n_cont, fused_ms);
+        }
         ds4_session_set_logits(owner, replay_logits, vocab);
-        if (accept_n == fused_k && n_cont > 0 && span_tokens[fused_k] != eos_token) {
+        if (exact_drafts == fused_k && n_cont > 0 &&
+            span_tokens[fused_k] != eos_token) {
             int cnt = n_cont > 16 ? 16 : n_cont;
             memcpy(d->spec_pending_drafts, cont,
                    (size_t)cnt * sizeof(cont[0]));
@@ -7061,7 +7082,7 @@ int ds4_dist_session_mtp_spec_cycle(
         free(replay_logits);
         int n_accept = 0;
         accepted[n_accept++] = first_token;
-        for (int i = 0; i < accept_n && n_accept < accepted_cap; i++) {
+        for (int i = 0; i < exact_drafts && n_accept < accepted_cap; i++) {
             accepted[n_accept++] = span_tokens[i + 1];
             if (span_tokens[i + 1] == eos_token) break;
         }
@@ -7221,16 +7242,10 @@ int ds4_dist_session_mtp_spec_cycle(
             }
         }
     }
-    d->spec_accepted += (uint64_t)accept_n;
-    if (getenv("DS4_MTP_SPEC_LOG")) {
-        fprintf(stderr,
-                "ds4: dist mtp spec verify drafted=%d accepted=%d decode2=%d base=%.1fms verify=%.1fms\n",
-                draft_n,
-                accept_n,
-                decode2_verify ? 1 : 0,
-                base_ms,
-                verify_ms);
-    }
+    /* accept_n above is only a replay-length bound (and the legacy decode2
+     * verifier result stays exact); the final accept/emit decision is made
+     * inside dist_mtp_spec_replay_accept from single-token output-head
+     * logits, so the batched verify rows never decide what is emitted. */
     if (accept_n > 0) {
         /* Exact commit: re-decode the accepted drafts one token at a time
          * from the committed prefix (first_token was already committed by
@@ -7275,7 +7290,17 @@ int ds4_dist_session_mtp_spec_cycle(
             return n_accept;
         }
         ds4_session_set_logits(owner, replay_logits, vocab);
-        if (accept_n == draft_n && want_cont && n_cont > 0 &&
+        d->spec_accepted += (uint64_t)repl;
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            fprintf(stderr,
+                    "ds4: dist mtp spec verify drafted=%d accepted=%d decode2=%d base=%.1fms verify=%.1fms\n",
+                    draft_n,
+                    repl,
+                    decode2_verify ? 1 : 0,
+                    base_ms,
+                    verify_ms);
+        }
+        if (repl == draft_n && want_cont && n_cont > 0 &&
             drafts[draft_n - 1] != eos_token) {
             /* Full accept: arm the next cycle's fused span from the exact
              * final logits. */
@@ -7287,7 +7312,7 @@ int ds4_dist_session_mtp_spec_cycle(
             d->spec_pending_pos = start + 1u + (uint32_t)draft_n;
         }
         free(replay_logits);
-        for (int i = 0; i < accept_n && n_accept < accepted_cap; i++) {
+        for (int i = 0; i < repl && n_accept < accepted_cap; i++) {
             accepted[n_accept++] = drafts[i];
             if (drafts[i] == eos_token) break;
         }

@@ -18,8 +18,11 @@ v3 protocol:
   (`F_SPEC_VERIFY | F_OUTPUT_ALL_LOGITS`, optional `F_OUTPUT_DRAFTS` for
   continuation drafts) runs the target model over the pipeline, and the
   coordinator accepts only drafts whose continuation equals the target's
-  greedy argmax. Partial accepts use `F_SPEC_COMMIT` (per-prefix snapshot
-  commit) with `F_SPEC_ROLLBACK` re-eval as fallback.
+  greedy argmax, re-verified one token at a time. Partial accepts rewind the
+  verify-span frontier (`F_SPEC_ROLLBACK`) and re-decode the accepted prefix
+  through the single-token distributed route (`dist_mtp_spec_replay_accept`),
+  so the accept/emit decision uses single-token logits and never the batched
+  verify rows.
 - The worker drafts through `ds4_session_dist_support_draft` -> legacy MTP or
   DSpark propose (`ds4_session_dist_dspark_draft`), and returns the new
   `DS4_DIST_RESULT_LOGITS_DRAFTS` / `..._NROWS` / `..._DECODE2` result kinds.
@@ -185,6 +188,25 @@ tests/test_dist_v3.c: negotiation coverage for the new capability bit.
   in `size_t` arithmetic and rejected (worker error) when it exceeds
   `UINT32_MAX`, preventing the 32-bit `n_tokens*vocab*4 + drafts` products
   from wrapping.
+## review-fix: exact acceptance
+
+Deep review tightened the acceptance invariant: every accepted token must equal
+`dist_logits_argmax` re-computed once on the single-token output-head path, and
+no batched verify-row argmax may participate in the accept/emit decision.
+
+- `ds4_distributed.c` — `dist_mtp_spec_replay_accept` now exact-verifies each
+  replayed step: after decoding token `i` on the ordinary single-token route it
+  compares `dist_logits_argmax(last_logits)` to `tokens[i+1]` and returns at
+  the first divergence, emitting only the verified prefix.  The batched
+  verify-row `accept_n` the caller passes in is demoted to a replay-length
+  bound; `spec_accepted`, the emitted `accepted[]` prefix, and the fused/pending
+  arming are all derived from the replay's returned exact count.
+- Legacy MTP `draft_n==2` keeps its existing exact decode2 verifier; the
+  replay re-verification is redundant-but-harmless there.
+- No protocol/struct change; all recovery and WHY logging, memory freeing
+  (including `replay_logits`), stats semantics (cycles/proposed/accepted_draft
+  now post-exact), and the no-`--mtp`/`--dspark` default path are preserved.
+
 ## v21-window fix (dist DSpark hard-error + exactness)
 
 Root cause (from the sealed NHI TP log pair + validation report):
