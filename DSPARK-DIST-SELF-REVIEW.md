@@ -578,6 +578,17 @@ ROCm validation result and containment
   synchronization/readback, and transport account for the remainder. Thus an
   exact speedup requires broad K-row target-layer amortization and/or a much
   cheaper proposer, not acceptance accuracy alone.
+- Sealed scheduler-density probe `stage3-f7edfcf-inference-v4` kept the same
+  exact/span/K-row-required path but set `DS4_DSPARK_SCHEDULER=0`. Identity,
+  restoration, dmesg, receipts, and all 130 evidence rows again passed. It
+  increased proposals/accepts to 162/132 over 381 cycles, but proposal work
+  rose to 6.342 seconds (5.429 seconds in the stage chain), exact decode fell
+  to 11.19 versus 14.43 tokens/s, and wall rose to 46.820 versus 36.549
+  seconds (+28.10%). The scheduler-enabled v3 exact arm was 7.615 seconds
+  faster than this probe while the two no-spec controls differed by only
+  0.062 seconds. More proposal coverage does not help until verification is
+  substantially cheaper; the existing no-draft/confidence backoff remains the
+  better measured policy.
 - `DS4_DIST_SPEC_EXACT` remains explicit opt-in. The default verifies drafts,
   restores the speculative frontier, and serially replays accepted tokens.
   This is conservative containment of an unproven direct-state-retention path,
