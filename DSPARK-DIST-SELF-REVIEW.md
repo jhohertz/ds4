@@ -360,7 +360,7 @@ exactly the single decoded token, matching the ordinary fallback.
   `dist spec stats` format, and WHY logs are unchanged.  `DS4_MTP_SPEC_LOG`
   adds one gated diagnostic line (`ds4: dist mtp spec trust_all ...`).
 
-## Fast verify span (perf-dspark-fast-verify)
+## Fast verify span experiment (disabled by default after v25f)
 
 Cost split (profile-by-inspection of the sealed v23c logs + code)
 
@@ -394,10 +394,10 @@ Cost split (profile-by-inspection of the sealed v23c logs + code)
   head/layer weight re-stream — both are what `ds4_session_eval_layer_slice_exact_rows`
   was doing.
 
-What changed (ds4.c only, additive +200 lines)
+Experimental implementation (ds4.c only, additive +200 lines)
 
-- New `ds4_session_eval_layer_slice_exact_span` (ds4.c, `#ifndef DS4_NO_GPU`)
-  executes the same bit-exact single-token kernels one command buffer per
+- `ds4_session_eval_layer_slice_exact_span` (ds4.c, `#ifndef DS4_NO_GPU`)
+  attempts to reuse the one-token layer kernels in one command buffer per
   *span* instead of per row:
   - 2..8 rows ride `metal_graph_encode_decode_layer` (ds4.c:25634) — the
     identical layer kernel the single-token decode path uses — interleaved
@@ -414,27 +414,22 @@ What changed (ds4.c only, additive +200 lines)
     once per row; the f16/norm stages keep the per-row reduction order.
   - One `ds4_gpu_end_commands()` + one `ds4_gpu_tensor_read_any()` per span
     replaces 2*N syncs + 2*N readbacks.
-- `ds4_session_eval_layer_slice_exact_rows` now dispatches to the span when
-  `ds4_session_eval_layer_slice_exact_span_enabled()` is true and the span is
-  single-tier, 2..8 rows, `2*n <= prefill_cap`, and (for the worker)
-  `spec_logits` present; otherwise it keeps the original per-row loop.  The
-  new env `DS4_DIST_SPEC_EXACT_SPAN=0` restores the old behavior for A/B and
-  fail-safe.  The outer exact gate (`DS4_DIST_SPEC_EXACT`, ROCm-only) is
-  unchanged, and Metal/CPU/GLM/large spans still take the batched-verify +
-  replay arm.
+- `ds4_session_eval_layer_slice_exact_rows` dispatches to the span only when
+  `DS4_DIST_SPEC_EXACT_SPAN=1` explicitly opts into the experiment and the
+  span is single-tier, 2..8 rows, `2*n <= prefill_cap`, and (for the worker)
+  `spec_logits` is present.  The default keeps the original per-row loop.
+  The outer exact gate (`DS4_DIST_SPEC_EXACT`, ROCm-only) is unchanged, and
+  Metal/CPU/GLM/large spans still take the batched-verify + replay arm.
 
-Why still bit-exact (argument with file:line)
+Original exactness argument and failed assumption
 
-- Layer part: each row still executes the exact `metal_graph_encode_decode_layer`
-  kernel the single-token path (`ds4_session_eval_layer_slice` n_tokens==1
-  branch, ds4.c:60407/61008) and the prior per-row exact loop used.  The
-  interleave (layer il: row 0, row 1, ..., row n-1; then layer il+1) preserves
-  the KV/compressed-KV write-then-read dependency order: by the time row i's
-  layer il runs, every row <= i has already written its layer-il KV slot and
-  every row's layer il-1 has completed, exactly the cache state the sequential
-  row-major evaluation would have produced.  The kernels are deterministic and
-  read bit-identical inputs, so each row's hidden state is bit-identical to a
-  one-row launch.
+- Layer part: each row uses `metal_graph_encode_decode_layer`, as the
+  single-token path (`ds4_session_eval_layer_slice` n_tokens==1 branch,
+  ds4.c:60407/61008) and prior per-row exact loop do.  The interleave (layer
+  il: row 0, row 1, ..., row n-1; then layer il+1) preserves the intended
+  KV/compressed-KV write-before-read dependencies.  This remains a plausible
+  weight-hot transformation, but v25f proves that the complete span cannot be
+  called exact without differential hidden-state and logits evidence.
 - Head part (f16/norm stages): `metal_graph_encode_output_head_exact_span`
   (ds4.c:26277) runs `output_hc_fn`, `output_hc_weights`, `hc_weighted_sum`
   and `output_norm` over per-row views with `n_tok == 1`, so
@@ -451,7 +446,9 @@ Why still bit-exact (argument with file:line)
   and the same `q8_0_scale_broadcast_w32` operand scale as the single-token
   `matmul_q8_0_f32_sharedx_warp_rows_w32_kernel` (rocm/ds4_rocm_q8.cuh:670);
   the zero-padding rows are never read by the coordinator (it reads only
-  `n_tokens` rows).
+  `n_tokens` rows).  This source-level reduction-order argument did not prove
+  identical compiler contraction or kernel arithmetic; the v25f result below
+  disproved the end-to-end identity claim.
 - Capture ring: the interleaved loop swaps the graph's `cur_hc_by_tier` /
   `after_ffn_hc_by_tier` pointers alongside the local ping-pong swap before
   `metal_graph_dspark_capture_decode_layer`, mirroring the single-token decode
@@ -461,37 +458,36 @@ Why still bit-exact (argument with file:line)
   `dist_logits_argmax(rows[i]) == drafts[i+1]` (ds4_distributed.c
   `ds4_dist_session_mtp_spec_cycle`), and a partial accept / non-exact
   backend still rewinds and runs `dist_mtp_spec_replay_accept`
-  (ds4_distributed.c:6731) on the exact single-token route.  So temp=0
-  token-identity vs no-spec is preserved by construction, not by tuning.
+  (ds4_distributed.c:6731) on the exact single-token route.  A full fast-span
+  accept, however, retains the span state and last-row logits without replay,
+  so the batched Q8 head must be byte-identical—not merely reduction-order
+  similar—to preserve the serial greedy stream.
 
-Predicted ratio
+ROCm validation result and containment
 
-- Expected exact-arm ratio < 1.0 vs no-spec (target achieved), bounded below
-  by the trust-all ceiling (7.651s).  The prior exact arm paid ~33 extra
-  verify rows of sync + head/layer weight re-stream; the span removes the
-  per-row sync latency and makes head/layer weights single-stream, so most of
-  the 1.294s deficit should vanish.  A conservative local estimate is an
-  exact wall in the ~8.5-10.0s range (12.8-15 t/s), but the ratio is a
-  hypothesis until measured on the NHI harness.
+- The v25f 512-token screen disproved the batched-head identity assumption.
+  All three no-spec samples were byte-stable, all twelve fast-span DSpark
+  samples were byte-stable within and across scheduler/confidence variants,
+  but every DSpark sample diverged from no-spec after a 505-character common
+  decoded prefix.  This is deterministic path-dependent greedy-token
+  divergence, not sampling or response metadata noise.
+- v25f medians were 36.533s no-spec, 40.743s default scheduler, 47.103s
+  scheduler-off, 48.978s at confidence 0.65, and 51.129s at confidence 0.60.
+  More accepted drafts per cycle monotonically increased wall time; the
+  default scheduler remains the least-cost DSpark policy but was still 11.5%
+  slower than no-spec in this workload.
+- `DS4_DIST_SPEC_EXACT_SPAN` is therefore opt-in after this review.  Exact
+  mode defaults to the prior per-row one-token-head fallback.  Enabling the
+  research span prints a warning that exact greedy identity is not
+  guaranteed.  The fast implementation remains available for differential
+  kernel work but must not decide production exact output.
 
-Validation performed on this host (macOS)
+Validation required before re-enabling the fast span
 
-- `make ds4 ds4-server` (Metal, zero warnings) and `make ds4_cpu.o`
-  (`-DDS4_NO_GPU`, zero warnings), `make test-dist-v3` (92/92 passing).
-  `make test` runs all model-independent suites until the expected
-  `ds4_test` stop at the absent `ds4flash.gguf`.
-
-Only the ROCm host A/B can settle (identity gates fail closed)
-
-1. Bit-identity of the batched direct Q8 vocab kernel vs the single-token
-   sharedx head under -ffast-math contraction (reduction-order argument holds,
-   but the compiler must emit the same `fma` shape across the two kernels).
-   The f16 `output_hc_fn` / norm / `hc_weighted_sum` stages now run per-row
-   through the single-token kernels, so they no longer need a host A/B.
-2. The actual v23c-format wall/t/s and whether the predicted < 1.0x ratio is
-   realized; the direct-kernel env `DS4_ROCM_BATCH_DIRECT=0` additionally
-   restores the tile kernel for the head A/B.
-3. Any residual memory / command-buffer behavior specific to the Strix Halo
-   deque (the span uses one command buffer for the whole slice, unlike the
-   per-row path's `metal_graph_token_split_after_layers` flush cadence) and
-   the resulting next-cycle draft quality.
+1. Compare every full logits row from the production 2..8-row padded head
+   byte-for-byte with separate one-row heads at the real 7168-wide input.
+2. Compare fast-span and per-row hidden rows, compressor/indexer state, and
+   DSpark capture at raw-window and compression boundaries.
+3. Run at least 512 greedy token IDs end-to-end against no-spec, with actual
+   proposals and accepts, before allowing fast-span state or last-row logits
+   to bypass serial replay again.

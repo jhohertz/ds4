@@ -58912,7 +58912,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     e->dspark_weights.missing_tensors,
                     e->dspark_weights.invalid_tensors,
                     e->dspark_weights.metadata_errors);
-            if (e->dspark && !e->quality && !e->dspark_strict) {
+            if (e->dspark &&
+                e->distributed.role == DS4_DISTRIBUTED_NONE &&
+                !e->quality && !e->dspark_strict) {
                 fprintf(stderr,
                         "ds4: DSpark direct verifier-state commits enabled; "
                         "output may differ from one-token decode due "
@@ -61506,25 +61508,25 @@ bool ds4_session_dist_spec_exact_verify(const ds4_session *s, uint32_t n_tokens)
 }
 
 #ifndef DS4_NO_GPU
-/* The spec verify span runs per-row through the ordinary single-token decode
- * kernels so its logits stay bit-identical to sequential decode.  The naive
- * loop (one ds4_session_eval_layer_slice call per row) re-opens a command
- * buffer and synchronizes after every row, and it re-reads every layer's and
- * the output head's weights from DRAM for each row.  This span variant keeps
- * the same bit-exact kernels but executes all rows in ONE command buffer,
- * interleaving rows per layer so a layer's weights are streamed once and
- * reused by every row.  The output head runs the f16 output_hc_fn,
- * output_hc_weights, hc_weighted_sum and output_norm stages one row at a
- * time with the same single-token kernels (n_tok == 1 keeps the
- * ordered-chunk f16 reduction), so every stage feeding sigmoid/norm is
- * bit-identical to sequential decode.  Only the Q8 vocab matmul is batched:
- * its per-row warp-ordered reduction is order-stable and it loops the
- * 562 MiB vocab weights once instead of once per row. */
+/* Experimental weight-hot verifier span.  The transformer and pre-vocab
+ * head stages use the ordinary one-row kernels, but the final Q8 vocabulary
+ * projection is padded and dispatched as a multi-row ROCm matmul.  That
+ * kernel is not structurally identical to the serial shared-X decode head;
+ * a long greedy identity run demonstrated that its last-row logits can
+ * eventually select a different token.  Keep the optimization available for
+ * differential research, but exact mode must default to the ordinary per-row
+ * head below until the complete fast output head is byte-identical. */
 static bool ds4_session_eval_layer_slice_exact_span_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_DIST_SPEC_EXACT_SPAN");
-        cached = (env == NULL || env[0] != '0') ? 1 : 0;
+        cached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+        if (cached != 0) {
+            fprintf(stderr,
+                    "ds4: WARNING DS4_DIST_SPEC_EXACT_SPAN enables an "
+                    "experimental multi-row verifier head; exact greedy "
+                    "identity is not guaranteed\n");
+        }
     }
     return cached != 0;
 }

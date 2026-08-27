@@ -508,12 +508,13 @@ int ds4_session_eval_layer_slice_logits_all(ds4_session *s,
                                             float *logits,
                                             char *err,
                                             size_t errlen);
-/* Per-row exact layer-slice verifier: each token is decoded one at a time
- * through the ordinary single-token layer-slice path, so every emitted row
- * (logits or hidden state) is bit-identical to the sequential replay arm.
- * The coordinator runs this to produce one hidden row per token and the
- * worker consumes those rows and emits one logits row per token, all within
- * a single distributed span (one round trip, KV advanced row by row). */
+/* Per-row exact layer-slice verifier.  By default each token is decoded one
+ * at a time through the ordinary single-token layer-slice path, so every
+ * emitted row (logits or hidden state) follows the sequential replay arm.
+ * The coordinator produces one hidden row per token and the worker consumes
+ * those rows and emits one logits row per token within one distributed span.
+ * DS4_DIST_SPEC_EXACT_SPAN is a diagnostic-only override that substitutes an
+ * experimental multi-row implementation without this identity guarantee. */
 int ds4_session_eval_layer_slice_exact_rows(ds4_session *s,
                                             const int *tokens,
                                             uint32_t n_tokens,
