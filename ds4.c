@@ -52235,14 +52235,37 @@ int ds4_session_dist_dspark_draft(ds4_session *s, int token, uint32_t pos,
     /* Same contract as the local speculative cycle: prepare fills the
      * session draft block from the captured target hiddens, or leaves it
      * invalid when the scheduler or the confidence gate skips this cycle
-     * (that is a normal outcome, not an error). */
+     * (that is a normal outcome, not an error).  Distributed acceptance is
+     * decided on the coordinator and is not fed back to this worker, but the
+     * worker can still account every proposal call and returned block length.
+     * This exposes scheduler/no-draft coverage (including blocks shorter than
+     * the coordinator's verify threshold) without pretending to know accepts. */
     (void)ds4_session_prepare_dspark_draft(s, token, pos);
+    const bool stats_enabled = ds4_dspark_stats_enabled();
+    if (stats_enabled) {
+        if (s->dspark_stats.cycles == 0) {
+            fprintf(stderr,
+                    "ds4: DSpark distributed worker stats are proposal-only; "
+                    "acceptance feedback unavailable\n");
+        }
+        s->dspark_stats.cycles++;
+        s->dspark_stats.first_tokens++;
+    }
     if (!s->dspark_draft_valid || s->dspark_draft_len == 0) {
+        if (stats_enabled) {
+            s->dspark_stats.no_draft++;
+            ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, 0);
+        }
         ds4_session_dspark_scheduler_note(s, 0, true, 0.0);
         return 0;
     }
     int n = (int)s->dspark_draft_len;
     if (n > max_drafts) n = max_drafts;
+    if (stats_enabled) {
+        s->dspark_stats.proposed_tokens += (uint64_t)n;
+        ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist,
+                                  (uint32_t)n);
+    }
     for (int i = 0; i < n; i++) drafts[i] = s->dspark_draft_tokens[i];
     /* The coordinator consumes the block this cycle either way. */
     s->dspark_draft_valid = false;
