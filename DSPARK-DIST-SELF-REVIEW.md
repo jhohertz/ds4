@@ -552,6 +552,22 @@ ROCm validation result and containment
   and restoration/dmesg/evidence gates passed. This proves the default policy
   no longer changes target arithmetic merely by loading support; speculation
   was deliberately disabled and no proposal correctness is implied.
+- Sealed bundle `stage3-f7edfcf-inference-v3` then exercised real proposals at
+  commit `f7edfcf552363976a3f5b0ad50a1737d7dcb86ea` with
+  `DS4_DIST_SPEC_EXACT=1`, `DS4_DIST_SPEC_EXACT_SPAN=1`, and
+  `DS4_ROCM_Q8_EXACT_KROW_REQUIRED=1` on both ranks. The no-spec and exact
+  512-token payloads both had length 1374 and SHA256
+  `5f38d237fa0622975c53d5affca6e86e66f18cba5294e5aa18475e5a436ccc71`.
+  The coordinator recorded 460 cycles, 59 proposals, and 53 accepted drafts
+  (89.83% acceptance). Required exact/span warnings, K-row receipt evidence,
+  and the primary-preserved/support-disabled policy were present on both
+  ranks; restoration, zero dmesg deltas, and all 130 sealed evidence rows
+  passed. This closes end-to-end identity for this 512-token production-width
+  run, but not every possible hidden/KV/capture state or span length.
+  Performance is not yet a win: exact delivered 13.42 versus 14.45 decode
+  tokens/s and 39.205 versus 36.487 seconds wall (7.1% lower throughput,
+  7.45% longer wall); prefill was 81.80 versus 82.19 tokens/s. The report's
+  screening decision therefore remains negative despite correctness PASS.
 - `DS4_DIST_SPEC_EXACT` remains explicit opt-in. The default verifies drafts,
   restores the speculative frontier, and serially replays accepted tokens.
   This is conservative containment of an unproven direct-state-retention path,
@@ -573,17 +589,21 @@ Validation required before any direct-commit default
    prequant-disabled rollback child, then run the fail-closed production-head
    benchmark. Both hosts passed every bitwise comparison and retained the
    timings above.
-3. Repeat the replay-default speculative arm with real proposals and accepts;
+3. **Passed (`f7edfcf` inference v3):** require real proposals and accepts,
+   required K-row dispatch, and exact 512-token identity for the direct exact
+   span. This production-width run passed with 59 proposed and 53 accepted
+   drafts, but its negative performance screening keeps the path experimental.
+4. Repeat the replay-default speculative arm with real proposals and accepts;
    require exact token identity now that target arithmetic is held constant.
-4. Compare fast-span and per-row hidden rows, KV/compressed-KV,
+5. Compare fast-span and per-row hidden rows, KV/compressed-KV,
    compressor/indexer state, capture state, and final logits before considering
    direct verifier-state retention. For the shared-row sub-experiment, cover
    K=2,3,4,5 separately and compare every layer boundary against both the
    ordinary exact span and serial one-row decode, including routed/shared
    intermediates and the last-row capture ring.
-5. Measure the shared-row candidate independently after identity passes;
+6. Measure the shared-row candidate independently after identity passes;
    confirm one gate/up pair-matmul plus one SwiGLU launch per layer and one
    shared-down/HC launch per row, positively attest the `ACTIVE` line under
    the required-mode switch, with no hidden synchronization or fallback.
-6. Only after all state and token gates pass may verifier state bypass replay
+7. Only after all state and token gates pass may verifier state bypass replay
    or the experimental exact span become a default.
