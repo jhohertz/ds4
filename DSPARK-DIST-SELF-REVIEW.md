@@ -359,3 +359,128 @@ exactly the single decoded token, matching the ordinary fallback.
 - No wire/protocol surface changed.  The existing exact/non-exact arms,
   `dist spec stats` format, and WHY logs are unchanged.  `DS4_MTP_SPEC_LOG`
   adds one gated diagnostic line (`ds4: dist mtp spec trust_all ...`).
+
+## Fast verify span (perf-dspark-fast-verify)
+
+Cost split (profile-by-inspection of the sealed v23c logs + code)
+
+- v23c sealed numbers: nospec 10.434s / 14.49 t/s, exact 11.728s / 12.74 t/s
+  (ratio 1.124), trust-all 7.651s / 21.41 t/s (ceiling).  `dist spec stats
+  cycles=100 proposed=33 accepted_draft=28 accept_rate=84.85%` — 33 drafts
+  enter verify spans, 28 survive.  trust-all proves the drafting machinery can
+  deliver ~21 t/s when the verify is skipped (48 drafts / 80 cycles in the
+  sealed trust-all window), so the entire +12.4% exact-arm deficit is the
+  verify span cost, not the drafter.
+- On ROCm, `ds4_gpu_end_commands()` is `cudaDeviceSynchronize()`
+  (rocm/ds4_rocm_runtime.cuh:6281) and `ds4_gpu_tensor_read_any()` is a
+  synchronous `hipMemcpy` (rocm/ds4_rocm_runtime.cuh:6003).  The previous
+  exact_row implementation (`ds4.c` pre-change) called
+  `ds4_session_eval_layer_slice(..., n_tokens=1, ...)` once per verify row,
+  so every row paid a full device sync plus a readback on *both* machines:
+  - coordinator (layers 0:21, 22 layers): full layer-eval + 64 KiB hidden
+    readback per row (hc = DS4_N_HC*DS4_N_EMBD = 16384 f32).
+  - worker (layers 22:41, 20 layers + output head): full layer-eval + head
+    GEMM (4096 x 129280, ~562 MiB Q8_0) + 517 KiB logits readback per row.
+- On gfx1151 (Strix Halo: 2 MB L2, no MALL) the weights re-read per row all
+  come back from DRAM.  The output-head weights dominate the worker row: a
+  per-row head re-streams ~562 MiB, and a 5-row verify span re-streams it
+  5x.  The layer weights (attn/MoE) are likewise re-streamed once per row on
+  both machines because row-major means a layer's weights are long evicted
+  from L2 before the next row reaches the same layer.
+- Network framing / scheduling are NOT the dominant cost: hidden (320 KiB for
+  5 rows) and logits (2.6 MiB for 5 rows) transfers amortize over one
+  round trip, and the fused continuation already packs base commit + drafts.
+  The dominant cost is (a) per-row device sync + readback, and (b) per-row
+  head/layer weight re-stream — both are what `ds4_session_eval_layer_slice_exact_rows`
+  was doing.
+
+What changed (ds4.c only, additive +200 lines)
+
+- New `ds4_session_eval_layer_slice_exact_span` (ds4.c, `#ifndef DS4_NO_GPU`)
+  executes the same bit-exact single-token kernels one command buffer per
+  *span* instead of per row:
+  - 2..8 rows ride `metal_graph_encode_decode_layer` (ds4.c:25634) — the
+    identical layer kernel the single-token decode path uses — interleaved
+    per layer (row 0..n-1 within each layer) so each layer's weights are
+    streamed once and reused by every row.  The interleave is the same
+    weight-hot pattern the exact two-row verifier
+    `ds4_session_eval_layer_slice_decode2` (ds4.c:61544) already used.
+  - The output head runs once as
+    `metal_graph_encode_output_head_batch` (ds4.c:26187) over all rows; for
+    2..8 rows this dispatches the existing direct warp-row Q8 kernel
+    (rocm/ds4_rocm_matmul.cuh:40 -> rocm/ds4_rocm_q8.cuh:886) that streams the
+    head weights exactly once instead of once per row.
+  - One `ds4_gpu_end_commands()` + one `ds4_gpu_tensor_read_any()` per span
+    replaces 2*N syncs + 2*N readbacks.
+- `ds4_session_eval_layer_slice_exact_rows` now dispatches to the span when
+  `ds4_session_eval_layer_slice_exact_span_enabled()` is true and the span is
+  single-tier, 2..8 rows, `2*n <= prefill_cap`, and (for the worker)
+  `spec_logits` present; otherwise it keeps the original per-row loop.  The
+  new env `DS4_DIST_SPEC_EXACT_SPAN=0` restores the old behavior for A/B and
+  fail-safe.  The outer exact gate (`DS4_DIST_SPEC_EXACT`, ROCm-only) is
+  unchanged, and Metal/CPU/GLM/large spans still take the batched-verify +
+  replay arm.
+
+Why still bit-exact (argument with file:line)
+
+- Layer part: each row still executes the exact `metal_graph_encode_decode_layer`
+  kernel the single-token path (`ds4_session_eval_layer_slice` n_tokens==1
+  branch, ds4.c:60407/61008) and the prior per-row exact loop used.  The
+  interleave (layer il: row 0, row 1, ..., row n-1; then layer il+1) preserves
+  the KV/compressed-KV write-then-read dependency order: by the time row i's
+  layer il runs, every row <= i has already written its layer-il KV slot and
+  every row's layer il-1 has completed, exactly the cache state the sequential
+  row-major evaluation would have produced.  The kernels are deterministic and
+  read bit-identical inputs, so each row's hidden state is bit-identical to a
+  one-row launch.
+- Head part: `metal_graph_output_logits_head_matmul` (ds4.c:26029) pads 2..7
+  rows to 8 and then `cuda_matmul_q8_0_tensor_labeled`
+  (rocm/ds4_rocm_matmul.cuh:338) selects `matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel`
+  (rocm/ds4_rocm_q8.cuh:886) for n_tok in 2..8.  That kernel accumulates per
+  output row as `for b ascending: acc += (d*q)*x[b*32+lane]` then
+  `warp_sum_f32`, which is the same reduction order (blocks ascending, warp
+  sum last) and the same `q8_0_scale_broadcast_w32` operand scale as the
+  single-token head kernel `matmul_q8_0_f32_sharedx_warp_rows_w32_kernel`
+  (rocm/ds4_rocm_q8.cuh:670).  Therefore each row's logits are bit-identical
+  to a one-row head; the zero-padding rows are never read by the coordinator
+  (it reads only `n_tokens` rows).
+- Acceptance logic is untouched: the coordinator still accepts draft i iff
+  `dist_logits_argmax(rows[i]) == drafts[i+1]` (ds4_distributed.c
+  `ds4_dist_session_mtp_spec_cycle`), and a partial accept / non-exact
+  backend still rewinds and runs `dist_mtp_spec_replay_accept`
+  (ds4_distributed.c:6731) on the exact single-token route.  So temp=0
+  token-identity vs no-spec is preserved by construction, not by tuning.
+
+Predicted ratio
+
+- Expected exact-arm ratio < 1.0 vs no-spec (target achieved), bounded below
+  by the trust-all ceiling (7.651s).  The prior exact arm paid ~33 extra
+  verify rows of sync + head/layer weight re-stream; the span removes the
+  per-row sync latency and makes head/layer weights single-stream, so most of
+  the 1.294s deficit should vanish.  A conservative local estimate is an
+  exact wall in the ~8.5-10.0s range (12.8-15 t/s), but the ratio is a
+  hypothesis until measured on the NHI harness.
+
+Validation performed on this host (macOS)
+
+- `make ds4 ds4-server` (Metal, zero warnings) and `make ds4_cpu.o`
+  (`-DDS4_NO_GPU`, zero warnings), `make test-dist-v3` (92/92 passing).
+  `make test` runs all model-independent suites until the expected
+  `ds4_test` stop at the absent `ds4flash.gguf`.
+
+Only the ROCm host A/B can settle (identity gates fail closed)
+
+1. Bit-identity of the interleaved span vs the prior per-row exact loop and
+   vs no-spec single-token decode (empirical; the argument above is by
+   inspection).  A/B by running with `DS4_DIST_SPEC_EXACT_SPAN=0` vs `1`.
+2. Bit-identity of the batched direct head kernel vs the single-token sharedx
+   head under -ffast-math contraction (reduction-order argument holds, but
+   the compiler must emit the same `fma` shape across the two kernels).
+3. The actual v23c-format wall/t/s and whether the predicted < 1.0x ratio is
+   realized; the direct-kernel env `DS4_ROCM_BATCH_DIRECT=0` additionally
+   restores the tile kernel for the head A/B.
+4. The DSpark capture ring after interleaved capture (last row must remain the
+   captured target hidden state feeding the next propose).
+5. Any residual memory / command-buffer behavior specific to the Strix Halo
+   deque (the span uses one command buffer for the whole slice, unlike the
+   per-row path's `metal_graph_token_split_after_layers` flush cadence).

@@ -61433,6 +61433,188 @@ bool ds4_session_dist_spec_exact_verify(const ds4_session *s, uint32_t n_tokens)
 #endif
 }
 
+#ifndef DS4_NO_GPU
+/* The spec verify span runs per-row through the ordinary single-token decode
+ * kernels so its logits stay bit-identical to sequential decode.  The naive
+ * loop (one ds4_session_eval_layer_slice call per row) re-opens a command
+ * buffer and synchronizes after every row, and it re-reads every layer's and
+ * the output head's weights from DRAM for each row.  This span variant keeps
+ * the same bit-exact kernels but executes all rows in ONE command buffer,
+ * interleaving rows per layer so a layer's weights are streamed once and
+ * reused by every row.  The output head is a single direct 2..8-row batch
+ * whose per-row summation order is identical to the one-row head. */
+static bool ds4_session_eval_layer_slice_exact_span_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_DIST_SPEC_EXACT_SPAN");
+        cached = (env == NULL || env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static int ds4_session_eval_layer_slice_exact_span(
+        ds4_session *s,
+        const int *tokens,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t layer_start,
+        uint32_t layer_end,
+        const float *input_hc,
+        float *output_hc,
+        float *logits,
+        bool output_logits,
+        char *err,
+        size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds4_gpu_graph *g = &s->graph;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+
+    /* The interleaved ping-pong needs two hc rows per token.  The dispatcher
+     * already checked width and single-tier; these bounds are the fail-closed
+     * guards in case a future caller reaches the span directly. */
+    if (n_tokens < 2u || n_tokens > 8u ||
+        2u * (uint64_t)n_tokens > (uint64_t)s->prefill_cap) {
+        if (errlen) snprintf(err, errlen, "layer-slice exact span is too wide");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    if (g->placement || g->raw_cap == 0) {
+        if (errlen) snprintf(err, errlen, "layer-slice exact span requires a single-tier graph");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    if (output_logits && !g->spec_logits) {
+        if (errlen) snprintf(err, errlen, "layer-slice exact span needs spec logits");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+
+    ds4_gpu_tensor *cur[8];
+    ds4_gpu_tensor *next[8];
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        cur[i] = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g), i, hc_dim);
+        next[i] = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g),
+                                              n_tokens + i, hc_dim);
+        if (!cur[i] || !next[i]) {
+            for (uint32_t j = 0; j <= i; j++) {
+                ds4_gpu_tensor_free(cur[j]);
+                ds4_gpu_tensor_free(next[j]);
+            }
+            if (errlen) snprintf(err, errlen, "layer-slice exact span row views failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+    }
+    ds4_gpu_tensor *saved_cur = g->cur_hc_by_tier[g->active_tier];
+    ds4_gpu_tensor *saved_after = g->after_ffn_hc_by_tier[g->active_tier];
+
+    bool ok = true;
+    if (input_hc) {
+        ok = ds4_gpu_tensor_write(metal_graph_batch_cur_hc(g), 0, input_hc,
+                                  (uint64_t)n_tokens * hc_bytes) != 0;
+    } else {
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            ok = ds4_gpu_embed_token_hc_tensor(cur[i],
+                                               e->model.map,
+                                               e->model.size,
+                                               e->weights.token_embd->abs_offset,
+                                               (uint32_t)e->weights.token_embd->dim[1],
+                                               (uint32_t)tokens[i],
+                                               DS4_N_EMBD,
+                                               DS4_N_HC) != 0;
+            if (!ok) break;
+        }
+    }
+
+    if (ok) {
+        /* Capture the verify rows exactly like the single-token decode: the
+         * target-hidden ring is invalidated once and each row's target layers
+         * re-fill it, so the last row ends up as the captured state. */
+        metal_graph_dspark_capture_begin(g);
+        g->spec_prefix_rows = 0;
+        ok = ds4_gpu_begin_commands() != 0;
+    }
+    for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            const uint32_t pos = pos0 + i;
+            const uint32_t raw_row = pos % g->raw_cap;
+            g->cur_hc_by_tier[g->active_tier] = cur[i];
+            g->after_ffn_hc_by_tier[g->active_tier] = next[i];
+            ok = metal_graph_encode_decode_layer(g,
+                                                 &e->model,
+                                                 &e->weights.layer[il],
+                                                 il,
+                                                 pos,
+                                                 g->layer_raw_cache[il],
+                                                 g->raw_cap,
+                                                 raw_row,
+                                                 metal_graph_raw_span_for_batch(g, pos, 1),
+                                                 tokens[i]);
+            if (!ok) break;
+            ds4_gpu_tensor *tmp = cur[i];
+            cur[i] = next[i];
+            next[i] = tmp;
+            if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
+        }
+    }
+    g->cur_hc_by_tier[g->active_tier] = saved_cur;
+    g->after_ffn_hc_by_tier[g->active_tier] = saved_after;
+
+    /* After an odd number of layers the final hidden state of each row sits
+     * in the second half of the borrowed rows; copy it back so one contiguous
+     * read / batch head at offset 0 sees the rows.  The dist verify slices
+     * are even (22 and 20 layers), so this copy is defensive. */
+    if (ok && ((layer_end - layer_start + 1u) & 1u) != 0u) {
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            ok = ds4_gpu_tensor_copy(metal_graph_batch_cur_hc(g),
+                                     (uint64_t)i * hc_bytes,
+                                     cur[i],
+                                     0,
+                                     hc_bytes) != 0;
+            if (!ok) break;
+        }
+    }
+    if (ok && output_logits) {
+        ok = metal_graph_encode_output_head_batch(g,
+                                                  &e->model,
+                                                  &e->weights,
+                                                  n_tokens,
+                                                  e->weights.output->dim[1]);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+
+    if (ok && output_hc) {
+        ok = ds4_gpu_tensor_read_any(metal_graph_batch_cur_hc(g), 0,
+                                     output_hc,
+                                     (uint64_t)n_tokens * hc_bytes) != 0;
+    }
+    if (ok && output_logits) {
+        ok = ds4_gpu_tensor_read_any(g->spec_logits, 0, logits,
+                                     (uint64_t)n_tokens *
+                                         (uint64_t)DS4_N_VOCAB *
+                                         sizeof(float)) != 0;
+    }
+
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        ds4_gpu_tensor_free(cur[i]);
+        ds4_gpu_tensor_free(next[i]);
+    }
+    if (!ok) {
+        if (ds4_gpu_synchronize() == 0) {
+            fprintf(stderr, "ds4: synchronize after layer-slice exact span failure also failed\n");
+        }
+        if (errlen) snprintf(err, errlen, "%s layer-slice exact span failed",
+                             ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+    return 0;
+}
+#endif /* DS4_NO_GPU */
+
 int ds4_session_eval_layer_slice_exact_rows(ds4_session *s,
                                             const int *tokens,
                                             uint32_t n_tokens,
@@ -61507,6 +61689,24 @@ int ds4_session_eval_layer_slice_exact_rows(ds4_session *s,
         if (errlen) snprintf(err, errlen, "layer-slice chunk %u exceeds prefill cap %u",
                              n_tokens, s->prefill_cap);
         return 1;
+    }
+    /* Fast span path: one command buffer, weight-hot interleaved layers, and
+     * one batched head.  The batch_cur_hc ping-pong needs two hc rows per
+     * token, so it only applies to the same single-tier, 2..8-row verify
+     * spans the dist spec gate already admits.  Wider/multi-tier spans keep
+     * the original per-row loop. */
+    if (ds4_session_eval_layer_slice_exact_span_enabled() &&
+        n_tokens >= 2u && n_tokens <= 8u &&
+        2u * (uint64_t)n_tokens <= (uint64_t)s->prefill_cap &&
+        s->graph.placement == NULL &&
+        s->graph.raw_cap != 0 &&
+        (!output_logits || s->graph.spec_logits != NULL)) {
+        return ds4_session_eval_layer_slice_exact_span(s, tokens, n_tokens,
+                                                       pos0, layer_start,
+                                                       layer_end, input_hc,
+                                                       output_hc, logits,
+                                                       output_logits, err,
+                                                       errlen);
     }
     const uint64_t hc_values = ds4_engine_hidden_f32_values(s->engine);
     const int vocab = output_logits ? ds4_engine_vocab_size(s->engine) : 0;
