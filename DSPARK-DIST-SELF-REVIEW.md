@@ -120,7 +120,7 @@ tests/test_dist_v3.c: negotiation coverage for the new capability bit.
   session object is intentionally process-lifetime, so the stats print is
   hooked onto `ds4_session_free` (owner session), which runs before
   `ds4_dist_session_free`.
-- New coordinator buffers `logits0`/`rows`/`rebuild_logits`/`reeval_logits`
+- New coordinator buffers `logits0`/`rows`/`replay_logits`/`prefix_logits`
   are freed on all success/error returns; `dist_coordinator_eval_span` frees
   its `hidden` span buffer.
 - The only new worker-state field (`spec_warned`) is a bool zeroed by the
@@ -143,17 +143,18 @@ tests/test_dist_v3.c: negotiation coverage for the new capability bit.
 1. Cannot build or execute ROCm on macOS; the `rocm/*.cuh` verify-batch
    kernel/dispatch changes were reviewed only for include order and call-site
    types. They need a ROCm host to compile/run.
-2. No end-to-end dist run was performed here (no model/GPU/harness on this
-   host). The coordinator/worker protocol paths were validated by compile,
-   link, and `tests/test_dist_v3` only.
-3. Exactness claim is token-identical for temperature=0/top_k=1 because drafts
-   are accepted only when they equal the target model's greedy argmax of the
-   verify row, but the multi-token verify span uses the batch kernel path; if
-   batch floating-point reduction order ever flips an argmax versus
-   single-token decode, a spec run could diverge from baseline (the same
-   documented caveat as single-node non-strict DSpark; strict
-   `--quality/--dspark-strict` handling under dist is not separately gated and
-   should be decided by the owner).
+2. The coordinator/worker protocol paths are validated by compile, link, and
+   `tests/test_dist_v3` (92/92 passing).  The v21-window ROCm run on the
+   NHI TP harness (`--mtp <DSpark GGUF> --dspark --mtp-draft 5`) is the
+   first end-to-end execution evidence; see the v21-window fix section below.
+3. Exactness: the original direct per-prefix snapshot commit and the batched
+   rollback re-eval both inherited the batch-verifier floating-point order,
+   which could flip a greedy argmax versus single-token decode.  As of the
+   v21-window fix the dist spec cycle no longer commits batch-derived state:
+   every accepted draft (and the fused base token) is re-decoded one token at
+   a time through the ordinary route, so temperature=0 output is token-
+   identical to the no-spec arm.  The remaining practical risk is the
+   `rocm/*.cuh` verify-batch kernels still needing a ROCm compile check.
 4. The DSpark propose pipeline requires the worker's layer slice to own the
    declared capture target layers. A coordinator-heavy split where no worker
    owns those layers would degrade to zero drafts; this is not detected at
@@ -184,3 +185,50 @@ tests/test_dist_v3.c: negotiation coverage for the new capability bit.
   in `size_t` arithmetic and rejected (worker error) when it exceeds
   `UINT32_MAX`, preventing the 32-bit `n_tokens*vocab*4 + drafts` products
   from wrapping.
+## v21-window fix (dist DSpark hard-error + exactness)
+
+Root cause (from the sealed NHI TP log pair + validation report):
+
+- The spec cycle worked for 80 cycles (`cycles=80 proposed=16 accepted_draft=14`),
+  then emitted `finish=error error="distributed speculative decode failed"` at
+  gen=92.  The worker-side stats (`scheduler_skips=59`, `proposed=0` local spec
+  cycle) show the worker only *drafts*; acceptance and commit live on the
+  coordinator.
+- The failure surface is the partial-accept commit cascade: the original code
+  committed accepted batches by a direct per-prefix snapshot commit
+  (`dist_coordinator_spec_commit_prefix` / `SPEC_COMMIT`) whose per-machine
+  state (compressor/indexer row counters vs. the worker's kept session) can
+  drift, then fell back to a *batched* `F_SPEC_ROLLBACK` re-eval, then to a
+  full transcript rebuild.  When all three disagreed in one cycle the cycle
+  returned the hard `fail_msg`, dropping the request; the coordinator's
+  session-teardown stats (`cycles=80`) still showed the committed work.
+- The same batch-verifier floating-point order also broke exactness: the
+  captured validation report records `reasoning_content` differing from the
+  no-spec arm, so the direct commit path produced non-greedy tokens.
+
+Fix (minimal robust):
+
+- Replaced the direct snapshot commit and batched rollback with
+  `dist_mtp_spec_replay_accept`: after a verify span, the accepted prefix (and
+  the fused base token) is re-decoded one token at a time through the ordinary
+  distributed route.  Each span is the exact same single-token decode the
+  no-spec arm uses, so temperature=0 output is token-identical, and the first
+  replay token carries `F_SPEC_ROLLBACK` to rewind the worker's verify-span
+  frontier while subsequent tokens are ordinary spans.
+- Added `dist_mtp_spec_recover_after_failure`: on any failed speculative span,
+  rewind to the committed prefix (`start`), rebuild the prefix, then re-eval
+  the pending base token through the plain per-token decode.  Only if that
+  also fails does the cycle return an error; every stage logs a one-line WHY
+  (`ds4: dist spec span failed rc=.. why=..`, `.. prefix rebuild failed why=..`,
+  `.. plain per-token fallback failed why=..`) so the next failing window pins
+  the residual path.  This replaces the old `DIST_MTP_SPEC_REBUILD` macro.
+- Exact replay now sets `owner` logits from the replay buffer
+  (`ds4_session_set_logits`) and arms the fused continuation
+  (`spec_pending_token`) from those exact logits instead of the batch rows.
+
+Behavior is unchanged without `--mtp`/`--dspark`; the existing
+`DS4_DSPARK_STATS` telemetry (cycles/proposed/accepted_draft/accept_rate) and
+the `DS4_MTP_SPEC_LOG`/`DS4_DSPARK_SPEC_LOG` diagnostics are preserved.
+Validated on this host by compiling `ds4_distributed.o` (Metal/CPU link path)
+and `tests/test_dist_v3` (92/92); the ROCm executable warm-path must be
+re-run on the NHI pair to close the residual `rocm/*.cuh` compile risk.

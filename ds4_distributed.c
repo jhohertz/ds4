@@ -6697,81 +6697,56 @@ int ds4_dist_session_eval(
  * Distributed Legacy-MTP Speculative Cycle
  * ========================================================================= */
 
-/* Commit an accepted verify prefix on both machines without a replay span:
- * each rank restores the per-prefix compressor/indexer state its verify
- * slice captured and re-appends the accepted tokens.  Returns nonzero when
- * either side cannot commit; callers then fall back to the rollback
- * re-eval path (the local rewind is safely overridden by the frontier
- * restore there). */
-static int dist_coordinator_spec_commit_prefix(
-        ds4_dist_coordinator_state *state,
+/* Re-decode an accepted speculative prefix one token at a time through the
+ * ordinary distributed route (the same single-token eval the non-spec arm
+ * uses).  This makes temperature-0 output token-identical to baseline and
+ * avoids the batched-verify-order divergence of the old direct prefix commit.
+ * It is also the recovery path: each span here is the plain decode, so a
+ * caller can rewind to the committed prefix and keep going instead of ending
+ * the request.  The worker's verify-span frontier snapshot is consumed on the
+ * first token to rewind the remote slice; the remaining tokens follow as
+ * ordinary single-token spans.  On success *last_logits holds the exact logits
+ * after the final replayed token and the function returns the replayed count. */
+static int dist_mtp_spec_replay_accept(
+        ds4_dist_session *d,
         ds4_session *owner,
-        const ds4_dist_route_plan *plan,
-        const int *accepted,
-        uint32_t n_accept,
+        const int *tokens,
+        int count,
         uint32_t pos0,
-        uint64_t session_id,
-        uint64_t request_id,
+        bool remote_rewind,
+        float *last_logits,
         char *err,
         size_t errlen) {
-    if (ds4_session_dist_spec_commit_prefix(owner, accepted, n_accept, pos0,
-                                            err, errlen) != 0) {
-        return 1;
+    for (int i = 0; i < count; i++) {
+        const bool rewind = remote_rewind && i == 0;
+        const int rc = dist_coordinator_eval_span(
+                &d->state,
+                owner,
+                &d->plan,
+                &tokens[i],
+                1,
+                pos0 + (uint32_t)i,
+                d->session_id,
+                d->request_id++,
+                false,
+                rewind ? DS4_DIST_WORK_F_SPEC_ROLLBACK : 0u,
+                false,
+                NULL,
+                last_logits,
+                NULL,
+                NULL,
+                err,
+                errlen);
+        if (rc != 0) {
+            if (getenv("DS4_DSPARK_SPEC_LOG")) {
+                fprintf(stderr,
+                        "ds4: dist spec exact replay token %d failed rc=%d: %s\n",
+                        i, rc, err && err[0] ? err : "(no detail)");
+            }
+            return -1;
+        }
     }
-    uint64_t prefix_hash = DS4_DIST_TOKEN_HASH_INIT;
-    if (dist_session_token_hash_prefix(owner, pos0, &prefix_hash,
-                                       err, errlen) != 0) {
-        return 1;
-    }
-    const uint64_t result_hash =
-        dist_token_hash_update_span(prefix_hash, accepted, n_accept);
-    if (plan->count == 0) return 0;
-    const ds4_dist_route_entry *first = &plan->entry[0];
-    const int fd = first->fd;
-    if (fd < 0) {
-        if (errlen) snprintf(err, errlen, "distributed route has no live first-hop connection");
-        return 1;
-    }
-    int rc = dist_coordinator_send_remote_work_on_fd(state,
-                                                     plan,
-                                                     fd,
-                                                     first->transport,
-                                                     accepted,
-                                                     n_accept,
-                                                     pos0,
-                                                     session_id,
-                                                     request_id,
-                                                     prefix_hash,
-                                                     result_hash,
-                                                     false,
-                                                     false,
-                                                     DS4_DIST_WORK_F_SPEC_COMMIT,
-                                                     NULL,
-                                                     0,
-                                                     NULL,
-                                                     err,
-                                                     errlen);
-    if (rc != 0) return rc;
-    uint32_t kind = 0, payload_bytes = 0;
-    uint64_t got_hash = 0;
-    void *payload = NULL;
-    rc = dist_recv_result_alloc(fd,
-                                first->transport,
-                                state,
-                                request_id,
-                                &kind,
-                                &got_hash,
-                                &payload,
-                                &payload_bytes,
-                                err,
-                                errlen);
-    if (rc != 0) return rc;
-    free(payload);
-    if (kind != DS4_DIST_RESULT_ACK || got_hash != result_hash) {
-        if (errlen) snprintf(err, errlen, "distributed prefix commit was not acknowledged");
-        return 1;
-    }
-    return 0;
+    return count;
 }
 
 /* The speculative WORK/RESULT extensions ride on negotiated v3 capability
@@ -6806,6 +6781,64 @@ void ds4_dist_session_print_spec_stats(const ds4_dist_session *d) {
             (unsigned long long)d->spec_proposed,
             (unsigned long long)d->spec_accepted,
             accept_rate);
+}
+
+/* Recover from a failed speculative span without hard-ending the request.
+ * Rebuild the committed prefix (all tokens before the cycle's incoming
+ * first_token) so both machines are clean at `start`, then re-eval that
+ * pending token through the ordinary per-token distributed decode.  The
+ * plain eval owns its own rebuild fallback, so this path keeps the request
+ * alive even when the speculative rebuild above it failed.  Logs a one-line
+ * WHY at each stage so the next failing window pins the residual path. */
+static int dist_mtp_spec_recover_after_failure(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        uint32_t start,
+        int first_token,
+        int span_rc,
+        char *err,
+        size_t errlen) {
+    ds4_engine *e = d->state.engine;
+    const int vocab = ds4_engine_vocab_size(e);
+    fprintf(stderr,
+            "ds4: dist spec span failed rc=%d why=%s; re-syncing from committed prefix\n",
+            span_rc, err && err[0] ? err : "(no detail)");
+    (void)ds4_session_dist_timeline_truncate(owner, start);
+    float *prefix_logits = malloc((size_t)vocab * sizeof(float));
+    if (prefix_logits) {
+        if (dist_coordinator_rebuild_from_transcript(
+                &d->state,
+                owner,
+                &d->plan,
+                ds4_session_tokens(owner),
+                d->session_id,
+                &d->request_id,
+                prefix_logits,
+                &d->plan_generation,
+                span_rc != DS4_DIST_RECV_REMOTE_ERROR,
+                err,
+                errlen) != 0) {
+            d->plan_ready = false;
+            d->plan_generation = 0;
+            fprintf(stderr,
+                    "ds4: dist spec prefix rebuild failed why=%s; trying plain per-token decode\n",
+                    err && err[0] ? err : "(no detail)");
+        } else {
+            d->plan_ready = true;
+        }
+        free(prefix_logits);
+    } else {
+        fprintf(stderr,
+                "ds4: dist spec prefix rebuild oom; trying plain per-token decode\n");
+    }
+    if (ds4_session_eval(owner, first_token, err, errlen) == 0) {
+        d->plan_ready = true;
+        return 0;
+    }
+    fprintf(stderr,
+            "ds4: dist spec plain per-token fallback failed why=%s\n",
+            err && err[0] ? err : "(no detail)");
+    return -1;
 }
 
 int ds4_dist_session_mtp_spec_cycle(
@@ -6862,36 +6895,10 @@ int ds4_dist_session_mtp_spec_cycle(
     }
     const uint32_t start = (uint32_t)timeline->len;
 
-    /* Failure recovery: rewind to the committed prefix and rebuild both
-     * machines from the transcript, exactly like the plain distributed
-     * decode path.  On success the cycle degrades to one emitted token. */
+    /* Failure recovery is the dist_mtp_spec_recover_after_failure helper:
+     * rewind to the committed prefix, rebuild both machines, then re-eval
+     * the pending token through the plain per-token distributed decode. */
     static const char fail_msg[] = "distributed speculative decode failed";
-    float *rebuild_logits = NULL;
-    bool rebuilt = false;
-#define DIST_MTP_SPEC_REBUILD(rc_) do { \
-        (void)ds4_session_dist_timeline_truncate(owner, start + 1u); \
-        rebuild_logits = malloc((size_t)vocab * sizeof(float)); \
-        if (!rebuild_logits) break; \
-        if (dist_coordinator_rebuild_from_transcript(&d->state, \
-                                                     owner, \
-                                                     &d->plan, \
-                                                     ds4_session_tokens(owner), \
-                                                     d->session_id, \
-                                                     &d->request_id, \
-                                                     rebuild_logits, \
-                                                     &d->plan_generation, \
-                                                     (rc_) != DS4_DIST_RECV_REMOTE_ERROR, \
-                                                     err, \
-                                                     errlen) != 0) { \
-            d->plan_ready = false; \
-            d->plan_generation = 0; \
-            free(rebuild_logits); \
-            rebuild_logits = NULL; \
-        } else { \
-            d->plan_ready = true; \
-            rebuilt = true; \
-        } \
-    } while (0)
 
     int min_verify = 3;
     {
@@ -6919,9 +6926,8 @@ int ds4_dist_session_mtp_spec_cycle(
     }
     d->spec_pending_count = 0;
     if (fused_k > draft_cap) fused_k = draft_cap;
-    /* Prefix commits need span rows <= DS4_SPEC_PREFIX_SLOTS + 1 (the
-     * constant lives in ds4.c; the commit helper validates the real value
-     * and falls back to the rollback re-eval on any mismatch). */
+    /* The verify span rows must fit the draft_tokens scratch and the DSpark
+     * proposer's block size; clamp to the same bound as the classic cycle. */
     if (fused_k > 5) fused_k = 5;
     if (fused_k > max_tokens - 1) fused_k = max_tokens - 1;
     if (fused_k > accepted_cap - 1) fused_k = accepted_cap - 1;
@@ -6972,22 +6978,17 @@ int ds4_dist_session_mtp_spec_cycle(
         const double fused_ms = (dist_now_sec() - fused_t0) * 1000.0;
         if (frc != 0) {
             free(rows);
-            if (getenv("DS4_MTP_SPEC_LOG")) {
-                fprintf(stderr,
-                        "ds4: dist mtp spec fused span failed rc=%d: %s\n",
-                        frc, err && err[0] ? err : "(no detail)");
-            }
-            (void)ds4_session_dist_frontier_restore(owner, &fused_frontier);
             int n_accept = 0;
             accepted[n_accept++] = first_token;
-            DIST_MTP_SPEC_REBUILD(frc);
-            if (rebuilt) {
-                ds4_session_set_logits(owner, rebuild_logits, vocab);
-                free(rebuild_logits);
-                return n_accept;
+            if (dist_mtp_spec_recover_after_failure(d, owner, start, first_token,
+                                                    frc, err, errlen) != 0) {
+                fprintf(stderr,
+                        "ds4: dist spec unrecoverable after fused verify why=%s\n",
+                        err && err[0] ? err : "(no detail)");
+                if (errlen) snprintf(err, errlen, "%s", fail_msg);
+                return -1;
             }
-            if (errlen) snprintf(err, errlen, "%s", fail_msg);
-            return -1;
+            return n_accept;
         }
         int accept_n = 0;
         for (int i = 0; i < fused_k; i++) {
@@ -7003,93 +7004,61 @@ int ds4_dist_session_mtp_spec_cycle(
                     "ds4: dist mtp spec fused drafted=%d accepted=%d cont=%d span=%.1fms\n",
                     fused_k, accept_n, n_cont, fused_ms);
         }
-        if (accept_n == fused_k) {
-            if (n_cont > 0 && span_tokens[fused_k] != eos_token) {
-                int cnt = n_cont > 16 ? 16 : n_cont;
-                memcpy(d->spec_pending_drafts, cont,
-                       (size_t)cnt * sizeof(cont[0]));
-                d->spec_pending_count = cnt;
-                d->spec_pending_token =
-                    dist_logits_argmax(rows + (uint64_t)fused_k * vocab, vocab);
-                d->spec_pending_pos = start + rows_n;
+        /* Exact commit: re-decode the base token plus the accepted drafts one
+         * token at a time through the ordinary distributed route so the
+         * committed tokens and the next sample match plain per-token decode. */
+        if (!ds4_session_dist_frontier_restore(owner, &fused_frontier)) {
+            free(rows);
+            if (errlen) snprintf(err, errlen, "coordinator speculative frontier restore failed");
+            int n_accept = 0;
+            accepted[n_accept++] = first_token;
+            if (dist_mtp_spec_recover_after_failure(d, owner, start, first_token,
+                                                    -1, err, errlen) != 0) {
+                if (errlen) snprintf(err, errlen, "%s", fail_msg);
+                return -1;
             }
-            ds4_session_set_logits(owner,
-                                   rows + (uint64_t)fused_k * vocab,
-                                   vocab);
-        } else {
-            char commit_err[192] = "";
-            if (dist_coordinator_spec_commit_prefix(&d->state,
-                                                    owner,
-                                                    &d->plan,
-                                                    span_tokens,
-                                                    (uint32_t)(1 + accept_n),
-                                                    start,
-                                                    d->session_id,
-                                                    d->request_id++,
-                                                    commit_err,
-                                                    sizeof(commit_err)) == 0) {
-                ds4_session_set_logits(owner,
-                                       rows + (uint64_t)accept_n * vocab,
-                                       vocab);
-            } else {
-                if (getenv("DS4_MTP_SPEC_LOG")) {
-                    fprintf(stderr,
-                            "ds4: dist spec prefix commit fallback: %s\n",
-                            commit_err);
-                }
-                (void)ds4_session_dist_frontier_restore(owner, &fused_frontier);
-                if (!ds4_session_dist_timeline_truncate(owner, start)) {
-                    free(rows);
-                    if (errlen) snprintf(err, errlen, "coordinator speculative timeline rewind failed");
-                    return -1;
-                }
-                float *reeval_logits = malloc((size_t)vocab * sizeof(float));
-                if (!reeval_logits) {
-                    free(rows);
-                    if (errlen) snprintf(err, errlen, "out of memory allocating speculative re-eval logits");
-                    return -1;
-                }
-                const int rrc = dist_coordinator_eval_span(&d->state,
-                                                           owner,
-                                                           &d->plan,
-                                                           span_tokens,
-                                                           (uint32_t)(1 + accept_n),
-                                                           start,
-                                                           d->session_id,
-                                                           d->request_id++,
-                                                           false,
-                                                           DS4_DIST_WORK_F_SPEC_ROLLBACK,
-                                                           false,
-                                                           NULL,
-                                                           reeval_logits,
-                                                           NULL,
-                                                           NULL,
-                                                           err,
-                                                           errlen);
-                if (rrc != 0) {
-                    free(reeval_logits);
-                    free(rows);
-                    if (getenv("DS4_MTP_SPEC_LOG")) {
-                        fprintf(stderr,
-                                "ds4: dist mtp spec rollback span failed rc=%d: %s\n",
-                                rrc, err && err[0] ? err : "(no detail)");
-                    }
-                    int n_accept = 0;
-                    accepted[n_accept++] = first_token;
-                    DIST_MTP_SPEC_REBUILD(rrc);
-                    if (rebuilt) {
-                        ds4_session_set_logits(owner, rebuild_logits, vocab);
-                        free(rebuild_logits);
-                        return n_accept;
-                    }
-                    if (errlen) snprintf(err, errlen, "%s", fail_msg);
-                    return -1;
-                }
-                ds4_session_set_logits(owner, reeval_logits, vocab);
-                free(reeval_logits);
-            }
+            return n_accept;
         }
+        if (!ds4_session_dist_timeline_truncate(owner, start)) {
+            free(rows);
+            if (errlen) snprintf(err, errlen, "coordinator speculative timeline rewind failed");
+            return -1;
+        }
+        float *replay_logits = malloc((size_t)vocab * sizeof(float));
+        if (!replay_logits) {
+            free(rows);
+            if (errlen) snprintf(err, errlen, "out of memory allocating speculative replay logits");
+            return -1;
+        }
+        const int replay_count = 1 + accept_n;
+        const int repl = dist_mtp_spec_replay_accept(d, owner, span_tokens,
+                                                     replay_count, start, true,
+                                                     replay_logits, err, errlen);
         free(rows);
+        if (repl < 0) {
+            free(replay_logits);
+            int n_accept = 0;
+            accepted[n_accept++] = first_token;
+            if (dist_mtp_spec_recover_after_failure(d, owner, start, first_token,
+                                                    repl, err, errlen) != 0) {
+                fprintf(stderr,
+                        "ds4: dist spec unrecoverable after fused exact replay why=%s\n",
+                        err && err[0] ? err : "(no detail)");
+                if (errlen) snprintf(err, errlen, "%s", fail_msg);
+                return -1;
+            }
+            return n_accept;
+        }
+        ds4_session_set_logits(owner, replay_logits, vocab);
+        if (accept_n == fused_k && n_cont > 0 && span_tokens[fused_k] != eos_token) {
+            int cnt = n_cont > 16 ? 16 : n_cont;
+            memcpy(d->spec_pending_drafts, cont,
+                   (size_t)cnt * sizeof(cont[0]));
+            d->spec_pending_count = cnt;
+            d->spec_pending_token = dist_logits_argmax(replay_logits, vocab);
+            d->spec_pending_pos = start + rows_n;
+        }
+        free(replay_logits);
         int n_accept = 0;
         accepted[n_accept++] = first_token;
         for (int i = 0; i < accept_n && n_accept < accepted_cap; i++) {
@@ -7131,19 +7100,15 @@ int ds4_dist_session_mtp_spec_cycle(
     const double base_ms = (dist_now_sec() - cycle_t0) * 1000.0;
     if (rc != 0) {
         free(logits0);
-        if (getenv("DS4_MTP_SPEC_LOG")) {
+        if (dist_mtp_spec_recover_after_failure(d, owner, start, first_token,
+                                                rc, err, errlen) != 0) {
             fprintf(stderr,
-                    "ds4: dist mtp spec base span failed rc=%d: %s\n",
-                    rc, err && err[0] ? err : "(no detail)");
+                    "ds4: dist spec unrecoverable after base decode why=%s\n",
+                    err && err[0] ? err : "(no detail)");
+            if (errlen) snprintf(err, errlen, "%s", fail_msg);
+            return -1;
         }
-        DIST_MTP_SPEC_REBUILD(rc);
-        if (rebuilt) {
-            ds4_session_set_logits(owner, rebuild_logits, vocab);
-            free(rebuild_logits);
-            return n_accept;
-        }
-        if (errlen) snprintf(err, errlen, "%s", fail_msg);
-        return -1;
+        return n_accept;
     }
     if (getenv("DS4_MTP_SPEC_LOG")) {
         fprintf(stderr,
@@ -7230,20 +7195,15 @@ int ds4_dist_session_mtp_spec_cycle(
     const double verify_ms = (dist_now_sec() - verify_t0) * 1000.0;
     if (rc != 0) {
         free(rows);
-        if (getenv("DS4_MTP_SPEC_LOG")) {
+        if (dist_mtp_spec_recover_after_failure(d, owner, start, first_token,
+                                                rc, err, errlen) != 0) {
             fprintf(stderr,
-                    "ds4: dist mtp spec verify span failed rc=%d: %s\n",
-                    rc, err && err[0] ? err : "(no detail)");
+                    "ds4: dist spec unrecoverable after verify span why=%s\n",
+                    err && err[0] ? err : "(no detail)");
+            if (errlen) snprintf(err, errlen, "%s", fail_msg);
+            return -1;
         }
-        (void)ds4_session_dist_frontier_restore(owner, &frontier);
-        DIST_MTP_SPEC_REBUILD(rc);
-        if (rebuilt) {
-            ds4_session_set_logits(owner, rebuild_logits, vocab);
-            free(rebuild_logits);
-            return n_accept;
-        }
-        if (errlen) snprintf(err, errlen, "%s", fail_msg);
-        return -1;
+        return n_accept;
     }
 
     /* 3. Greedy acceptance scan.  rows[i] holds the target logits after
@@ -7271,120 +7231,79 @@ int ds4_dist_session_mtp_spec_cycle(
                 base_ms,
                 verify_ms);
     }
-    if (accept_n < draft_n) {
-        /* Partial accept.  Preferred path: both machines commit the
-         * accepted prefix from the per-prefix state snapshots their verify
-         * slices captured -- no replay span.  The base logits for the next
-         * cycle are the accepted row's logits, already in hand. */
-        {
-            char commit_err[192] = "";
-            if (dist_coordinator_spec_commit_prefix(&d->state,
-                                                    owner,
-                                                    &d->plan,
-                                                    drafts,
-                                                    (uint32_t)accept_n,
-                                                    start + 1u,
-                                                    d->session_id,
-                                                    d->request_id++,
-                                                    commit_err,
-                                                    sizeof(commit_err)) == 0) {
-                ds4_session_set_logits(owner,
-                                       rows + (uint64_t)(accept_n - 1) * vocab,
-                                       vocab);
-                free(rows);
-                for (int i = 0; i < accept_n && n_accept < accepted_cap; i++) {
-                    accepted[n_accept++] = drafts[i];
-                    if (drafts[i] == eos_token) break;
-                }
-                if (getenv("DS4_MTP_SPEC_LOG")) {
-                    fprintf(stderr,
-                            "ds4: dist spec prefix commit accepted=%d\n",
-                            accept_n);
-                }
-                return n_accept;
+    if (accept_n > 0) {
+        /* Exact commit: re-decode the accepted drafts one token at a time
+         * from the committed prefix (first_token was already committed by
+         * the base decode) so the emitted tokens and the next sample match
+         * plain per-token decode.  accept_n is always >= 1 here because
+         * drafts[0] was pre-verified against the base decode's argmax. */
+        if (!ds4_session_dist_frontier_restore(owner, &frontier)) {
+            free(rows);
+            if (errlen) snprintf(err, errlen, "coordinator speculative frontier restore failed");
+            if (dist_mtp_spec_recover_after_failure(d, owner, start, first_token,
+                                                    -1, err, errlen) != 0) {
+                if (errlen) snprintf(err, errlen, "%s", fail_msg);
+                return -1;
             }
-            if (getenv("DS4_MTP_SPEC_LOG")) {
-                fprintf(stderr,
-                        "ds4: dist spec prefix commit fallback: %s\n",
-                        commit_err);
-            }
+            return n_accept;
         }
-        /* Fallback: rewind both machines and re-eval the accepted prefix
-         * (the worker restores its own frontier via the F_SPEC_ROLLBACK
-         * flag); the re-eval's last row is the base logits for the next
-         * cycle. */
-        (void)ds4_session_dist_frontier_restore(owner, &frontier);
         if (!ds4_session_dist_timeline_truncate(owner, start + 1u)) {
             free(rows);
             if (errlen) snprintf(err, errlen, "coordinator speculative timeline rewind failed");
             return -1;
         }
-        float *reeval_logits = malloc((size_t)vocab * sizeof(float));
-        if (!reeval_logits) {
+        float *replay_logits = malloc((size_t)vocab * sizeof(float));
+        if (!replay_logits) {
             free(rows);
-            if (errlen) snprintf(err, errlen, "out of memory allocating speculative re-eval logits");
+            if (errlen) snprintf(err, errlen, "out of memory allocating speculative replay logits");
             return -1;
         }
-        rc = dist_coordinator_eval_span(&d->state,
-                                        owner,
-                                        &d->plan,
-                                        drafts,
-                                        (uint32_t)accept_n,
-                                        start + 1u,
-                                        d->session_id,
-                                        d->request_id++,
-                                        false,
-                                        DS4_DIST_WORK_F_SPEC_ROLLBACK,
-                                        false,
-                                        NULL,
-                                        reeval_logits,
-                                        NULL,
-                                        NULL,
-                                        err,
-                                        errlen);
-        if (rc != 0) {
-            free(reeval_logits);
-            free(rows);
-            if (getenv("DS4_MTP_SPEC_LOG")) {
+        const int repl = dist_mtp_spec_replay_accept(d, owner, drafts, accept_n,
+                                                     start + 1u, true,
+                                                     replay_logits, err, errlen);
+        free(rows);
+        if (repl < 0) {
+            free(replay_logits);
+            if (dist_mtp_spec_recover_after_failure(d, owner, start, first_token,
+                                                    repl, err, errlen) != 0) {
                 fprintf(stderr,
-                        "ds4: dist mtp spec rollback span failed rc=%d: %s\n",
-                        rc, err && err[0] ? err : "(no detail)");
+                        "ds4: dist spec unrecoverable after classic exact replay why=%s\n",
+                        err && err[0] ? err : "(no detail)");
+                if (errlen) snprintf(err, errlen, "%s", fail_msg);
+                return -1;
             }
-            DIST_MTP_SPEC_REBUILD(rc);
-            if (rebuilt) {
-                ds4_session_set_logits(owner, rebuild_logits, vocab);
-                free(rebuild_logits);
-                return n_accept;
-            }
-            if (errlen) snprintf(err, errlen, "%s", fail_msg);
-            return -1;
+            return n_accept;
         }
-        ds4_session_set_logits(owner, reeval_logits, vocab);
-        free(reeval_logits);
-    } else {
-        if (want_cont && n_cont > 0 && drafts[draft_n - 1] != eos_token) {
-            /* Full accept: arm the next cycle's fused span. */
+        ds4_session_set_logits(owner, replay_logits, vocab);
+        if (accept_n == draft_n && want_cont && n_cont > 0 &&
+            drafts[draft_n - 1] != eos_token) {
+            /* Full accept: arm the next cycle's fused span from the exact
+             * final logits. */
             int cnt = n_cont > 16 ? 16 : n_cont;
             memcpy(d->spec_pending_drafts, cont,
                    (size_t)cnt * sizeof(cont[0]));
             d->spec_pending_count = cnt;
-            d->spec_pending_token = dist_logits_argmax(
-                    rows + (uint64_t)(draft_n - 1) * vocab, vocab);
+            d->spec_pending_token = dist_logits_argmax(replay_logits, vocab);
             d->spec_pending_pos = start + 1u + (uint32_t)draft_n;
         }
-        /* decode2 payload carries row-1 logits at the buffer base; the
-         * batch path carries them at the last row offset. */
-        ds4_session_set_logits(owner,
-                               decode2_verify ? rows
-                                              : rows + (uint64_t)(draft_n - 1) * vocab,
-                               vocab);
+        free(replay_logits);
+        for (int i = 0; i < accept_n && n_accept < accepted_cap; i++) {
+            accepted[n_accept++] = drafts[i];
+            if (drafts[i] == eos_token) break;
+        }
+        return n_accept;
     }
+    /* Defensive: accept_n should always be >= 1 because drafts[0] was
+     * pre-verified against the base decode; if it is ever 0, recover the
+     * base token exactly instead of returning with stale logits. */
     free(rows);
-#undef DIST_MTP_SPEC_REBUILD
-
-    for (int i = 0; i < accept_n && n_accept < accepted_cap; i++) {
-        accepted[n_accept++] = drafts[i];
-        if (drafts[i] == eos_token) break;
+    if (dist_mtp_spec_recover_after_failure(d, owner, start, first_token,
+                                            0, err, errlen) != 0) {
+        fprintf(stderr,
+                "ds4: dist spec unrecoverable after classic empty accept why=%s\n",
+                err && err[0] ? err : "(no detail)");
+        if (errlen) snprintf(err, errlen, "%s", fail_msg);
+        return -1;
     }
     return n_accept;
 }
