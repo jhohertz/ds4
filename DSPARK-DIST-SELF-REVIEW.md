@@ -551,6 +551,30 @@ ROCm validation result and containment
   unchanged head arithmetic, and the source-level admission contract; it does
   not yet prove that production inference admits the shared path or preserves
   end-to-end identity.
+- Sealed inference bundle `stage3-223b182-shared-inference-v3` closed that
+  production admission and identity gap with one no-spec anchor and three
+  alternating exact-base/exact-shared samples. All seven 512-token projections
+  matched on role, finish reason, usage `(87,512,599)`, reasoning/content
+  boundary, length 1374, and SHA256
+  `5f38d237fa0622975c53d5affca6e86e66f18cba5294e5aa18475e5a436ccc71`.
+  Every speculative sample had the identical work tuple `cycles=460`,
+  `proposed=59`, `accepted_draft=53`, so the comparison is not explained by
+  different scheduler density. Each shared sample admitted exactly 15 spans on
+  both ranks, with row histogram `{3:3,4:6,5:6}`, worker layers `22:42`,
+  coordinator layers `0:21`, and no shared-path rejection; base and no-spec
+  logs had no shared-path contamination. Median wall time improved only from
+  39.142 to 39.001 seconds (`0.9964x`), while median decode throughput improved
+  from 13.45 to 13.50 tokens/s (`1.0037x`). This is a repeatable but insufficient
+  approximately 0.14-second gain: shared exact mode still took 6.9% longer than
+  no-spec (39.001 versus 36.482 seconds). The 15 admitted spans contained 63
+  total rows, hence 48 rows beyond one row per span; the observed saving is
+  consistent with eliminating those repeated shared gate/up weight streams at
+  the independently measured roughly 230 GB/s bandwidth. It validates the
+  batching mechanism and cost model, while showing that shared gate/up alone
+  removes only a small fraction of the roughly 2.5-second remaining deficit.
+  Restoration, the dmesg gate, exact launch receipts, and all 240 evidence rows
+  passed; evidence manifest SHA256 is
+  `e1c472d7164eba6b2495b50c43a223ecec2adac9f1ed1a7e7e422fc9e90f40eb`.
 - Sealed no-env bundle `stage3-11a0c28-inference-v32e` also validated the
   default primary-target cache policy with a loaded support model and
   `DS4_MTP_SPEC_DISABLE=1`. Both 512-token payloads were byte-identical to each
@@ -644,9 +668,12 @@ Validation required before any direct-commit default
    K=2,3,4,5 separately and compare every layer boundary against both the
    ordinary exact span and serial one-row decode, including routed/shared
    intermediates and the last-row capture ring.
-6. Measure the shared-row candidate independently after identity passes;
-   confirm one gate/up pair-matmul plus one SwiGLU launch per layer and one
-   shared-down/HC launch per row, positively attest the `ACTIVE` line under
-   the required-mode switch, with no hidden synchronization or fallback.
+6. **Passed for production admission, identity, and end-to-end timing
+   (`223b182` shared-inference v3):** the required-mode `ACTIVE` ranges and
+   identical row sequence were attested bilaterally with no rejection or
+   baseline contamination. The measured gain was only about 0.14 seconds, so
+   route-overlap and broader verifier/proposer diagnostics remain required.
+   Kernel-level launch-count tracing remains a separate diagnostic rather than
+   a prerequisite for the already sealed output-identity result.
 7. Only after all state and token gates pass may verifier state bypass replay
    or the experimental exact span become a default.
