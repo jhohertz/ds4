@@ -83,6 +83,16 @@ class DistributedSafetyContractsStaticTest(unittest.TestCase):
         self.assertIn("shutdown(tp->control_fd, SHUT_RDWR)", fn)
         self.assertNotIn("atoi(tmo)", TP_SOURCE)
 
+    def test_tp_socket_lifecycle_uses_bounded_waits(self) -> None:
+        accept_fn = c_function_from(TP_SOURCE, "tp_accept_deadline")
+        connect_fn = c_function_from(TP_SOURCE, "tp_connect_one_deadline")
+        create_fn = c_function_from(TP_SOURCE, "ds4_tp_create")
+        self.assertIn("tp_poll_deadline(listener, POLLIN, deadline)", accept_fn)
+        self.assertIn("O_NONBLOCK", connect_fn)
+        self.assertIn("tp_poll_deadline(fd, POLLOUT, deadline)", connect_fn)
+        self.assertEqual(create_fn.count("tp_accept_deadline("), 2)
+        self.assertEqual(create_fn.count("tp_socket_tune("), 2)
+
     def test_gpu_cleanup_precedes_model_unmap(self) -> None:
         definition = SOURCE[SOURCE.index("void ds4_engine_close(") :]
         fn = c_function_from(definition, "ds4_engine_close")

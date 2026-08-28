@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
@@ -309,10 +310,73 @@ static int tp_listen(const char *host, int port, char *err, size_t errlen) {
     return fd;
 }
 
+static int tp_poll_deadline(int fd, short events, double deadline) {
+    for (;;) {
+        const double remaining = deadline - tp_now_sec();
+        if (remaining <= 0.0) {
+            errno = ETIMEDOUT;
+            return 0;
+        }
+        double ms_double = remaining * 1000.0;
+        if (ms_double > (double)INT_MAX) ms_double = (double)INT_MAX;
+        int timeout_ms = (int)ms_double;
+        if (timeout_ms < 1) timeout_ms = 1;
+        struct pollfd pfd = { .fd = fd, .events = events, .revents = 0 };
+        const int rc = poll(&pfd, 1, timeout_ms);
+        if (rc > 0) return 1;
+        if (rc == 0) {
+            errno = ETIMEDOUT;
+            return 0;
+        }
+        if (errno != EINTR) return 0;
+    }
+}
+
+static int tp_accept_deadline(int listener, double timeout_sec,
+                              char *err, size_t errlen) {
+    const double deadline = tp_now_sec() + timeout_sec;
+    for (;;) {
+        if (!tp_poll_deadline(listener, POLLIN, deadline)) {
+            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+            return -1;
+        }
+        const int fd = accept(listener, NULL, NULL);
+        if (fd >= 0) return fd;
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+            return -1;
+        }
+    }
+}
+
+static int tp_connect_one_deadline(int fd, const struct sockaddr *addr,
+                                   socklen_t addrlen, double deadline) {
+    const int old_flags = fcntl(fd, F_GETFL, 0);
+    if (old_flags < 0 || fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) != 0)
+        return 0;
+    if (connect(fd, addr, addrlen) == 0) {
+        if (fcntl(fd, F_SETFL, old_flags) != 0) return 0;
+        return 1;
+    }
+    if (errno != EINPROGRESS && errno != EWOULDBLOCK) return 0;
+    if (!tp_poll_deadline(fd, POLLOUT, deadline)) return 0;
+    int socket_error = 0;
+    socklen_t socket_error_len = sizeof(socket_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                   &socket_error, &socket_error_len) != 0)
+        return 0;
+    if (socket_error != 0) {
+        errno = socket_error;
+        return 0;
+    }
+    if (fcntl(fd, F_SETFL, old_flags) != 0) return 0;
+    return 1;
+}
+
 static int tp_dial(const char *host, int port, double timeout_sec, char *err, size_t errlen) {
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
-    double deadline = tp_now_sec() + timeout_sec;
+    const double deadline = tp_now_sec() + timeout_sec;
     int last_errno = 0;
     uint32_t attempts = 0;
     do {
@@ -324,12 +388,17 @@ static int tp_dial(const char *host, int port, double timeout_sec, char *err, si
             for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
                 int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
                 if (fd < 0) continue;
-                if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+                double attempt_deadline = tp_now_sec() + 5.0;
+                if (attempt_deadline > deadline) attempt_deadline = deadline;
+                if (tp_connect_one_deadline(fd, ai->ai_addr,
+                                            ai->ai_addrlen,
+                                            attempt_deadline)) {
                     freeaddrinfo(res);
                     return fd;
                 }
                 last_errno = errno;
                 close(fd);
+                if (tp_now_sec() >= deadline) break;
             }
             freeaddrinfo(res);
         }
@@ -340,7 +409,7 @@ static int tp_dial(const char *host, int port, double timeout_sec, char *err, si
                     gai != 0 ? gai_strerror(gai) :
                     last_errno ? strerror(last_errno) : "no address worked");
         }
-        usleep(200 * 1000);
+        if (tp_now_sec() < deadline) usleep(200 * 1000);
     } while (tp_now_sec() < deadline);
     tp_set_err(err, errlen, "tp connect %s:%d: %s", host, port,
                last_errno ? strerror(last_errno) : "unreachable");
@@ -1456,11 +1525,9 @@ int ds4_tp_create(
         if (listener < 0) goto fail;
         fprintf(stderr, "ds4-tp: waiting for worker on %s:%d ...\n",
                 opt->listen_host ? opt->listen_host : "0.0.0.0", opt->listen_port);
-        tp->control_fd = accept(listener, NULL, NULL);
-        if (tp->control_fd < 0) {
-            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
-            goto fail;
-        }
+        tp->control_fd = tp_accept_deadline(
+            listener, (double)tp->timeout_sec, err, errlen);
+        if (tp->control_fd < 0) goto fail;
     } else {
         tp->control_fd = tp_dial(opt->leader_host, opt->leader_port,
                                  (double)tp->timeout_sec, err, errlen);
@@ -1484,7 +1551,8 @@ int ds4_tp_create(
          * interleave with gate payloads.  Created under RDMA too for
          * headers, verify-block gates, and transport fallback. */
         if (tp->rank == 0) {
-            tp->data_fd = accept(listener, NULL, NULL);
+            tp->data_fd = tp_accept_deadline(
+                listener, (double)tp->timeout_sec, err, errlen);
             if (tp->data_fd < 0) {
                 tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
                 goto fail;
