@@ -1,7 +1,10 @@
 # DSpark distributed speculative decode — self-review
 
-Branch: `wip-dspark-dist`. Base for this work is `93f75b9`; the WIP commit
-`c200554` plus the follow-up edits described below implement the feature.
+Branch: `perf-dspark-exact-krow` at code commit `ae762ae`. The single-PR
+base is `upstream/main` commit `c1d4597`; the distributed-DSpark implementation
+starts at `93f75b9`, with `c200554` plus the follow-up commits described below.
+The PR series also contains its required server metrics, descriptor-framed NHI
+transport, tensor-parallel ROCm/NHI support, and exact-row kernel prerequisites.
 
 ## Scope summary
 
@@ -645,7 +648,23 @@ ROCm validation result and containment
   level further, defaults off, and prints a prominent warning; it has no
   bearing on the sealed results above.
 
-Validation required before any direct-commit default
+## Endurance validation status
+
+- Frozen bundle `stage3-ae762ae-endurance-v9` received independent review
+  PASS for its exact six-phase AB/BA/AB protocol, evidence publication, and
+  fail-closed checker. Its SHA256SUMS digest is
+  `dfdd7d045a2779b706d15ad5b4fe8d8799071f8f16f7e41da0a5e679bf47d65e`.
+- Execution remains explicitly held. There is no endurance runtime result yet,
+  and the reviewed bundle must not be cited as performance or correctness
+  evidence until its atomic SUCCESS receipt is published and independently
+  checked. It targets code commit `ae762ae`; later packaging-only documentation
+  changes do not alter the candidate binaries.
+- Until that run completes, the measured performance decision remains negative:
+  exact/shared paths stay nested, experimental, and default-off. The existing
+  512-token evidence establishes targeted correctness and mechanism behavior,
+  not a general speedup or direct-commit default.
+
+## Validation required before any direct-commit default
 
 1. **Passed (v32e):** ROCm-build the primary-only multi-model cache fix and
    prove no-env support-loaded plain decode matches no-spec for 512 greedy
