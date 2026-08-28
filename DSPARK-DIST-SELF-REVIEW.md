@@ -1,8 +1,10 @@
 # DSpark distributed speculative decode — self-review
 
-Branch: `perf-dspark-exact-krow` at code commit `ae762ae`. The single-PR
-base is `upstream/main` commit `c1d4597`; the distributed-DSpark implementation
-starts at `93f75b9`, with `c200554` plus the follow-up commits described below.
+Branch: `perf-dspark-exact-krow`. The reviewed endurance candidate is
+`ae762ae`; post-review transport/state hardening is code commit `5eccd5a`.
+The single-PR base is `upstream/main` commit `c1d4597`; the distributed-DSpark
+implementation starts at `93f75b9`, with `c200554` plus the follow-up commits
+below.
 The PR series also contains its required server metrics, descriptor-framed NHI
 transport, tensor-parallel ROCm/NHI support, and exact-row kernel prerequisites.
 
@@ -103,13 +105,19 @@ tests/test_dist_v3.c: negotiation coverage for the new capability bit.
   Additive: `dist_v3_local_offer` advertises it; `ds4_dist_v3_negotiate`
   selects it only when both peers advertise it; `hello_ack_validate` requires
   selected bits to be a supported subset of the common offer. Old v3 peers
-  simply never see the bit selected. `test_dist_v3` covers both directions
-  (92/92 passing).
-- New WORK flag bits 0x10/0x20/0x40/0x80/0x100 ride the existing 32-bit
-  `flags` field of the fixed WORK record (which already carried v2 flag
+  simply never see the bit selected. `test_dist_v3` covers both directions.
+- New capability bit `DS4_DIST_V3_CAP_SPEC_EXACT_V1 = 0x00000010u` gates the
+  explicit bilateral exact-row requirement separately from base speculation.
+  Mixed pre-flag peers therefore retain replay and never receive the new flag.
+- New WORK flag bits 0x10/0x20/0x40/0x80/0x100/0x200 ride the existing
+  32-bit `flags` field of the fixed WORK record (which already carried v2 flag
   bits). They are masked by the worker's `DS4_DIST_WORK_F_VALID_MASK`, and the
-  coordinator only sets them when every hop selected the spec cap, so an
-  older peer never observes them.
+  coordinator only sets them when every hop selected the required capability,
+  so an older peer never observes them. `0x200` is
+  `F_SPEC_EXACT_REQUIRED`: a
+  coordinator may retain exact-span state only after the worker positively
+  executes its own exact-row gate; an environment mismatch fails the span
+  instead of silently mixing exact and ordinary batch state.
 - New result kinds 3/4/5 (`LOGITS_DRAFTS`, `LOGITS_NROWS`,
   `LOGITS_DECODE2`) ride the existing `result_kind` field. They are only
   produced in response to the gated spec WORK flags.
@@ -131,6 +139,13 @@ tests/test_dist_v3.c: negotiation coverage for the new capability bit.
   its `hidden` span buffer.
 - The only new worker-state field (`spec_warned`) is a bool zeroed by the
   existing `memset` of the worker state.
+- Engine teardown releases TP/GPU workspaces, retained model ranges, and host
+  registrations before unmapping either the target or support GGUF. Inbound
+  distributed RESULT headers are checked against request-specific kind and
+  payload geometry before any payload allocation/read; telemetry is bounded
+  by layer count. TP command frames are type/size-bounded before allocation,
+  and the negotiated NHI payload ceiling is retained in transport state and
+  enforced independently of ring capacity.
 
 ## Expected log lines
 
@@ -295,7 +310,8 @@ What changed:
   - `dist_coordinator_eval_span` runs its local slice through the per-row
     exact path for `F_SPEC_VERIFY` spans when the gate is true.
   - The worker eval dispatch uses `ds4_session_eval_layer_slice_exact_rows`
-    for `F_SPEC_VERIFY | F_OUTPUT_ALL_LOGITS` spans when the same gate is true.
+    only for `F_SPEC_VERIFY | F_OUTPUT_ALL_LOGITS |
+    F_SPEC_EXACT_REQUIRED` spans after its local exact gate succeeds.
   - `ds4_dist_session_mtp_spec_cycle` trusts the span rows on a full accept
     (`exact_span && accept_n == draft_n`), keeping the span's commits and
     setting `owner` logits from the last row; partial accepts (or non-exact
@@ -313,9 +329,11 @@ Exactness argument:
   `F_SPEC_VERIFY` frontier snapshot is still taken before the span; a full
   accept leaves both machines' commits in place (they are already the accepted
   prefix), while a partial accept rewinds via the same replay path as before.
-  There is no new wire flag: both sides derive the exact/batched decision from
-  the same `ds4_session_dist_spec_exact_verify` gate, so no protocol surface
-  changed.
+  `F_SPEC_EXACT_REQUIRED` makes the bilateral decision explicit. The worker
+  hard-fails the span if its local exact gate is unavailable; without the flag
+  it deliberately uses the ordinary batch path even if its environment alone
+  enabled exact mode. Thus a successful response positively attests the same
+  exact-row decision before the coordinator may retain span state.
 
 Paths that still replay:
 
@@ -324,9 +342,11 @@ Paths that still replay:
   verifies and partial accepts also retain the replay arm.  All existing
   `dist spec stats` / WHY logs and `F_SPEC_*` protocol surface are preserved.
 
-Validation performed on this host (macOS): `make ds4 ds4-server` and
-`make test-dist-v3` (92/92 passing).  ROCm warm-path bit-identity and the
-authoritative A/B remain to be measured on the NHI harness window.
+Validation performed on this host (macOS): `make ds4 ds4-server`,
+`make test-dist-v3` (117/117), `make test-transport` (126/126), and the ten
+worker/safety source-contract checks pass. ROCm warm-path bit-identity and the
+authoritative A/B for the post-review fixes remain to be measured on the NHI
+harness after the active frozen-candidate endurance window completes.
 
 ## Trust-all research mode
 
@@ -342,24 +362,26 @@ It is inert unless all of these hold:
   the ordinary per-token decode (so `dist_route_plan_supports_spec` also held).
 
 When active, `ds4_dist_session_mtp_spec_cycle` emits every drafted token
-directly: it still runs the ordinary base decode (committing `first_token` and
-pulling `F_OUTPUT_DRAFTS`), then returns all returned drafts without any
-`F_SPEC_VERIFY` span, acceptance scan, or replay.  `spec_proposed` and
-`spec_accepted` both advance by the emitted draft count, so the
-`dist spec stats` accept_rate is 100%; `spec_cycles` counts the base decodes.
-Missing drafts (`n_drafts == 0`) leave `draft_n == 0`, so the cycle returns
-exactly the single decoded token, matching the ordinary fallback.
+without comparing it to the target argmax. It still runs the ordinary base
+decode (committing `first_token` and pulling `F_OUTPUT_DRAFTS`), then advances
+every trusted draft through one ordinary batched target span. This keeps both
+target timelines/KV states aligned with the emitted stream and samples the
+next boundary from the final target logits, while deliberately skipping the
+acceptance scan and replay. `spec_proposed` and `spec_accepted` both advance by
+the emitted draft count, so `dist spec stats` reports 100% acceptance;
+`spec_cycles` counts base decodes. Missing drafts return exactly the single
+base token.
 
 - The coordinator session prints once at creation (only when the env is set
   and the backend offers drafts):
-  `ds4: WARNING: DS4_DIST_SPEC_TRUST_ALL=1 — target-model verification DISABLED (research mode); emitted completion is not guaranteed to match greedy decode`
+  `ds4: WARNING: DS4_DIST_SPEC_TRUST_ALL=1 — target-vs-draft acceptance DISABLED (research mode); batched target-state advancement remains and emitted completion is not guaranteed to match greedy decode`
 - Temperature is not special-cased here: the knob only lives in
   `ds4_dist_session_mtp_spec_cycle`, which the non-greedy distributed arm never
   reaches, so sampling semantics are unchanged.
-- The live logits are set from the base-decode logits, so the next boundary
-  token is the target's own next greedy token; the emitted completion is
-  explicitly not required to match greedy decode.
-- No wire/protocol surface changed.  The existing exact/non-exact arms,
+- Live logits are set from the last trusted row after its batched target-state
+  advancement. The emitted completion is explicitly not required to match
+  greedy decode, but it is a coherent target timeline rather than stale state.
+- No additional wire kind is needed. The existing exact/non-exact arms,
   `dist spec stats` format, and WHY logs are unchanged.  `DS4_MTP_SPEC_LOG`
   adds one gated diagnostic line (`ds4: dist mtp spec trust_all ...`).
 
@@ -368,12 +390,13 @@ exactly the single decoded token, matching the ordinary fallback.
 Cost split (profile-by-inspection of the sealed v23c logs + code)
 
 - v23c sealed numbers: nospec 10.434s / 14.49 t/s, exact 11.728s / 12.74 t/s
-  (ratio 1.124), trust-all 7.651s / 21.41 t/s (ceiling).  `dist spec stats
+  (ratio 1.124), historical trust-all 7.651s / 21.41 t/s. `dist spec stats
   cycles=100 proposed=33 accepted_draft=28 accept_rate=84.85%` — 33 drafts
-  enter verify spans, 28 survive.  trust-all proves the drafting machinery can
-  deliver ~21 t/s when the verify is skipped (48 drafts / 80 cycles in the
-  sealed trust-all window), so the entire +12.4% exact-arm deficit is the
-  verify span cost, not the drafter.
+  enter verify spans, 28 survive. The historical trust-all result did not
+  advance target state through its emitted drafts and is therefore not a valid
+  end-to-end speed ceiling. It motivated the diagnostic, but must not be used
+  as performance evidence for the corrected state-advancing mode; that mode
+  needs a new measurement after this fix.
 - On ROCm, `ds4_gpu_end_commands()` is `cudaDeviceSynchronize()`
   (rocm/ds4_rocm_runtime.cuh:6281) and `ds4_gpu_tensor_read_any()` is a
   synchronous `hipMemcpy` (rocm/ds4_rocm_runtime.cuh:6003).  The previous
@@ -654,11 +677,12 @@ ROCm validation result and containment
   PASS for its exact six-phase AB/BA/AB protocol, evidence publication, and
   fail-closed checker. Its SHA256SUMS digest is
   `dfdd7d045a2779b706d15ad5b4fe8d8799071f8f16f7e41da0a5e679bf47d65e`.
-- Execution remains explicitly held. There is no endurance runtime result yet,
-  and the reviewed bundle must not be cited as performance or correctness
+- Its one authorized execution is active; there is no endurance runtime result
+  yet, and the reviewed bundle must not be cited as performance or correctness
   evidence until its atomic SUCCESS receipt is published and independently
-  checked. It targets code commit `ae762ae`; later packaging-only documentation
-  changes do not alter the candidate binaries.
+  checked. It targets code commit `ae762ae`. The later `5eccd5a` source fixes
+  materially change transport/state handling and require their own compile and
+  targeted node validation; the endurance result cannot be attributed to them.
 - Until that run completes, the measured performance decision remains negative:
   exact/shared paths stay nested, experimental, and default-off. The existing
   512-token evidence establishes targeted correctness and mechanism behavior,
