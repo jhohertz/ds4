@@ -559,6 +559,8 @@ int main(int argc, char **argv) {
     if (setenv("DS4_ROCM_DSV4_PREQUANT_DECODE",
                fallback_mode ? "0" : "1", 1) != 0 ||
         setenv("DS4_ROCM_Q8_EXACT_KROW_REQUIRED",
+               fallback_mode ? "0" : "1", 1) != 0 ||
+        setenv("DS4_ROCM_SHARED_DOWN_CUBLAS",
                fallback_mode ? "0" : "1", 1) != 0) {
         perror("q8 krow: setenv");
         return 1;

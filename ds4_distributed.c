@@ -73,18 +73,16 @@
  * the per-prefix state snapshots (no re-eval); tokens carry the accepted
  * ids, pos0 the pre-draft timeline length, the reply is a bare ack. */
 #define DS4_DIST_WORK_F_SPEC_COMMIT 0x00000100u
+/* The coordinator may retain a verified span only when the final worker
+ * positively executes its own exact-row path. A missing local gate is a hard
+ * protocol error, never an asymmetric fallback to ordinary batch rows. */
+#define DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED 0x00000200u
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
      DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
      DS4_DIST_WORK_F_SPEC_VERIFY | DS4_DIST_WORK_F_SPEC_ROLLBACK | \
      DS4_DIST_WORK_F_OUTPUT_DRAFTS | DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS | \
-     DS4_DIST_WORK_F_SPEC_COMMIT)
-#define DS4_DIST_RESULT_ACK 0u
-#define DS4_DIST_RESULT_HIDDEN_STATE 1u
-#define DS4_DIST_RESULT_LOGITS 2u
-#define DS4_DIST_RESULT_LOGITS_DRAFTS 3u
-#define DS4_DIST_RESULT_LOGITS_NROWS 4u
-#define DS4_DIST_RESULT_LOGITS_DECODE2 5u
+     DS4_DIST_WORK_F_SPEC_COMMIT | DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED)
 #define DS4_DIST_ACTIVATION_BITS_DEFAULT 32u
 #define DS4_DIST_ROUTE_F_OUTPUT_LOGITS 0x00000001u
 #define DS4_DIST_ROUTE_RETURN_UPSTREAM 1u
@@ -2120,7 +2118,8 @@ static ds4_dist_v3_hello_ext dist_v3_local_offer(
     offer.protocol_min = DS4_DIST_V3_PROTOCOL_VERSION;
     offer.protocol_max = DS4_DIST_V3_PROTOCOL_VERSION;
     offer.capabilities = DS4_DIST_V3_CAP_BULK_DESC_V1 |
-                         DS4_DIST_V3_CAP_SPEC_DECODE_V1;
+                         DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
+                         DS4_DIST_V3_CAP_SPEC_EXACT_V1;
     offer.transport_policy = policy == DS4_DIST_TRANSPORT_NHI
         ? DS4_DIST_V3_POLICY_REQUIRE_NHI : DS4_DIST_V3_POLICY_AUTO;
     if (nhi) {
@@ -2328,6 +2327,7 @@ static ds4_transport *dist_worker_negotiate_link(
         if (ds4_transport_configure_link(candidate, generation,
                                          ack.nhi_frame_size,
                                          ack.nhi_ring_size,
+                                         ack.nhi_max_payload,
                                          err, errlen) != 0) {
             ds4_transport_release(candidate);
             if (v3_tcp_retry &&
@@ -2340,7 +2340,7 @@ static ds4_transport *dist_worker_negotiate_link(
         ds4_transport_release(candidate);
         selected = ds4_transport_tcp_create(fd, err, errlen);
         if (!selected) return NULL;
-        if (ds4_transport_configure_link(selected, generation, 0, 0,
+        if (ds4_transport_configure_link(selected, generation, 0, 0, 0,
                                          err, errlen) != 0) {
             ds4_transport_release(selected);
             return NULL;
@@ -2417,8 +2417,9 @@ static ds4_transport *dist_coordinator_negotiate_v3(
     if (ack.selected_transport == DS4_DIST_V3_TRANSPORT_NHI) {
         if (!candidate ||
             ds4_transport_configure_link(candidate, generation,
-                                         worker_offer->nhi_frame_size,
-                                         worker_offer->nhi_ring_size,
+                                         ack.nhi_frame_size,
+                                         ack.nhi_ring_size,
+                                         ack.nhi_max_payload,
                                          err, errlen) != 0) {
             ds4_transport_release(candidate);
             candidate = NULL;
@@ -2439,7 +2440,7 @@ static ds4_transport *dist_coordinator_negotiate_v3(
         ds4_transport_release(candidate);
         selected = ds4_transport_tcp_dup(fd, err, errlen);
         if (!selected) return NULL;
-        if (ds4_transport_configure_link(selected, generation, 0, 0,
+        if (ds4_transport_configure_link(selected, generation, 0, 0, 0,
                                          err, errlen) != 0) {
             ds4_transport_release(selected);
             return NULL;
@@ -2973,6 +2974,7 @@ static int dist_recv_result_alloc_leased(
         ds4_transport *transport,
         const ds4_dist_coordinator_state *state,
         uint64_t request_id,
+        const ds4_dist_v3_result_limits *limits,
         uint32_t *kind,
         uint64_t *result_hash,
         void **payload,
@@ -3010,6 +3012,13 @@ static int dist_recv_result_alloc_leased(
         return 1;
     }
     dist_result_from_wire(&result);
+    if (ds4_dist_v3_result_payload_validate(
+            result.status, result.result_kind, result.payload_bytes,
+            result.payload_bits, limits,
+            state ? state->activation_bits : 0u, err, errlen) != 0) {
+        shutdown(fd, SHUT_RDWR);
+        return 1;
+    }
     const uint64_t got_request = dist_u64_from_halves(result.request_hi, result.request_lo);
     const uint64_t got_hash = dist_u64_from_halves(result.result_hash_hi,
                                                   result.result_hash_lo);
@@ -3044,6 +3053,7 @@ static int dist_recv_result_alloc_leased(
         tcp_payload_bytes = 0;
     if (result.telemetry_bytes % (uint32_t)sizeof(ds4_dist_telemetry_fixed) != 0 ||
         result.telemetry_count != result.telemetry_bytes / (uint32_t)sizeof(ds4_dist_telemetry_fixed) ||
+        !state || result.telemetry_count > state->n_layers + 1u ||
         result.telemetry_bytes > body_bytes ||
         tcp_payload_bytes != body_bytes - result.telemetry_bytes) {
         if (v3)
@@ -3251,6 +3261,7 @@ static int dist_recv_result_alloc(
         ds4_transport *transport,
         const ds4_dist_coordinator_state *state,
         uint64_t request_id,
+        const ds4_dist_v3_result_limits *limits,
         uint32_t *kind,
         uint64_t *result_hash,
         void **payload,
@@ -3258,7 +3269,7 @@ static int dist_recv_result_alloc(
         char *err,
         size_t errlen) {
     return dist_recv_result_alloc_leased(fd, transport, state, request_id,
-                                         kind, result_hash, payload,
+                                         limits, kind, result_hash, payload,
                                          payload_bytes, NULL, err, errlen);
 }
 
@@ -3375,6 +3386,29 @@ static int dist_coordinator_eval_remote_on_fd(
     const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
     const double total_t0 = profile ? dist_now_sec() : 0.0;
     const double send_t0 = profile ? dist_now_sec() : 0.0;
+    const uint64_t logits_bytes64 =
+        (uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float);
+    const uint64_t nrows_bytes64 = (uint64_t)n_tokens * logits_bytes64;
+    uint32_t hidden_wire_bytes = 0;
+    if (logits_bytes64 == 0 || logits_bytes64 > UINT32_MAX ||
+        nrows_bytes64 == 0 || nrows_bytes64 > UINT32_MAX ||
+        !dist_activation_wire_bytes_from_f32_bytes(
+            state->activation_bits, hidden_hc_bytes, &hidden_wire_bytes)) {
+        if (errlen) snprintf(err, errlen,
+                             "distributed result bounds exceed protocol limits");
+        return 1;
+    }
+    const uint32_t logits_bytes = (uint32_t)logits_bytes64;
+    const ds4_dist_v3_result_limits result_limits = {
+        .allowed_kinds = DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_HIDDEN_STATE) |
+            DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_LOGITS) |
+            DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_LOGITS_DRAFTS) |
+            DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_LOGITS_NROWS) |
+            DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_LOGITS_DECODE2),
+        .hidden_wire_bytes = hidden_wire_bytes,
+        .logits_bytes = logits_bytes,
+        .nrows_bytes = (uint32_t)nrows_bytes64,
+    };
     if (n_drafts_out) *n_drafts_out = 0;
     if (top0_out) *top0_out = -1;
     int rc = dist_coordinator_send_remote_work_on_fd(state,
@@ -3407,6 +3441,7 @@ static int dist_coordinator_eval_remote_on_fd(
                                            transport,
                                            state,
                                            request_id,
+                                           &result_limits,
                                            &kind,
                                            &result_hash,
                                            &payload,
@@ -3433,7 +3468,6 @@ static int dist_coordinator_eval_remote_on_fd(
         return 1;
     }
 
-    const uint32_t logits_bytes = (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
     if (kind == DS4_DIST_RESULT_LOGITS && payload_bytes == logits_bytes) {
         const double copy_t0 = profile ? dist_now_sec() : 0.0;
         memcpy(logits, payload, logits_bytes);
@@ -3642,11 +3676,19 @@ static int dist_coordinator_eval_span(
 
     const double local_t0 = profile ? dist_now_sec() : 0.0;
     int rc;
+    const bool exact_required =
+        (spec_flags & DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED) != 0;
     const bool exact_rows =
         !decode2_span &&
         (spec_flags & DS4_DIST_WORK_F_SPEC_VERIFY) != 0 &&
-        n_tokens > 1u &&
+        exact_required && n_tokens > 1u &&
         ds4_session_dist_spec_exact_verify(session, n_tokens);
+    if (exact_required && !exact_rows) {
+        free(hidden);
+        if (errlen) snprintf(err, errlen,
+                             "coordinator exact speculative verify gate is unavailable");
+        return 1;
+    }
     if (decode2_span) {
         const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
         rc = ds4_session_eval_layer_slice_decode2(session,
@@ -4308,10 +4350,46 @@ static void *dist_prefill_result_reader_main(void *arg) {
     reader->final_payload = NULL;
     reader->final_payload_bytes = 0;
 
-    const uint32_t logits_bytes =
-        (uint32_t)((uint64_t)ds4_engine_vocab_size(reader->state->engine) * sizeof(float));
+    const uint64_t logits_bytes64 =
+        (uint64_t)ds4_engine_vocab_size(reader->state->engine) * sizeof(float);
+    if (logits_bytes64 == 0 || logits_bytes64 > UINT32_MAX) {
+        snprintf(reader->err, sizeof(reader->err),
+                 "distributed pipelined prefill logits size overflow");
+        reader->rc = 1;
+        shutdown(reader->fd, SHUT_RDWR);
+        dist_prefill_reader_signal_progress(reader, 0, true);
+        return NULL;
+    }
+    const uint32_t logits_bytes = (uint32_t)logits_bytes64;
     for (uint32_t i = 0; i < reader->count; i++) {
         const uint64_t request_id = reader->first_request_id + (uint64_t)i;
+        const uint32_t pos0 = i * reader->chunk_cap;
+        const uint32_t remaining = reader->total_tokens - pos0;
+        const uint32_t chunk = remaining < reader->chunk_cap
+            ? remaining : reader->chunk_cap;
+        const uint64_t hidden_bytes64 =
+            (uint64_t)chunk * reader->hc_values * sizeof(float);
+        uint32_t hidden_wire_bytes = 0;
+        if (hidden_bytes64 == 0 || hidden_bytes64 > UINT32_MAX ||
+            !dist_activation_wire_bytes_from_f32_bytes(
+                reader->state->activation_bits,
+                (uint32_t)hidden_bytes64,
+                &hidden_wire_bytes)) {
+            snprintf(reader->err, sizeof(reader->err),
+                     "distributed pipelined prefill result bounds overflow");
+            reader->rc = 1;
+            shutdown(reader->fd, SHUT_RDWR);
+            dist_prefill_reader_signal_progress(reader, i, true);
+            return NULL;
+        }
+        const ds4_dist_v3_result_limits result_limits = {
+            .allowed_kinds = DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_ACK) |
+                DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_LOGITS) |
+                DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_HIDDEN_STATE),
+            .hidden_wire_bytes = hidden_wire_bytes,
+            .logits_bytes = logits_bytes,
+            .nrows_bytes = 0,
+        };
         uint32_t kind = 0;
         uint32_t payload_bytes = 0;
         uint64_t result_hash = 0;
@@ -4320,6 +4398,7 @@ static void *dist_prefill_result_reader_main(void *arg) {
                                              reader->transport,
                                              reader->state,
                                              request_id,
+                                             &result_limits,
                                              &kind,
                                              &result_hash,
                                              &payload,
@@ -4343,10 +4422,6 @@ static void *dist_prefill_result_reader_main(void *arg) {
             dist_prefill_reader_signal_progress(reader, i, true);
             return NULL;
         }
-        const uint32_t pos0 = i * reader->chunk_cap;
-        const uint32_t remaining = reader->total_tokens - pos0;
-        const uint32_t chunk = remaining < reader->chunk_cap ? remaining : reader->chunk_cap;
-        const uint64_t hidden_bytes64 = (uint64_t)chunk * reader->hc_values * sizeof(float);
         const bool final_chunk = i + 1u == reader->count;
         const bool valid_ack = !final_chunk &&
                                kind == DS4_DIST_RESULT_ACK &&
@@ -6480,7 +6555,7 @@ int ds4_dist_session_create(
     if (ds4_dist_spec_trust_all_enabled() &&
         ds4_engine_mtp_draft_tokens(engine) > 1) {
         fprintf(stderr,
-                "ds4: WARNING: DS4_DIST_SPEC_TRUST_ALL=1 — target-model verification DISABLED (research mode); emitted completion is not guaranteed to match greedy decode\n");
+                "ds4: WARNING: DS4_DIST_SPEC_TRUST_ALL=1 — target-vs-draft acceptance DISABLED (research mode); batched target-state advancement remains and emitted completion is not guaranteed to match greedy decode\n");
     }
 
     d->accept_ctx.state = &d->state;
@@ -6814,6 +6889,12 @@ static bool dist_route_plan_supports_spec(const ds4_dist_route_plan *plan) {
     return true;
 }
 
+static bool dist_route_plan_supports_exact_required(
+        const ds4_dist_route_plan *plan) {
+    return dist_route_plan_supports_spec(plan) &&
+        (plan->entry[0].caps & DS4_DIST_V3_CAP_SPEC_EXACT_V1) != 0;
+}
+
 void ds4_dist_session_print_spec_stats(const ds4_dist_session *d) {
     if (!d || d->spec_cycles == 0) return;
     /* Same gate as the single-node DSpark stats line: enabled only when
@@ -7019,21 +7100,62 @@ int ds4_dist_session_mtp_spec_cycle(
             draft_n = 0;
         }
         if (draft_n < 0) draft_n = 0;
+        for (int i = 0; i < draft_n; i++) {
+            if (drafts[i] == eos_token) {
+                draft_n = i + 1;
+                break;
+            }
+        }
+        double trusted_ms = 0.0;
         if (draft_n > 0) {
+            /* Trust means skipping target-vs-draft acceptance, not leaving
+             * the target KV/timeline behind the emitted stream. Advance all
+             * trusted drafts in one ordinary batch span, retain that target
+             * state, and sample the next boundary from its final logits. */
+            const uint64_t rows_bytes =
+                (uint64_t)draft_n * (uint64_t)vocab * sizeof(float);
+            float *rows = rows_bytes <= SIZE_MAX ? malloc((size_t)rows_bytes) : NULL;
+            if (!rows) {
+                free(logits0);
+                if (errlen) snprintf(err, errlen,
+                                     "out of memory allocating trust-all rows");
+                return -1;
+            }
+            const double trusted_t0 = dist_now_sec();
+            const int trc = dist_coordinator_eval_span(
+                &d->state, owner, &d->plan, drafts, (uint32_t)draft_n,
+                start + 1u, d->session_id, d->request_id++, false,
+                DS4_DIST_WORK_F_SPEC_VERIFY |
+                    DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS,
+                false, NULL, rows, NULL, NULL, err, errlen);
+            trusted_ms = (dist_now_sec() - trusted_t0) * 1000.0;
+            if (trc != 0) {
+                free(rows);
+                free(logits0);
+                if (dist_mtp_spec_recover_after_failure(
+                        d, owner, start, first_token, trc,
+                        err, errlen) != 0) {
+                    if (errlen) snprintf(err, errlen, "%s", fail_msg);
+                    return -1;
+                }
+                return n_accept;
+            }
+            ds4_session_set_logits(
+                owner, rows + (uint64_t)(draft_n - 1) * vocab, vocab);
+            free(rows);
             d->spec_proposed += (uint64_t)draft_n;
             d->spec_accepted += (uint64_t)draft_n;
-            for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+            for (int i = 0; i < draft_n && n_accept < accepted_cap; i++)
                 accepted[n_accept++] = drafts[i];
-                if (drafts[i] == eos_token) break;
-            }
         }
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr,
-                    "ds4: dist mtp spec trust_all token=%d drafts=%d emitted=%d base=%.1fms\n",
+                    "ds4: dist mtp spec trust_all token=%d drafts=%d emitted=%d base=%.1fms trusted_span=%.1fms\n",
                     first_token,
                     draft_n,
                     n_accept - 1,
-                    base_ms);
+                    base_ms,
+                    trusted_ms);
         }
         free(logits0);
         return n_accept;
@@ -7078,7 +7200,9 @@ int ds4_dist_session_mtp_spec_cycle(
         memcpy(span_tokens + 1, fused_pending,
                (size_t)fused_k * sizeof(span_tokens[0]));
         const uint32_t rows_n = (uint32_t)fused_k + 1u;
-        const bool exact_span = ds4_session_dist_spec_exact_verify(owner, rows_n);
+        const bool exact_span =
+            dist_route_plan_supports_exact_required(&d->plan) &&
+            ds4_session_dist_spec_exact_verify(owner, rows_n);
         float *rows = malloc((size_t)rows_n * (size_t)vocab * sizeof(float));
         if (!rows) {
             if (errlen) snprintf(err, errlen, "out of memory allocating speculative verify rows");
@@ -7098,7 +7222,10 @@ int ds4_dist_session_mtp_spec_cycle(
                                                    false,
                                                    DS4_DIST_WORK_F_SPEC_VERIFY |
                                                        DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS |
-                                                       DS4_DIST_WORK_F_OUTPUT_DRAFTS,
+                                                       DS4_DIST_WORK_F_OUTPUT_DRAFTS |
+                                                       (exact_span
+                                                           ? DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED
+                                                           : 0u),
                                                    false,
                                                    NULL,
                                                    rows,
@@ -7338,6 +7465,7 @@ int ds4_dist_session_mtp_spec_cycle(
     const bool want_cont = !decode2_verify && !ds4_engine_has_mtp(e);
     const bool exact_span =
         !decode2_verify &&
+        dist_route_plan_supports_exact_required(&d->plan) &&
         ds4_session_dist_spec_exact_verify(owner, (uint32_t)draft_n);
     int cont[16];
     int n_cont = 0;
@@ -7353,7 +7481,10 @@ int ds4_dist_session_mtp_spec_cycle(
                                     false,
                                     DS4_DIST_WORK_F_SPEC_VERIFY |
                                         DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS |
-                                        (want_cont ? DS4_DIST_WORK_F_OUTPUT_DRAFTS : 0u),
+                                        (want_cont ? DS4_DIST_WORK_F_OUTPUT_DRAFTS : 0u) |
+                                        (exact_span
+                                            ? DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED
+                                            : 0u),
                                     decode2_verify,
                                     decode2_verify ? &verify_top0 : NULL,
                                     rows,
@@ -9898,6 +10029,8 @@ static int dist_worker_process_work_message(
     const bool output_drafts = (work.flags & DS4_DIST_WORK_F_OUTPUT_DRAFTS) != 0;
     const bool output_all_logits = (work.flags & DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS) != 0;
     const bool spec_commit = (work.flags & DS4_DIST_WORK_F_SPEC_COMMIT) != 0;
+    const bool spec_exact_required =
+        (work.flags & DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED) != 0;
     if (spec_verify && spec_rollback) {
         free(route_blob);
         free(tokens);
@@ -9905,16 +10038,24 @@ static int dist_worker_process_work_message(
     }
     if (spec_commit &&
         (spec_verify || spec_rollback || output_drafts || output_all_logits ||
-         ack_only || has_next || work.n_tokens == 0u)) {
+         spec_exact_required || ack_only || has_next || work.n_tokens == 0u)) {
         free(route_blob);
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "conflicting speculative WORK flags");
     }
-    if ((spec_verify || spec_rollback || output_drafts || output_all_logits) &&
+    if ((spec_verify || spec_rollback || output_drafts || output_all_logits ||
+         spec_exact_required) &&
         (has_next || !output_logits || ack_only)) {
         free(route_blob);
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "speculative flags require a final logits span");
+    }
+    if (spec_exact_required && (!spec_verify || !output_all_logits)) {
+        free(route_blob);
+        free(tokens);
+        return dist_worker_upstream_send_work_error(
+            upstream, request_id,
+            "exact speculative WORK requires an all-logits verify span");
     }
     if (spec_verify && work.n_tokens < 2u) {
         free(route_blob);
@@ -10141,9 +10282,19 @@ static int dist_worker_process_work_message(
             return dist_worker_upstream_send_work_error(upstream, request_id, "worker speculative frontier snapshot failed");
         }
     }
-    const bool exact_verify_rows =
-        spec_verify && output_all_logits &&
+    const bool exact_verify_rows = spec_exact_required &&
         ds4_session_dist_spec_exact_verify(session->session, work.n_tokens);
+    if (spec_exact_required && !exact_verify_rows) {
+        pthread_mutex_unlock(&state->mu);
+        if (!input_hc_uses_wire) free(input_hc);
+        if (!result_mapped) free(result);
+        dist_tx_bulk_plan_abort(upstream->transport, &result_tx_plan);
+        free(route_blob);
+        free(tokens);
+        return dist_worker_upstream_send_work_error(
+            upstream, request_id,
+            "worker exact speculative verify gate is unavailable");
+    }
     const double eval_t0 = dist_now_sec();
     int eval_rc = spec_commit
         ? ds4_session_dist_spec_commit_prefix(session->session,
