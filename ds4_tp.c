@@ -245,7 +245,7 @@ static int tp_read_full(int fd, void *buf, size_t len) {
     return 1;
 }
 
-static void tp_socket_tune(int fd, uint64_t timeout_sec) {
+static int tp_socket_tune(int fd, uint64_t timeout_sec) {
     int one = 1;
 #ifdef SO_NOSIGPIPE
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -260,8 +260,12 @@ static void tp_socket_tune(int fd, uint64_t timeout_sec) {
         .tv_sec = (time_t)timeout_sec,
         .tv_usec = 0,
     };
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                   &timeout, sizeof(timeout)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout)) != 0)
+        return 0;
+    return 1;
 }
 
 #ifdef DS4_TP_HAVE_VERBS
@@ -1462,7 +1466,11 @@ int ds4_tp_create(
                                  (double)tp->timeout_sec, err, errlen);
         if (tp->control_fd < 0) goto fail;
     }
-    tp_socket_tune(tp->control_fd, tp->timeout_sec);
+    if (!tp_socket_tune(tp->control_fd, tp->timeout_sec)) {
+        tp_set_err(err, errlen, "tp control socket timeout setup: %s",
+                   strerror(errno));
+        goto fail;
+    }
 
     if (!tp_hello_exchange(tp, id, rdma_ok, err, errlen)) goto fail;
 
@@ -1486,7 +1494,11 @@ int ds4_tp_create(
                                   (double)tp->timeout_sec, err, errlen);
             if (tp->data_fd < 0) goto fail;
         }
-        tp_socket_tune(tp->data_fd, tp->timeout_sec);
+        if (!tp_socket_tune(tp->data_fd, tp->timeout_sec)) {
+            tp_set_err(err, errlen, "tp data socket timeout setup: %s",
+                       strerror(errno));
+            goto fail;
+        }
     }
     if (listener >= 0) close(listener);
     fprintf(stderr, "ds4-tp: %s connected, transport=%s\n",
