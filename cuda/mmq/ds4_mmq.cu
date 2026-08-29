@@ -52,6 +52,11 @@ static bool ds4_mmq_nvtx_requested() {
     return enabled != 0;
 }
 
+static bool ds4_mmq_gfx1151_flag(const char *name, int cc) {
+    const char *env = getenv(name);
+    return env ? env[0] != '0' : cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+}
+
 static uint64_t ds4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
     return ((uint64_t)first << 32) | second;
 }
@@ -1382,7 +1387,14 @@ int ds4_mmq_moe_pair_impl(
      * token cannot select the same expert twice, so no expert bucket can
      * exceed n_tokens rows. Keep the conservative gathered-row bound for all
      * generic MMQ callers, including DSpark/MTP. */
-    const int64_t routed_ncols_max = fused_down
+    /* The IQ2 gate/up route is a true top-k selection: one token contributes
+     * at most one row to any expert. The default gathered-row upper bound
+     * overlaunches empty expert tiles by top_k; keep this opt-in until the
+     * compact expert-tile launch replaces the rectangular grid entirely. */
+    const bool tight_iq2_ncols =
+        type == GGML_TYPE_IQ2_XXS &&
+        ds4_mmq_gfx1151_flag("DS4_ROCM_MMQ_TIGHT_NCOLS", cc);
+    const int64_t routed_ncols_max = (fused_down || tight_iq2_ncols)
         ? (int64_t)n_tokens
         : ne_get_rows;
 
@@ -3050,8 +3062,8 @@ static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
     const int kqs = vdr * (lane % lanes_per_k);
 
 #pragma unroll
-    for (uint32_t rr = 0; rr < 4u; ++rr) {
-        const uint32_t row = blockIdx.x * 64u + row_lane + rr * 16u;
+    for (uint32_t rr = 0; rr < 8u; ++rr) {
+        const uint32_t row = blockIdx.x * 64u + row_lane + rr * 8u;
         if (row >= nrows_x) continue;
         float total = 0.0f;
 #pragma unroll
@@ -3295,7 +3307,7 @@ int ds4_mmq_moe_down_sum6_vec_impl(
     const uint32_t stride_channel_x = (uint32_t)((int64_t)M * stride_row_x);
 
     const dim3 block_nums((M + 63) / 64, n_tokens);
-    const dim3 block_dims(256);
+    const dim3 block_dims(128);
 
     ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
         W, (const block_q8_1 *)src1_q8_1_ptr, ids, out_f32,
