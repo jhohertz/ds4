@@ -78,6 +78,8 @@ next sections.
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
   guide for contributors. **Read this before sending a pull request**.
+- [DEBUGGING.md](DEBUGGING.md): GPU graph dump hooks and deferred one-token
+  layer-state capture.
 - [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md): the complete release test
   matrix, including the remote Metal, CUDA, and ROCm machines.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
@@ -188,6 +190,22 @@ make cuda-generic     # Linux CUDA, other local CUDA GPUs
 make strix-halo       # Linux ROCm, AMD Strix Halo
 make cpu              # CPU-only diagnostics build
 ```
+
+Resident single-token DeepSeek V4 decode on ROCm fuses Q/KV weighted RMS
+normalization and KV RoPE into one launch when the shape has at most 256 RoPE
+pairs. This attention optimization is independent of the routed-expert
+quantization and applies to both Q4_K and MXFP4 models. Larger shapes retain the
+two-launch path. Set `DS4_ROCM_DISABLE_QKV_KV_ROPE_FUSION=1` before process
+startup for a diagnostic rollback. Run the model-independent, bit-exact
+reference test with:
+
+```sh
+make HIPCC=/opt/rocm-therock/bin/hipcc test-rocm-qkv-fusion
+```
+
+It covers dense and YaRN parameters, inverse and multi-row/head layouts,
+zero rotation, the 256-pair boundary, the 257-pair fallback, and rejected
+shapes, requiring bit-exact Q and KV output.
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and

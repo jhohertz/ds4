@@ -77,6 +77,13 @@ typedef struct {
     bool set;
 } ds4_distributed_layers;
 
+typedef enum {
+    DS4_DIST_TRANSPORT_DEFAULT = 0,
+    DS4_DIST_TRANSPORT_AUTO,
+    DS4_DIST_TRANSPORT_TCP,
+    DS4_DIST_TRANSPORT_NHI,
+} ds4_distributed_transport;
+
 typedef struct {
     ds4_distributed_role role;
     ds4_distributed_layers layers;
@@ -87,6 +94,8 @@ typedef struct {
     uint32_t prefill_chunk;
     uint32_t prefill_window;
     uint32_t activation_bits;
+    ds4_distributed_transport transport;
+    const char *nhi_device;
     bool replay_check;
     bool debug;
 } ds4_distributed_options;
@@ -107,6 +116,7 @@ typedef enum {
     DS4_TP_TRANSPORT_AUTO = 0,
     DS4_TP_TRANSPORT_RDMA,
     DS4_TP_TRANSPORT_TCP,
+    DS4_TP_TRANSPORT_NHI,
 } ds4_tp_transport;
 
 typedef struct {
@@ -118,6 +128,8 @@ typedef struct {
     int leader_port;
     ds4_tp_transport transport;
     const char *rdma_device;
+    const char *nhi_device;     /* local thunderbolt-stream device path */
+    uint32_t nhi_ring_frames;   /* imported TX/RX ring geometry (default 4096) */
     int rdma_gid_index;
     bool rdma_gid_index_set;
     bool glm_token_prefill;
@@ -327,6 +339,9 @@ int ds4_token_assistant(ds4_engine *e);
  * with the caller. */
 struct ds4_tp;
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen);
+/* Quiesce GPU gate users and release the engine-owned data plane while the
+ * TCP control object remains alive for ordered NHI teardown. */
+void ds4_engine_tp_unbind(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
@@ -399,6 +414,9 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
+#ifndef DS4_NO_GPU
+int ds4_test_graph_deferred_dump_roundtrip(void);
+#endif
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
@@ -476,6 +494,112 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          float *logits,
                                          char *err,
                                          size_t errlen);
+/* Multi-token layer-slice evaluation that returns one logits row per token
+ * (output head run once per row).  Used by the distributed MTP speculative
+ * verify span, whose worker owns the output head. */
+int ds4_session_eval_layer_slice_logits_all(ds4_session *s,
+                                            const int *tokens,
+                                            uint32_t n_tokens,
+                                            uint32_t pos0,
+                                            uint32_t layer_start,
+                                            uint32_t layer_end,
+                                            const float *input_hc,
+                                            float *output_hc,
+                                            float *logits,
+                                            char *err,
+                                            size_t errlen);
+/* Per-row exact layer-slice verifier.  By default each token is decoded one
+ * at a time through the ordinary single-token layer-slice path, so every
+ * emitted row (logits or hidden state) follows the sequential replay arm.
+ * The coordinator produces one hidden row per token and the worker consumes
+ * those rows and emits one logits row per token within one distributed span.
+ * DS4_DIST_SPEC_EXACT_SPAN is a diagnostic-only override that substitutes an
+ * experimental multi-row implementation without this identity guarantee. */
+int ds4_session_eval_layer_slice_exact_rows(ds4_session *s,
+                                            const int *tokens,
+                                            uint32_t n_tokens,
+                                            uint32_t pos0,
+                                            uint32_t layer_start,
+                                            uint32_t layer_end,
+                                            const float *input_hc,
+                                            float *output_hc,
+                                            float *logits,
+                                            bool output_logits,
+                                            char *err,
+                                            size_t errlen);
+/* Whether a distributed speculative verify span may retain verifier state
+ * without ordinary one-token replay.  This direct-commit experiment is
+ * bounded to small ROCm spans and requires explicit DS4_DIST_SPEC_EXACT
+ * opt-in; the default and all non-ROCm/GLM sessions verify then replay. */
+bool ds4_session_dist_spec_exact_verify(const ds4_session *s, uint32_t n_tokens);
+/* Exact two-row verifier for a layer slice (fast Q8 decode kernels, two
+ * rows alternating per layer).  The coordinator produces the two hidden
+ * states; the worker runs the output head: top0 for row 0 and full logits
+ * for row 1. */
+int ds4_session_eval_layer_slice_decode2(ds4_session *s,
+                                         int token0,
+                                         int token1,
+                                         uint32_t start,
+                                         uint32_t layer_start,
+                                         uint32_t layer_end,
+                                         const float *input_hc0,
+                                         const float *input_hc1,
+                                         float *output_hc0,
+                                         float *output_hc1,
+                                         bool output_head,
+                                         int *top0,
+                                         float *logits1,
+                                         char *err,
+                                         size_t errlen);
+
+/* Distributed MTP speculative-decode support (pipeline split).  The worker
+ * owns the MTP head because the final hidden state lives there; the
+ * coordinator drives verify/rollback spans through the normal route. */
+#define DS4_DIST_MTP_FRONTIER_MAX_LAYER 128
+typedef struct ds4_dist_mtp_frontier {
+    bool valid;
+    uint32_t mtp_n_raw;
+    uint32_t dspark_cache_start;
+    uint32_t dspark_cache_token_start;
+    uint32_t dspark_cache_len;
+    uint32_t n_comp[DS4_DIST_MTP_FRONTIER_MAX_LAYER];
+    uint32_t n_index_comp[DS4_DIST_MTP_FRONTIER_MAX_LAYER];
+} ds4_dist_mtp_frontier;
+
+/* Draft up to max_drafts tokens with the legacy MTP head from the session's
+ * current final hidden state.  Returns 0 and sets *n_drafts (>= 1) on
+ * success; drafts are advisory and always verified by the target model. */
+int ds4_session_dist_mtp_draft(ds4_session *s, int token, uint32_t pos,
+                               int *drafts, int max_drafts, int *n_drafts,
+                               char *err, size_t errlen);
+/* DSpark drafting for the pipeline worker: runs the full propose pipeline
+ * (stage chain, confidence gate, markov bias) from the hidden states this
+ * rank captured at the target layers during its slice evals.  Zero drafts
+ * with a 0 return is a normal skip (scheduler or confidence gate). */
+int ds4_session_dist_dspark_draft(ds4_session *s, int token, uint32_t pos,
+                                  int *drafts, int max_drafts, int *n_drafts,
+                                  char *err, size_t errlen);
+/* Dispatch by the loaded support model kind (legacy MTP head or DSpark). */
+int ds4_session_dist_support_draft(ds4_session *s, int token, uint32_t pos,
+                                   int *drafts, int max_drafts, int *n_drafts,
+                                   char *err, size_t errlen);
+/* Commit an accepted verify-prefix without a replay span: rewinds the
+ * timeline to pos0, restores the per-prefix compressor/indexer state the
+ * verify span captured after the accepted row, and re-appends the accepted
+ * tokens.  Fails (without replay side effects beyond the timeline rewind)
+ * when the span did not capture prefixes; callers then use the rollback
+ * re-eval path. */
+int ds4_session_dist_spec_commit_prefix(ds4_session *s, const int *tokens,
+                                        uint32_t n_accept, uint32_t pos0,
+                                        char *err, size_t errlen);
+/* Snapshot/restore the session's owned compressor/indexer frontiers.  Cheap:
+ * only small per-layer state tensors, never the full KV caches. */
+bool ds4_session_dist_frontier_snapshot(ds4_session *s,
+                                        ds4_dist_mtp_frontier *f);
+bool ds4_session_dist_frontier_restore(ds4_session *s,
+                                       const ds4_dist_mtp_frontier *f);
+/* Rewind the session token timeline to len (must not exceed current len). */
+bool ds4_session_dist_timeline_truncate(ds4_session *s, uint32_t len);
 
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
