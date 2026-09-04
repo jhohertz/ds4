@@ -49,7 +49,7 @@
 #endif
 
 /* TP context for the verify-block RDMA window (set with the gate callbacks). */
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU)
 static ds4_tp *g_tp_block_ctx;
 #endif
 
@@ -23854,6 +23854,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 (ds4_gpu_device_is_pre_m5_apple_silicon() ||
                  ds4_gpu_device_is_m5_apple_silicon()) &&
                 ds4_gpu_kv_rope_fp8_fuse_available() != 0) {
+#if defined(__APPLE__)
                 {
                     /* Fold the kv task into this layer's KV staging kernel
                      * (byte-exact); DS4_METAL_DISABLE_KV_NORM_DEFER=1 keeps
@@ -23862,6 +23863,7 @@ static bool metal_graph_encode_decode_layer_phase(
                     if (defer_kv < 0) defer_kv = getenv("DS4_METAL_DISABLE_KV_NORM_DEFER") == NULL;
                     if (defer_kv && g->tp_world == 2) ds4_gpu_dsv4_qkv_norm_defer_kv_next();
                 }
+#endif
                 kv_norm_store_fused =
                     ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor(
                             metal_graph_qr_norm(g),
@@ -26716,9 +26718,16 @@ static bool metal_graph_encode_decode_layer_phase(
          * routed_out. */
         const uint32_t tp_slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
         if (!tp_fold_ffn) {
+#if defined(__APPLE__)
             ok = ds4_gpu_add_tensor_tp_flag(g->tp_out[tp_slot], metal_graph_shared_out(g),
                                             metal_graph_routed_out(g), DS4_N_EMBD,
                                             il, DS4_TP_GATE_FFN) != 0;
+#else
+            /* The flag fold is a Metal RDMA-gate optimization; the NHI gate
+             * publishes its stamp from the gate encode itself. */
+            ok = ds4_gpu_add_tensor(g->tp_out[tp_slot], metal_graph_shared_out(g),
+                                    metal_graph_routed_out(g), DS4_N_EMBD) != 0;
+#endif
         }
         if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
         if (ok) {
@@ -73252,6 +73261,24 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
     }
     return 0;
 }
+#else /* DS4_NO_GPU */
+/* The multi-session layer-slice span is a GPU-graph feature; the CPU-only
+ * build (test hooks) keeps the symbol so ds4_distributed.c links. */
+int ds4_sessions_eval_layer_slice_batch(
+        ds4_decode_item *items,
+        int count,
+        uint32_t layer_start,
+        uint32_t layer_end,
+        const float *input_hc_rows,
+        float *logits_rows,
+        char *err,
+        size_t errlen) {
+    (void)items; (void)count; (void)layer_start; (void)layer_end;
+    (void)input_hc_rows; (void)logits_rows;
+    if (err && errlen)
+        snprintf(err, errlen, "batched layer-slice spans need a GPU backend");
+    return 1;
+}
 #endif
 
 static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
@@ -73286,6 +73313,12 @@ static int ds4_sessions_eval_batch_local_layers(
         if (err && errlen) snprintf(err, errlen, "batched local layers need the embedding table");
         return 1;
     }
+#ifdef DS4_NO_GPU
+    /* The batched span encoder is part of the GPU graph; the CPU-only
+     * build (test hooks) has no backend to run it on. */
+    if (err && errlen) snprintf(err, errlen, "batched local layers need a GPU backend");
+    return 1;
+#else
     bool ok = metal_graph_native_session_batch_layer_slice_supported(
             items, count, e, layer_start, layer_end);
     const bool batch_qkv = ok &&
@@ -73307,6 +73340,7 @@ static int ds4_sessions_eval_batch_local_layers(
         return 1;
     }
     return 0;
+#endif
 }
 
 /* Batched decode over the shared worker connection: one span carries one

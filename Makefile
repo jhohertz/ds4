@@ -62,6 +62,9 @@ ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt -lrocblas
 ROCM_MMQ_Y ?= 64
 ROCM_MMQ_FLAGS := $(ROCM_CFLAGS) -std=c++17 -DGGML_USE_HIP -DDS4_HIP_MMQ_Y=$(ROCM_MMQ_Y) $(MMQ_INCLUDES)
 ROCM_MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.rocm.o cuda/mmq/ds4_mmq.rocm.o cuda/mmq/quantize.rocm.o cuda/mmq/mmid.rocm.o cuda/mmq/mmvq.rocm.o cuda/mmq/d2r_stubs.rocm.o
+# Everything a standalone ROCm test/bench needs to link against ds4_rocm.o
+# (the MMQ kernels, the vision helpers and the two stub sets it references).
+ROCM_TEST_LINK_OBJS := ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_image.o $(ROCM_MMQ_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
@@ -483,7 +486,7 @@ test-mxfp4-rocm: tests/test_mxfp4_rocm
 tests/test_rocm_qkv_fusion.o: tests/test_rocm_qkv_fusion.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_rocm_qkv_fusion: tests/test_rocm_qkv_fusion.o ds4_rocm.o
+tests/test_rocm_qkv_fusion: tests/test_rocm_qkv_fusion.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-rocm-qkv-fusion: tests/test_rocm_qkv_fusion
@@ -492,7 +495,7 @@ test-rocm-qkv-fusion: tests/test_rocm_qkv_fusion
 tests/test_q8_krow_rocm.o: tests/test_q8_krow_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_q8_krow_rocm: tests/test_q8_krow_rocm.o ds4_rocm.o ds4_rocm_compat.o
+tests/test_q8_krow_rocm: tests/test_q8_krow_rocm.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-q8-krow-rocm: tests/test_q8_krow_rocm
@@ -501,13 +504,13 @@ test-q8-krow-rocm: tests/test_q8_krow_rocm
 tests/bench_q8_krow_rocm.o: tests/bench_q8_krow_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/bench_q8_krow_rocm: tests/bench_q8_krow_rocm.o ds4_rocm.o ds4_rocm_compat.o
+tests/bench_q8_krow_rocm: tests/bench_q8_krow_rocm.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 tests/bench_matvec_poc_rocm.o: tests/bench_matvec_poc_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/bench_matvec_poc_rocm: tests/bench_matvec_poc_rocm.o ds4_rocm.o ds4_rocm_compat.o $(ROCM_MMQ_OBJS)
+tests/bench_matvec_poc_rocm: tests/bench_matvec_poc_rocm.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_compat.cu
@@ -698,7 +701,7 @@ test-dist-v3: tests/test_dist_v3
 tests/test_tp_combine_rocm.o: tests/test_tp_combine_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_tp_combine_rocm: tests/test_tp_combine_rocm.o ds4_rocm.o ds4_rocm_unavailable.o
+tests/test_tp_combine_rocm: tests/test_tp_combine_rocm.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-tp-combine-rocm: tests/test_tp_combine_rocm
@@ -716,8 +719,7 @@ tests/test_graph_deferred_dump_rocm.o: tests/test_graph_deferred_dump_rocm.c ds4
 tests/test_graph_deferred_dump_rocm: tests/test_graph_deferred_dump_rocm.o \
 		ds4_rocm_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o \
 		ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o \
-		ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o \
-		ds4_rocm_unavailable.o ds4_layer_pack.o
+		ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_layer_pack.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-graph-deferred-dump-rocm: tests/test_graph_deferred_dump_rocm
@@ -729,5 +731,5 @@ ds4_tp_nhi.o: ds4_tp_nhi.c ds4_tp_nhi.h ds4_tbstream_uapi.h ds4_gpu.h
 tests/test_tp_nhi_live.o: tests/test_tp_nhi_live.c ds4_tp_nhi.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_tp_nhi_live: tests/test_tp_nhi_live.o ds4_tp_nhi.o ds4_rocm.o
+tests/test_tp_nhi_live: tests/test_tp_nhi_live.o ds4_tp_nhi.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
