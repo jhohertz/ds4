@@ -54,6 +54,7 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 static void stop_signal_handler(int sig) {
     (void)sig;
+    ds4_tp_request_stop();
     if (g_stop_requested) _exit(130);
     g_stop_requested = 1;
     if (g_listen_fd >= 0) {
@@ -8965,6 +8966,152 @@ static double now_sec(void) {
 
 static pthread_mutex_t server_log_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* ---------------- Prometheus metrics (GET /metrics) ---------------------
+ * Series names match the journald-parsing exporter historically used with
+ * this server, so existing dashboards keep working when the scrape target
+ * moves to this endpoint. Counters cover the process lifetime; throughput
+ * gauges hold the last observed value. Updates happen at the same sites
+ * that emit the corresponding log lines. */
+#define METRICS_REASONS_MAX 12
+typedef struct {
+    /* Sized for the longest current reason string,
+     * "incoming-prompt-shorter-than-live-checkpoint" (44 bytes + NUL);
+     * snprintf truncation would otherwise desynchronize the label from
+     * the corresponding log line and could collide two long reasons. */
+    char name[48];
+    uint64_t count;
+} metrics_reason;
+
+#define METRICS_BUCKETS 9
+/* Upper bounds (seconds) for the prompt/request latency histograms; the
+ * implicit +Inf bucket is the total count. */
+static const double metrics_prompt_bounds[METRICS_BUCKETS] =
+    {0.5, 1, 2, 5, 10, 30, 60, 120, 300};
+static const double metrics_request_bounds[METRICS_BUCKETS] =
+    {1, 2, 5, 10, 30, 60, 120, 300, 600};
+
+typedef struct {
+    pthread_mutex_t mu;
+    uint64_t prompt_tokens_total;
+    uint64_t reused_tokens_total;
+    uint64_t gen_thinking_total, gen_response_total;
+    double prefill_tps_chunk, prefill_tps_avg;
+    double decode_tps_chunk, decode_tps_avg;
+    metrics_reason finish[METRICS_REASONS_MAX];
+    double request_seconds_sum;
+    uint64_t request_seconds_count;
+    uint64_t request_seconds_bucket[METRICS_BUCKETS];
+    double prompt_seconds_sum;
+    uint64_t prompt_seconds_count;
+    uint64_t prompt_seconds_bucket[METRICS_BUCKETS];
+    uint64_t kv_stored_total, kv_trimmed_tokens_total;
+    double kv_stored_bytes_total;
+    metrics_reason kv_hit[METRICS_REASONS_MAX];
+    metrics_reason kv_miss[METRICS_REASONS_MAX];
+} server_metrics;
+
+static server_metrics g_server_metrics = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static void metrics_reason_add(metrics_reason *arr, const char *name) {
+    if (!name || !name[0]) name = "unknown";
+    for (int i = 0; i < METRICS_REASONS_MAX; i++) {
+        if (arr[i].name[0] == '\0') {
+            snprintf(arr[i].name, sizeof(arr[i].name), "%s", name);
+            arr[i].count = 1;
+            return;
+        }
+        if (!strcmp(arr[i].name, name)) {
+            arr[i].count++;
+            return;
+        }
+    }
+    /* Table full: account under the final bucket rather than dropping. */
+    arr[METRICS_REASONS_MAX - 1].count++;
+}
+
+static void metrics_decode_progress(int tokens, bool thinking,
+                                    double chunk_tps, double avg_tps) {
+    if (tokens < 0) tokens = 0;
+    pthread_mutex_lock(&g_server_metrics.mu);
+    if (thinking) g_server_metrics.gen_thinking_total += (uint64_t)tokens;
+    else g_server_metrics.gen_response_total += (uint64_t)tokens;
+    g_server_metrics.decode_tps_chunk = chunk_tps;
+    g_server_metrics.decode_tps_avg = avg_tps;
+    pthread_mutex_unlock(&g_server_metrics.mu);
+}
+
+/* Prompt tokens are accumulated per prefill chunk rather than in one jump
+ * at prompt completion: a whole prompt landing on the counter between two
+ * scrapes renders as an impossible rate() spike (a 27k-token prompt over a
+ * 30 s scrape interval reads as 900 tokens/s). metrics_prompt_done() adds
+ * only the remainder the chunk callbacks have not seen. */
+static void metrics_prefill_progress(int interval_tokens, double chunk_tps,
+                                     double avg_tps) {
+    if (interval_tokens < 0) interval_tokens = 0;
+    pthread_mutex_lock(&g_server_metrics.mu);
+    g_server_metrics.prompt_tokens_total += (uint64_t)interval_tokens;
+    g_server_metrics.prefill_tps_chunk = chunk_tps;
+    g_server_metrics.prefill_tps_avg = avg_tps;
+    pthread_mutex_unlock(&g_server_metrics.mu);
+}
+
+static void metrics_bucket_add(uint64_t *buckets, const double *bounds,
+                               double v) {
+    for (int i = 0; i < METRICS_BUCKETS; i++) {
+        if (v <= bounds[i]) {
+            buckets[i]++;
+            return;
+        }
+    }
+    /* Above the last bound: lands only in the implicit +Inf bucket (the
+     * total count), which render derives from _count. */
+}
+
+static void metrics_prompt_done(int remainder_tokens, int reused_tokens,
+                                const char *cache_source, double seconds) {
+    int evaluated_tokens = remainder_tokens;
+    if (evaluated_tokens < 0) evaluated_tokens = 0;
+    if (reused_tokens < 0) reused_tokens = 0;
+    pthread_mutex_lock(&g_server_metrics.mu);
+    g_server_metrics.prompt_tokens_total += (uint64_t)evaluated_tokens;
+    g_server_metrics.reused_tokens_total += (uint64_t)reused_tokens;
+    if (reused_tokens > 0)
+        metrics_reason_add(g_server_metrics.kv_hit, cache_source);
+    g_server_metrics.prompt_seconds_sum += seconds;
+    g_server_metrics.prompt_seconds_count++;
+    metrics_bucket_add(g_server_metrics.prompt_seconds_bucket,
+                       metrics_prompt_bounds, seconds);
+    pthread_mutex_unlock(&g_server_metrics.mu);
+}
+
+static void metrics_request_finish(const char *reason, double seconds) {
+    pthread_mutex_lock(&g_server_metrics.mu);
+    metrics_reason_add(g_server_metrics.finish, reason);
+    g_server_metrics.request_seconds_sum += seconds;
+    g_server_metrics.request_seconds_count++;
+    metrics_bucket_add(g_server_metrics.request_seconds_bucket,
+                       metrics_request_bounds, seconds);
+    pthread_mutex_unlock(&g_server_metrics.mu);
+}
+
+static void metrics_kv_miss(const char *reason) {
+    pthread_mutex_lock(&g_server_metrics.mu);
+    metrics_reason_add(g_server_metrics.kv_miss, reason);
+    pthread_mutex_unlock(&g_server_metrics.mu);
+}
+
+/* Registered with ds4_kvstore at server startup. */
+static void metrics_kv_stored_bridge(int stored_tokens, int trimmed_tokens,
+                                     double stored_mib) {
+    (void)stored_tokens;
+    pthread_mutex_lock(&g_server_metrics.mu);
+    g_server_metrics.kv_stored_total++;
+    if (trimmed_tokens > 0)
+        g_server_metrics.kv_trimmed_tokens_total += (uint64_t)trimmed_tokens;
+    g_server_metrics.kv_stored_bytes_total += stored_mib * 1024.0 * 1024.0;
+    pthread_mutex_unlock(&g_server_metrics.mu);
+}
+
 static void server_log(ds4_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
@@ -10863,6 +11010,7 @@ typedef struct {
     double t0;
     double last_t;
     int last_current;
+    int metrics_counted; /* evaluated tokens already added to the metrics counter */
     bool seen;
     /* SSE keepalive during long prefill: send HTTP/SSE headers ahead of
      * generation and emit a `:` comment line every few seconds so HTTP/TCP
@@ -10912,6 +11060,7 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
     const int interval_tokens = completion - *last_completion;
     const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     const double avg_tps = elapsed > 0.0 ? (double)completion / elapsed : 0.0;
+    metrics_decode_progress(interval_tokens, thinking, chunk_tps, avg_tps);
     char ctx[48];
     request_ctx_span(ctx, sizeof(ctx),
                      prompt_tokens + *last_completion,
@@ -11135,6 +11284,10 @@ static void server_prefill_leave(server *s) {
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
     int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    /* Distributed sessions share one worker connection and the mixed
+     * prefill/decode interleave is not dist-aware yet (L0): keep prefills
+     * exclusive so a prefill never runs beside another slot's decode. */
+    if (s->engine && ds4_engine_is_distributed(s->engine)) quantum = 2048;
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
@@ -11410,13 +11563,29 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (display_current > display_total) display_current = display_total;
     double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
     double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
-    int interval_tokens = p->seen ? current - p->last_current : 0;
+    /* First callback: the interval is everything since prefill start, not
+     * zero — otherwise the first chunk always logs a bogus 0.00 t/s (most
+     * visible in distributed mode, where the first callback covers a whole
+     * pipeline chunk). */
+    int interval_tokens = p->seen ? current - p->last_current : display_current;
     if (interval_tokens < 0) interval_tokens = 0;
-    double interval_s = p->seen ? now - p->last_t : 0.0;
+    double interval_s = p->seen ? now - p->last_t : elapsed;
     double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     p->last_current = current;
     p->last_t = now;
     p->seen = true;
+    int metrics_add = interval_tokens;
+    {
+        /* Never let display-window resets count cached tokens as evaluated:
+         * cap the per-request total at prompt_tokens - cached_tokens. */
+        const int evaluated_total = p->prompt_tokens - p->cached_tokens;
+        if (evaluated_total <= 0) metrics_add = 0;
+        else if (p->metrics_counted + metrics_add > evaluated_total)
+            metrics_add = evaluated_total - p->metrics_counted;
+        if (metrics_add < 0) metrics_add = 0;
+    }
+    p->metrics_counted += metrics_add;
+    metrics_prefill_progress(metrics_add, chunk_tps, avg_tps);
     char flags[64];
     log_flags(flags, sizeof(flags), p->responses_protocol,
               p->has_tools, false, false, false);
@@ -11843,7 +12012,8 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     return rc;
 }
 
-static long server_decode_coalesce_us(void) {
+static long server_decode_coalesce_us(const server *s) {
+    (void)s;
     long us = 2000;
     const char *env = getenv("DS4_SERVER_DECODE_COALESCE_US");
     if (env && env[0]) {
@@ -11865,7 +12035,7 @@ static void *decode_worker_main(void *arg) {
     server *s = arg;
     ds4_decode_item *items = xmalloc((size_t)s->slot_count * sizeof(*items));
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
-    const long coalesce_us = server_decode_coalesce_us();
+    const long coalesce_us = server_decode_coalesce_us(s);
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
 
     pthread_mutex_lock(&s->model_mu);
@@ -12098,6 +12268,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    old_pos, j->req.prompt.len, common,
                    live_vision_match ? "match" : "mismatch",
                    trace_cache_miss_reason(&cache_diag));
+        metrics_kv_miss(trace_cache_miss_reason(&cache_diag));
     }
     if (multimodal && cached > 0) {
         server_log(DS4_LOG_KVCACHE,
@@ -12307,6 +12478,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    /* Chunk callbacks already accumulated progress.metrics_counted evaluated
+     * tokens; add only what they have not seen (small prompts may produce no
+     * chunk callbacks at all). */
+    metrics_prompt_done((prompt_tokens - cached) - progress.metrics_counted,
+                        cached, cache_source, now_sec() - t0);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -12480,9 +12656,20 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (!s->batched_mode &&
+        const bool can_mtp_spec =
+            (!s->batched_mode || s->slot_count <= 1) && temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: mtp spec gate batched=%d slots=%d temp=%.3f drafts=%d -> %s",
+                       s->batched_mode ? 1 : 0,
+                       s->slot_count,
+                       temperature,
+                       ds4_engine_mtp_draft_tokens(s->engine),
+                       can_mtp_spec ? "run" : "skip");
+        }
+        if (can_mtp_spec)
         {
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
@@ -13157,6 +13344,7 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    metrics_request_finish(final_finish, now_sec() - t0);
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -13481,6 +13669,126 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              s->default_tokens);
 }
 
+/* Render the Prometheus exposition text. `s` may be NULL in unit tests, in
+ * which case the server-state gauges (active requests, per-slot context) are
+ * omitted and only the counter/gauge series above are emitted. Per-slot
+ * context reads are done without the inference lock: a torn read costs at
+ * most one stale gauge sample. */
+static void append_metrics_text(buf *b, server *s) {
+    server_metrics snap;
+    pthread_mutex_lock(&g_server_metrics.mu);
+    snap = g_server_metrics; /* struct copy; snap.mu is never used */
+    pthread_mutex_unlock(&g_server_metrics.mu);
+
+    buf_puts(b, "# HELP ds4_prompt_tokens_total Prompt tokens evaluated by prefill\n"
+                "# TYPE ds4_prompt_tokens_total counter\n");
+    buf_printf(b, "ds4_prompt_tokens_total %llu\n",
+               (unsigned long long)snap.prompt_tokens_total);
+    buf_puts(b, "# HELP ds4_generated_tokens_total Tokens generated, by phase\n"
+                "# TYPE ds4_generated_tokens_total counter\n");
+    buf_printf(b, "ds4_generated_tokens_total{phase=\"thinking\"} %llu\n",
+               (unsigned long long)snap.gen_thinking_total);
+    buf_printf(b, "ds4_generated_tokens_total{phase=\"response\"} %llu\n",
+               (unsigned long long)snap.gen_response_total);
+    buf_puts(b, "# HELP ds4_prefill_tps Prefill tokens/s (last chunk, running avg)\n"
+                "# TYPE ds4_prefill_tps gauge\n");
+    buf_printf(b, "ds4_prefill_tps{window=\"chunk\"} %.2f\n", snap.prefill_tps_chunk);
+    buf_printf(b, "ds4_prefill_tps{window=\"avg\"} %.2f\n", snap.prefill_tps_avg);
+    buf_puts(b, "# HELP ds4_decode_tps Decode tokens/s (last chunk, running avg)\n"
+                "# TYPE ds4_decode_tps gauge\n");
+    buf_printf(b, "ds4_decode_tps{window=\"chunk\"} %.2f\n", snap.decode_tps_chunk);
+    buf_printf(b, "ds4_decode_tps{window=\"avg\"} %.2f\n", snap.decode_tps_avg);
+    buf_puts(b, "# HELP ds4_requests_total Completed requests by finish reason\n"
+                "# TYPE ds4_requests_total counter\n");
+    for (int i = 0; i < METRICS_REASONS_MAX; i++) {
+        if (!snap.finish[i].name[0]) break;
+        buf_printf(b, "ds4_requests_total{finish=\"%s\"} %llu\n",
+                   snap.finish[i].name, (unsigned long long)snap.finish[i].count);
+    }
+    buf_puts(b, "# HELP ds4_reused_tokens_total Prompt tokens served from KV cache reuse\n"
+                "# TYPE ds4_reused_tokens_total counter\n");
+    buf_printf(b, "ds4_reused_tokens_total %llu\n",
+               (unsigned long long)snap.reused_tokens_total);
+    buf_puts(b, "# HELP ds4_kv_cache_hit_total Prompts that reused cached KV, by source\n"
+                "# TYPE ds4_kv_cache_hit_total counter\n");
+    for (int i = 0; i < METRICS_REASONS_MAX; i++) {
+        if (!snap.kv_hit[i].name[0]) break;
+        buf_printf(b, "ds4_kv_cache_hit_total{source=\"%s\"} %llu\n",
+                   snap.kv_hit[i].name, (unsigned long long)snap.kv_hit[i].count);
+    }
+    buf_puts(b, "# HELP ds4_request_duration_seconds Wall time per request\n"
+                "# TYPE ds4_request_duration_seconds histogram\n");
+    uint64_t cum = 0;
+    for (int i = 0; i < METRICS_BUCKETS; i++) {
+        cum += snap.request_seconds_bucket[i];
+        buf_printf(b, "ds4_request_duration_seconds_bucket{le=\"%g\"} %llu\n",
+                   metrics_request_bounds[i], (unsigned long long)cum);
+    }
+    buf_printf(b, "ds4_request_duration_seconds_bucket{le=\"+Inf\"} %llu\n",
+               (unsigned long long)snap.request_seconds_count);
+    buf_printf(b, "ds4_request_duration_seconds_sum %.3f\n", snap.request_seconds_sum);
+    buf_printf(b, "ds4_request_duration_seconds_count %llu\n",
+               (unsigned long long)snap.request_seconds_count);
+    buf_puts(b, "# HELP ds4_prompt_duration_seconds Wall time per prompt prefill\n"
+                "# TYPE ds4_prompt_duration_seconds histogram\n");
+    cum = 0;
+    for (int i = 0; i < METRICS_BUCKETS; i++) {
+        cum += snap.prompt_seconds_bucket[i];
+        buf_printf(b, "ds4_prompt_duration_seconds_bucket{le=\"%g\"} %llu\n",
+                   metrics_prompt_bounds[i], (unsigned long long)cum);
+    }
+    buf_printf(b, "ds4_prompt_duration_seconds_bucket{le=\"+Inf\"} %llu\n",
+               (unsigned long long)snap.prompt_seconds_count);
+    buf_printf(b, "ds4_prompt_duration_seconds_sum %.3f\n", snap.prompt_seconds_sum);
+    buf_printf(b, "ds4_prompt_duration_seconds_count %llu\n",
+               (unsigned long long)snap.prompt_seconds_count);
+    buf_puts(b, "# HELP ds4_kv_cache_stored_total Successful KV cache stores\n"
+                "# TYPE ds4_kv_cache_stored_total counter\n");
+    buf_printf(b, "ds4_kv_cache_stored_total %llu\n",
+               (unsigned long long)snap.kv_stored_total);
+    buf_puts(b, "# HELP ds4_kv_cache_stored_bytes_total Bytes written by KV cache stores\n"
+                "# TYPE ds4_kv_cache_stored_bytes_total counter\n");
+    buf_printf(b, "ds4_kv_cache_stored_bytes_total %.1f\n", snap.kv_stored_bytes_total);
+    buf_puts(b, "# HELP ds4_kv_cache_trimmed_tokens_total Tokens trimmed before store\n"
+                "# TYPE ds4_kv_cache_trimmed_tokens_total counter\n");
+    buf_printf(b, "ds4_kv_cache_trimmed_tokens_total %llu\n",
+               (unsigned long long)snap.kv_trimmed_tokens_total);
+    buf_puts(b, "# HELP ds4_kv_cache_miss_total Live KV cache misses by reason\n"
+                "# TYPE ds4_kv_cache_miss_total counter\n");
+    for (int i = 0; i < METRICS_REASONS_MAX; i++) {
+        if (!snap.kv_miss[i].name[0]) break;
+        buf_printf(b, "ds4_kv_cache_miss_total{reason=\"%s\"} %llu\n",
+                   snap.kv_miss[i].name, (unsigned long long)snap.kv_miss[i].count);
+    }
+    if (!s) return;
+    int clients;
+    pthread_mutex_lock(&s->mu);
+    clients = s->clients;
+    pthread_mutex_unlock(&s->mu);
+    buf_puts(b, "# HELP ds4_active_requests HTTP requests currently in flight\n"
+                "# TYPE ds4_active_requests gauge\n");
+    buf_printf(b, "ds4_active_requests %d\n", clients);
+    buf_puts(b, "# HELP ds4_context_limit_tokens Configured context size\n"
+                "# TYPE ds4_context_limit_tokens gauge\n");
+    buf_printf(b, "ds4_context_limit_tokens %d\n", s->ctx_size);
+    buf_puts(b, "# HELP ds4_context_tokens Tokens resident per decode slot\n"
+                "# TYPE ds4_context_tokens gauge\n");
+    for (int i = 0; i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        int pos = slot->session ? ds4_session_pos(slot->session) : 0;
+        buf_printf(b, "ds4_context_tokens{slot=\"%d\"} %d\n", slot->id, pos);
+    }
+}
+
+static bool send_metrics(server *s, int fd) {
+    buf b = {0};
+    append_metrics_text(&b, s);
+    bool ok = http_response(fd, s->enable_cors, 200,
+                            "text/plain; version=0.0.4", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static bool send_model(server *s, int fd, const char *id) {
     buf b = {0};
     append_model_json(&b, s, id);
@@ -13631,6 +13939,11 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics")) {
+        send_metrics(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);
@@ -13851,6 +14164,7 @@ static void server_close_resources(server *s) {
         visible_live_free(&slot->thinking_live);
         if (slot->session) ds4_session_free(slot->session);
     }
+    if (s->tp_leader) ds4_tp_send_stop(s->tp_leader);
     free(s->slot_threads);
     free(s->slots);
     pthread_mutex_destroy(&s->tool_mu);
@@ -14145,11 +14459,6 @@ static server_config parse_options(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
         exit(2);
     }
-    if (c.engine.tp.role == DS4_TP_WORKER) {
-        server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: --role worker is a serving mode; start tensor-parallel workers with ./ds4");
-        exit(2);
-    }
     return c;
 }
 
@@ -14222,15 +14531,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
-        ds4_dist_generation_options gen = {
-            .ctx_size = cfg.ctx_size,
-        };
-        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
+    if (cfg.engine.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
         ds4_engine_close(engine);
         return rc;
     }
-
     ds4_tp *tp_leader = NULL;
     if (cfg.engine.tp.role == DS4_TP_LEADER) {
         char tp_err[256] = "";
@@ -14248,15 +14553,31 @@ int main(int argc, char **argv) {
                                     &tp_id.gate_slot_step,
                                     &tp_id.gates_per_token,
                                     tp_id.gate_slot_mask);
-        if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id,
-                           tp_err, sizeof(tp_err)) ||
-            !ds4_engine_tp_bind(engine, tp_leader,
-                                tp_err, sizeof(tp_err))) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
+        if (!ds4_tp_create(&tp_leader,
+                           &cfg.engine.tp,
+                           &tp_id,
+                           tp_err,
+                           sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine,
+                                tp_leader,
+                                tp_err,
+                                sizeof(tp_err))) {
+            const bool stopping = ds4_tp_stop_requested();
+            server_log(stopping ? DS4_LOG_DEFAULT : DS4_LOG_ERROR,
+                       "ds4-server: %s",
+                       stopping ? "tensor-parallel shutdown requested" : tp_err);
             ds4_tp_free(tp_leader);
             ds4_engine_close(engine);
-            return 1;
+            return stopping ? 0 : 1;
         }
+    }
+    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+        ds4_dist_generation_options gen = {
+            .ctx_size = cfg.ctx_size,
+        };
+        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
+        ds4_engine_close(engine);
+        return rc;
     }
 
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
@@ -14278,6 +14599,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    ds4_kvstore_set_metrics_fn(metrics_kv_stored_bridge);
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -14326,7 +14648,7 @@ int main(int argc, char **argv) {
                    s.slot_count,
                    server_prefill_quantum_for(&s, false),
                    server_prefill_quantum_for(&s, true),
-                   server_decode_coalesce_us());
+                   server_decode_coalesce_us(&s));
         if (ds4_engine_has_mtp(engine)) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
@@ -19402,7 +19724,73 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_metrics_text(void) {
+    /* Reset the global metrics state, replay a known event sequence, and
+     * check the rendered exposition text. Runs single-threaded. */
+    memset(&g_server_metrics, 0, sizeof(g_server_metrics));
+    pthread_mutex_init(&g_server_metrics.mu, NULL);
+
+    /* Chunk-incremental prompt accounting: two chunks then the remainder. */
+    metrics_prefill_progress(2048, 33.60, 33.60);
+    metrics_prefill_progress(600, 31.51, 45.00);
+    metrics_prompt_done(91, 0, "none", 60.872);
+    metrics_prompt_done(100, 1900, "memory-rewind", 0.4);
+    metrics_decode_progress(50, true, 5.41, 5.41);
+    metrics_decode_progress(39, false, 5.48, 5.46);
+    metrics_request_finish("stop", 129.107);
+    metrics_request_finish("stop", 10.0);
+    metrics_request_finish("length", 5.0);
+    metrics_kv_miss("token-mismatch");
+    metrics_kv_stored_bridge(1288, 12, 39.79);
+
+    buf b = {0};
+    append_metrics_text(&b, NULL);
+    TEST_ASSERT(b.ptr != NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_tokens_total 2839\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_reused_tokens_total 1900\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_kv_cache_hit_total{source=\"memory-rewind\"} 1\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_generated_tokens_total{phase=\"thinking\"} 50\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_generated_tokens_total{phase=\"response\"} 39\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_prefill_tps{window=\"chunk\"} 31.51\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_decode_tps{window=\"chunk\"} 5.48\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_decode_tps{window=\"avg\"} 5.46\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_requests_total{finish=\"stop\"} 2\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_requests_total{finish=\"length\"} 1\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_request_duration_seconds_count 3\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_duration_seconds_sum 61.272\n"));
+    /* Histogram buckets are cumulative: the 0.4 s prompt lands in le=0.5,
+     * the 60.872 s prompt first appears at le=120. */
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_duration_seconds_bucket{le=\"0.5\"} 1\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_duration_seconds_bucket{le=\"60\"} 1\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_duration_seconds_bucket{le=\"120\"} 2\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_duration_seconds_bucket{le=\"+Inf\"} 2\n"));
+    /* Request histogram: 129.107 -> le=300, 10.0 -> le=10, 5.0 -> le=5. */
+    TEST_ASSERT(strstr(b.ptr, "ds4_request_duration_seconds_bucket{le=\"5\"} 1\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_request_duration_seconds_bucket{le=\"10\"} 2\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_request_duration_seconds_bucket{le=\"300\"} 3\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_kv_cache_stored_total 1\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_kv_cache_trimmed_tokens_total 12\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_kv_cache_miss_total{reason=\"token-mismatch\"} 1\n"));
+    /* Server-state gauges are omitted when no server is supplied. */
+    TEST_ASSERT(strstr(b.ptr, "ds4_active_requests") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_context_tokens") == NULL);
+    buf_free(&b);
+
+    /* Reason-table overflow: excess reasons account to the final bucket. */
+    for (int i = 0; i < METRICS_REASONS_MAX + 3; i++) {
+        char r[24];
+        snprintf(r, sizeof(r), "reason-%d", i);
+        metrics_kv_miss(r);
+    }
+    buf b2 = {0};
+    append_metrics_text(&b2, NULL);
+    TEST_ASSERT(strstr(b2.ptr, "reason-10\"} 5\n")); /* 1 own + 4 overflow */
+    buf_free(&b2);
+}
+
+
 static void ds4_server_unit_tests_run(void) {
+    test_metrics_text();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
